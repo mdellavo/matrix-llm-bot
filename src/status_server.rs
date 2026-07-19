@@ -1,0 +1,412 @@
+use std::net::SocketAddr;
+use std::sync::Arc;
+use std::time::Instant;
+
+use anyhow::{Context, Result};
+use axum::{
+    Json, Router,
+    extract::{Path, Query, State},
+    http::StatusCode,
+    response::{Html, IntoResponse},
+    routing::get,
+};
+use matrix_sdk::Client;
+use serde::{Deserialize, Serialize};
+use tracing::info;
+
+use crate::message_log::MessageLogger;
+use crate::skills::SkillRegistry;
+
+const DEFAULT_MESSAGES_LIMIT: usize = 20;
+const MAX_MESSAGES_LIMIT: usize = 200;
+
+/// Shared state for the status/debugging HTTP server. Read-only from the server's
+/// perspective — it queries the same `Client`, `MessageLogger`, and `SkillRegistry`
+/// the bot itself uses, rather than duplicating any state.
+pub struct AppState {
+    pub start_time: Instant,
+    pub client: Client,
+    pub message_log: Arc<MessageLogger>,
+    pub skills: Arc<SkillRegistry>,
+    pub homeserver_url: String,
+}
+
+fn router(state: Arc<AppState>) -> Router {
+    Router::new()
+        .route("/", get(index))
+        .route("/api/status", get(api_status))
+        .route("/api/rooms/{room_id}/messages", get(api_room_messages))
+        .route("/api/skills", get(api_skills))
+        .with_state(state)
+}
+
+/// Binds and serves the status/debugging HTTP server until it errors or is aborted.
+///
+/// The page and its JSON API expose logged message content with no authentication —
+/// see `Config::http_listen_addr`'s docs for why the default is loopback-only.
+pub async fn serve(addr: SocketAddr, state: Arc<AppState>) -> Result<()> {
+    let listener = tokio::net::TcpListener::bind(addr)
+        .await
+        .with_context(|| format!("failed to bind status/debug HTTP server to {addr}"))?;
+
+    info!(%addr, "status/debug HTTP server listening");
+    axum::serve(listener, router(state)).await.context("status/debug HTTP server failed")?;
+    Ok(())
+}
+
+#[derive(Debug, Serialize)]
+struct StatusResponse {
+    bot_user_id: Option<String>,
+    homeserver_url: String,
+    classifier_model: &'static str,
+    uptime_seconds: u64,
+    rooms: Vec<RoomSummary>,
+}
+
+#[derive(Debug, Serialize)]
+struct RoomSummary {
+    room_id: String,
+    display_name: Option<String>,
+}
+
+async fn api_status(State(state): State<Arc<AppState>>) -> Json<StatusResponse> {
+    let rooms = state
+        .client
+        .joined_rooms()
+        .into_iter()
+        .map(|room| RoomSummary {
+            room_id: room.room_id().to_string(),
+            display_name: room.name(),
+        })
+        .collect();
+
+    Json(StatusResponse {
+        bot_user_id: state.client.user_id().map(|id| id.to_string()),
+        homeserver_url: state.homeserver_url.clone(),
+        classifier_model: crate::classify::MODEL,
+        uptime_seconds: state.start_time.elapsed().as_secs(),
+        rooms,
+    })
+}
+
+#[derive(Debug, Deserialize)]
+struct MessagesQuery {
+    limit: Option<usize>,
+}
+
+async fn api_room_messages(
+    State(state): State<Arc<AppState>>,
+    Path(room_id): Path<String>,
+    Query(query): Query<MessagesQuery>,
+) -> impl IntoResponse {
+    let limit = query.limit.unwrap_or(DEFAULT_MESSAGES_LIMIT).clamp(1, MAX_MESSAGES_LIMIT);
+
+    match state.message_log.recent(&room_id, limit) {
+        Ok(entries) => Json(entries).into_response(),
+        Err(err) => (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response(),
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct SkillSummary {
+    name: String,
+    description: String,
+    usage: Option<String>,
+    tools: Vec<String>,
+    aliases: Vec<String>,
+    model: Option<String>,
+}
+
+async fn api_skills(State(state): State<Arc<AppState>>) -> Json<Vec<SkillSummary>> {
+    let skills = state
+        .skills
+        .list()
+        .into_iter()
+        .map(|skill| SkillSummary {
+            name: skill.name.clone(),
+            description: skill.description.clone(),
+            usage: skill.usage.clone(),
+            tools: skill.tools.clone(),
+            aliases: skill.aliases.clone(),
+            model: skill.model.clone(),
+        })
+        .collect();
+
+    Json(skills)
+}
+
+async fn index() -> Html<&'static str> {
+    Html(INDEX_HTML)
+}
+
+const INDEX_HTML: &str = r#"<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>matrix-llm-bot — status</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { font-family: system-ui, sans-serif; margin: 2rem; max-width: 960px; }
+  h1 { font-size: 1.25rem; }
+  dl { display: grid; grid-template-columns: max-content 1fr; gap: 0.25rem 1rem; }
+  dt { font-weight: 600; }
+  dd { margin: 0; }
+  table { border-collapse: collapse; width: 100%; margin-top: 1rem; font-size: 0.85rem; }
+  th, td { border: 1px solid #8884; padding: 0.35rem 0.5rem; text-align: left; vertical-align: top; }
+  th { background: #8881; }
+  select, input, button { font: inherit; }
+  .controls { margin: 1rem 0; display: flex; gap: 0.5rem; align-items: center; }
+</style>
+</head>
+<body>
+  <h1>matrix-llm-bot — status &amp; debug</h1>
+  <dl>
+    <dt>Bot user</dt><dd id="bot-user">…</dd>
+    <dt>Homeserver</dt><dd id="homeserver">…</dd>
+    <dt>Classifier model</dt><dd id="model">…</dd>
+    <dt>Uptime</dt><dd id="uptime">…</dd>
+  </dl>
+
+  <div class="controls">
+    <label for="room-select">Room</label>
+    <select id="room-select"></select>
+    <label for="limit">Limit</label>
+    <input id="limit" type="number" value="20" min="1" max="200" style="width: 5em;">
+    <button id="refresh">Refresh</button>
+  </div>
+
+  <table>
+    <thead>
+      <tr><th>Logged at</th><th>Sender</th><th>Intent</th><th>Sentiment</th><th>Reply?</th><th>Body</th></tr>
+    </thead>
+    <tbody id="messages-body"></tbody>
+  </table>
+
+  <h2>Commands</h2>
+  <table>
+    <thead>
+      <tr><th>Name</th><th>Aliases</th><th>Usage</th><th>Tools</th><th>Model</th><th>Description</th></tr>
+    </thead>
+    <tbody id="skills-body"></tbody>
+  </table>
+
+<script>
+function escapeHtml(str) {
+  const div = document.createElement('div');
+  div.textContent = str ?? '';
+  return div.innerHTML;
+}
+
+function formatUptime(seconds) {
+  const h = Math.floor(seconds / 3600);
+  const m = Math.floor((seconds % 3600) / 60);
+  const s = Math.floor(seconds % 60);
+  return `${h}h ${m}m ${s}s`;
+}
+
+async function loadMessages(roomId) {
+  if (!roomId) return;
+  const limit = document.getElementById('limit').value || 20;
+  const res = await fetch(`/api/rooms/${encodeURIComponent(roomId)}/messages?limit=${encodeURIComponent(limit)}`);
+  const tbody = document.getElementById('messages-body');
+  tbody.innerHTML = '';
+  if (!res.ok) {
+    tbody.innerHTML = `<tr><td colspan="6">Failed to load messages: ${escapeHtml(await res.text())}</td></tr>`;
+    return;
+  }
+  const messages = await res.json();
+  for (const m of messages) {
+    const row = document.createElement('tr');
+    row.innerHTML = `
+      <td>${escapeHtml(m.logged_at)}</td>
+      <td>${escapeHtml(m.sender)}</td>
+      <td>${escapeHtml(m.analysis.intent)}</td>
+      <td>${escapeHtml(m.analysis.sentiment)}</td>
+      <td>${m.analysis.requires_response ? 'yes' : 'no'}</td>
+      <td>${escapeHtml(m.body)}</td>
+    `;
+    tbody.appendChild(row);
+  }
+}
+
+async function loadSkills() {
+  const res = await fetch('/api/skills');
+  const tbody = document.getElementById('skills-body');
+  tbody.innerHTML = '';
+  if (!res.ok) {
+    tbody.innerHTML = `<tr><td colspan="6">Failed to load commands: ${escapeHtml(await res.text())}</td></tr>`;
+    return;
+  }
+  const skills = await res.json();
+  if (skills.length === 0) {
+    tbody.innerHTML = '<tr><td colspan="6">(no commands loaded)</td></tr>';
+    return;
+  }
+  for (const skill of skills) {
+    const row = document.createElement('tr');
+    row.innerHTML = `
+      <td>${escapeHtml(skill.name)}</td>
+      <td>${escapeHtml((skill.aliases ?? []).join(', '))}</td>
+      <td>${escapeHtml(skill.usage ?? '')}</td>
+      <td>${escapeHtml((skill.tools ?? []).join(', '))}</td>
+      <td>${escapeHtml(skill.model ?? '')}</td>
+      <td>${escapeHtml(skill.description)}</td>
+    `;
+    tbody.appendChild(row);
+  }
+}
+
+async function loadStatus(selectFirstRoom) {
+  const res = await fetch('/api/status');
+  const data = await res.json();
+  document.getElementById('bot-user').textContent = data.bot_user_id ?? '(not logged in)';
+  document.getElementById('homeserver').textContent = data.homeserver_url;
+  document.getElementById('model').textContent = data.classifier_model;
+  document.getElementById('uptime').textContent = formatUptime(data.uptime_seconds);
+
+  const roomSelect = document.getElementById('room-select');
+  const previousValue = roomSelect.value;
+  roomSelect.innerHTML = '';
+  for (const room of data.rooms) {
+    const opt = document.createElement('option');
+    opt.value = room.room_id;
+    opt.textContent = room.display_name ? `${room.display_name} (${room.room_id})` : room.room_id;
+    roomSelect.appendChild(opt);
+  }
+
+  if (selectFirstRoom && data.rooms.length > 0) {
+    roomSelect.value = data.rooms[0].room_id;
+    loadMessages(roomSelect.value);
+  } else if (previousValue) {
+    roomSelect.value = previousValue;
+  }
+}
+
+document.getElementById('room-select').addEventListener('change', (e) => loadMessages(e.target.value));
+document.getElementById('refresh').addEventListener('click', async () => {
+  await loadStatus(false);
+  loadMessages(document.getElementById('room-select').value);
+});
+
+loadStatus(true);
+loadSkills();
+</script>
+</body>
+</html>
+"#;
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use super::*;
+    use crate::classify::{Intent, MessageAnalysis, Sentiment};
+    use crate::message_log::LoggedMessage;
+
+    fn unique_temp_dir(label: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock is after the unix epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!("matrix-llm-bot-test-{label}-{nanos}"))
+    }
+
+    fn test_analysis(summary: &str) -> MessageAnalysis {
+        MessageAnalysis {
+            intent: Intent::Chitchat,
+            confidence: 0.9,
+            requires_response: false,
+            summary: summary.to_string(),
+            sentiment: Sentiment::Neutral,
+            entities: vec![],
+            command: None,
+        }
+    }
+
+    /// Boots a real server on an OS-assigned port and drives it with real HTTP
+    /// requests end-to-end: index page, `/api/status`, and `/api/rooms/{id}/messages`
+    /// backed by real `MessageLogger` entries on disk.
+    #[tokio::test]
+    async fn serves_status_page_and_room_messages() {
+        // No network I/O happens here: `.homeserver_url(...)` skips homeserver
+        // discovery entirely, so this succeeds even with nothing listening at the URL.
+        let client = matrix_sdk::Client::builder()
+            .homeserver_url("http://example.invalid")
+            .build()
+            .await
+            .expect("client build performs no network I/O for a plain homeserver_url");
+
+        let log_dir = unique_temp_dir("status-server");
+        let message_log = Arc::new(MessageLogger::open(&log_dir).expect("open message log"));
+
+        let room_id = "!test:example.org";
+        message_log
+            .log(room_id, "$event1", "@alice:example.org", 1_000, "hello there", &test_analysis("alice says hi"))
+            .expect("log message 1");
+        message_log
+            .log(room_id, "$event2", "@bob:example.org", 2_000, "hi alice", &test_analysis("bob says hi"))
+            .expect("log message 2");
+
+        let skills_dir = unique_temp_dir("status-server-skills");
+        let skills = Arc::new(SkillRegistry::load(&skills_dir).expect("load skills"));
+
+        let state = Arc::new(AppState {
+            start_time: Instant::now(),
+            client,
+            message_log,
+            skills,
+            homeserver_url: "http://example.invalid".to_string(),
+        });
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind ephemeral port");
+        let addr = listener.local_addr().expect("local addr");
+        tokio::spawn(async move {
+            axum::serve(listener, router(state)).await.expect("test server");
+        });
+
+        let http = reqwest::Client::new();
+        let base = format!("http://{addr}");
+
+        let index_resp = http.get(&base).send().await.expect("GET /");
+        assert!(index_resp.status().is_success());
+        let index_body = index_resp.text().await.expect("index body");
+        assert!(index_body.contains("matrix-llm-bot"));
+
+        let status_resp = http.get(format!("{base}/api/status")).send().await.expect("GET /api/status");
+        assert!(status_resp.status().is_success());
+        let status: serde_json::Value = status_resp.json().await.expect("status json");
+        assert_eq!(status["classifier_model"], crate::classify::MODEL);
+        assert_eq!(status["homeserver_url"], "http://example.invalid");
+        // The client never synced, so it has no joined rooms — the route still works.
+        assert_eq!(status["rooms"].as_array().expect("rooms array").len(), 0);
+
+        let messages_resp = http
+            .get(format!("{base}/api/rooms/{room_id}/messages?limit=10"))
+            .send()
+            .await
+            .expect("GET /api/rooms/{room_id}/messages");
+        assert!(messages_resp.status().is_success());
+        let messages: Vec<LoggedMessage> = messages_resp.json().await.expect("messages json");
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].sender, "@alice:example.org");
+        assert_eq!(messages[0].analysis.summary, "alice says hi");
+        assert_eq!(messages[1].sender, "@bob:example.org");
+
+        let empty_room_resp = http
+            .get(format!("{base}/api/rooms/!nobody-here:example.org/messages"))
+            .send()
+            .await
+            .expect("GET messages for unknown room");
+        assert!(empty_room_resp.status().is_success());
+        let empty: Vec<LoggedMessage> = empty_room_resp.json().await.expect("empty messages json");
+        assert!(empty.is_empty());
+
+        let skills_resp = http.get(format!("{base}/api/skills")).send().await.expect("GET /api/skills");
+        assert!(skills_resp.status().is_success());
+        let skills_json: serde_json::Value = skills_resp.json().await.expect("skills json");
+        assert!(skills_json.as_array().expect("skills array").is_empty());
+
+        let _ = std::fs::remove_dir_all(&log_dir);
+        let _ = std::fs::remove_dir_all(&skills_dir);
+    }
+}

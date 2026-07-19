@@ -1,0 +1,28 @@
+# Copy this file to config.toml and fill in your values.
+
+homeserver_url = "https://matrix.org"
+username = "my-bot-account"
+password = "changeme"
+
+# Room IDs ("!abc123:example.org") or aliases ("#room:example.org") to join and monitor.
+rooms = ["#some-room:matrix.org"]
+
+# Optional: device name shown for this login. Defaults to "matrix-llm-bot".
+# device_name = "matrix-llm-bot"
+
+# Optional: where the SQLite state/crypto store is persisted. Defaults to "./data/store".
+# store_path = "./data/store"
+
+# Optional: directory holding one JSONL log file per room of classified messages.
+# Defaults to "./data/messages".
+# message_log_dir = "./data/messages"
+
+# Optional: address the status/debugging HTTP server binds to. Defaults to
+# loopback-only ("127.0.0.1:8080") since the page and its API expose logged
+# message content with no authentication. Only widen this deliberately.
+# http_listen_addr = "127.0.0.1:8080"
+
+# Optional: directory of bot commands (one subdirectory per command, each with a
+# SKILL.md). Defaults to "./skills". Unlike store_path/message_log_dir, this is
+# meant to be committed, not git-ignored.
+# skills_dir = "./skills"
