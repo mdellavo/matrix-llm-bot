@@ -26,3 +26,8 @@ rooms = ["#some-room:matrix.org"]
 # SKILL.md). Defaults to "./skills". Unlike store_path/message_log_dir, this is
 # meant to be committed, not git-ignored.
 # skills_dir = "./skills"
+
+# Optional: OMDb API key (https://www.omdbapi.com/apikey.aspx) for the `imdb`
+# skill's movie/show lookups. If unset, the `imdb` skill replies with a clear
+# "not configured" message instead of attempting a lookup.
+# omdb_api_key = "your-key-here"

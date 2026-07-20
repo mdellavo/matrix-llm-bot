@@ -16,18 +16,23 @@ use tracing::info;
 
 use crate::message_log::MessageLogger;
 use crate::skills::SkillRegistry;
+use crate::tools::ToolClients;
+use crate::usage::UsageTracker;
 
 const DEFAULT_MESSAGES_LIMIT: usize = 20;
 const MAX_MESSAGES_LIMIT: usize = 200;
 
 /// Shared state for the status/debugging HTTP server. Read-only from the server's
-/// perspective — it queries the same `Client`, `MessageLogger`, and `SkillRegistry`
-/// the bot itself uses, rather than duplicating any state.
+/// perspective — it queries the same `Client`, `MessageLogger`, `SkillRegistry`,
+/// `ToolClients`, and `UsageTracker` the bot itself uses, rather than duplicating
+/// any state.
 pub struct AppState {
     pub start_time: Instant,
     pub client: Client,
     pub message_log: Arc<MessageLogger>,
     pub skills: Arc<SkillRegistry>,
+    pub tool_clients: Arc<ToolClients>,
+    pub usage_tracker: Arc<UsageTracker>,
     pub homeserver_url: String,
 }
 
@@ -37,6 +42,7 @@ fn router(state: Arc<AppState>) -> Router {
         .route("/api/status", get(api_status))
         .route("/api/rooms/{room_id}/messages", get(api_room_messages))
         .route("/api/skills", get(api_skills))
+        .route("/api/usage", get(api_usage))
         .with_state(state)
 }
 
@@ -60,6 +66,8 @@ struct StatusResponse {
     homeserver_url: String,
     classifier_model: &'static str,
     uptime_seconds: u64,
+    /// Whether an OMDb API key is configured — the `imdb` skill needs one to work.
+    omdb_configured: bool,
     rooms: Vec<RoomSummary>,
 }
 
@@ -85,6 +93,7 @@ async fn api_status(State(state): State<Arc<AppState>>) -> Json<StatusResponse> 
         homeserver_url: state.homeserver_url.clone(),
         classifier_model: crate::classify::MODEL,
         uptime_seconds: state.start_time.elapsed().as_secs(),
+        omdb_configured: state.tool_clients.has_omdb_key(),
         rooms,
     })
 }
@@ -135,6 +144,13 @@ async fn api_skills(State(state): State<Arc<AppState>>) -> Json<Vec<SkillSummary
     Json(skills)
 }
 
+/// Claude API token/request usage, accumulated in-memory since the bot started
+/// (see `UsageTracker`) — overall totals plus a per-label breakdown (`"classify"`
+/// for the message classifier, or a skill name for that skill's completions).
+async fn api_usage(State(state): State<Arc<AppState>>) -> Json<crate::usage::UsageSnapshot> {
+    Json(state.usage_tracker.snapshot())
+}
+
 async fn index() -> Html<&'static str> {
     Html(INDEX_HTML)
 }
@@ -165,7 +181,22 @@ const INDEX_HTML: &str = r#"<!doctype html>
     <dt>Homeserver</dt><dd id="homeserver">…</dd>
     <dt>Classifier model</dt><dd id="model">…</dd>
     <dt>Uptime</dt><dd id="uptime">…</dd>
+    <dt>OMDb configured</dt><dd id="omdb-configured">…</dd>
   </dl>
+
+  <h2>Claude API usage</h2>
+  <dl>
+    <dt>Total tokens</dt><dd id="usage-total-tokens">…</dd>
+    <dt>Input tokens</dt><dd id="usage-input-tokens">…</dd>
+    <dt>Output tokens</dt><dd id="usage-output-tokens">…</dd>
+    <dt>Requests</dt><dd id="usage-requests">…</dd>
+  </dl>
+  <table>
+    <thead>
+      <tr><th>Label</th><th>Input tokens</th><th>Output tokens</th><th>Total tokens</th><th>Requests</th></tr>
+    </thead>
+    <tbody id="usage-body"></tbody>
+  </table>
 
   <div class="controls">
     <label for="room-select">Room</label>
@@ -256,6 +287,37 @@ async function loadSkills() {
   }
 }
 
+async function loadUsage() {
+  const res = await fetch('/api/usage');
+  const tbody = document.getElementById('usage-body');
+  tbody.innerHTML = '';
+  if (!res.ok) {
+    tbody.innerHTML = `<tr><td colspan="5">Failed to load usage: ${escapeHtml(await res.text())}</td></tr>`;
+    return;
+  }
+  const usage = await res.json();
+  document.getElementById('usage-total-tokens').textContent = usage.input_tokens + usage.output_tokens;
+  document.getElementById('usage-input-tokens').textContent = usage.input_tokens;
+  document.getElementById('usage-output-tokens').textContent = usage.output_tokens;
+  document.getElementById('usage-requests').textContent = usage.request_count;
+
+  if (usage.by_label.length === 0) {
+    tbody.innerHTML = '<tr><td colspan="5">(no Claude API calls recorded yet)</td></tr>';
+    return;
+  }
+  for (const entry of usage.by_label) {
+    const row = document.createElement('tr');
+    row.innerHTML = `
+      <td>${escapeHtml(entry.label)}</td>
+      <td>${entry.input_tokens}</td>
+      <td>${entry.output_tokens}</td>
+      <td>${entry.input_tokens + entry.output_tokens}</td>
+      <td>${entry.request_count}</td>
+    `;
+    tbody.appendChild(row);
+  }
+}
+
 async function loadStatus(selectFirstRoom) {
   const res = await fetch('/api/status');
   const data = await res.json();
@@ -263,6 +325,7 @@ async function loadStatus(selectFirstRoom) {
   document.getElementById('homeserver').textContent = data.homeserver_url;
   document.getElementById('model').textContent = data.classifier_model;
   document.getElementById('uptime').textContent = formatUptime(data.uptime_seconds);
+  document.getElementById('omdb-configured').textContent = data.omdb_configured ? 'yes' : 'no';
 
   const roomSelect = document.getElementById('room-select');
   const previousValue = roomSelect.value;
@@ -286,10 +349,12 @@ document.getElementById('room-select').addEventListener('change', (e) => loadMes
 document.getElementById('refresh').addEventListener('click', async () => {
   await loadStatus(false);
   loadMessages(document.getElementById('room-select').value);
+  loadUsage();
 });
 
 loadStatus(true);
 loadSkills();
+loadUsage();
 </script>
 </body>
 </html>
@@ -302,6 +367,18 @@ mod tests {
     use super::*;
     use crate::classify::{Intent, MessageAnalysis, Sentiment};
     use crate::message_log::LoggedMessage;
+    use crate::usage::UsageTracker;
+
+    fn test_usage(input_tokens: u32, output_tokens: u32) -> anthropic_sdk::types::Usage {
+        anthropic_sdk::types::Usage {
+            input_tokens,
+            output_tokens,
+            cache_creation_input_tokens: None,
+            cache_read_input_tokens: None,
+            server_tool_use: None,
+            service_tier: None,
+        }
+    }
 
     fn unique_temp_dir(label: &str) -> PathBuf {
         let nanos = std::time::SystemTime::now()
@@ -349,12 +426,17 @@ mod tests {
 
         let skills_dir = unique_temp_dir("status-server-skills");
         let skills = Arc::new(SkillRegistry::load(&skills_dir).expect("load skills"));
+        let tool_clients = Arc::new(ToolClients::new(None));
+        let usage_tracker = Arc::new(UsageTracker::new());
+        usage_tracker.record("classify", &test_usage(120, 30));
 
         let state = Arc::new(AppState {
             start_time: Instant::now(),
             client,
             message_log,
             skills,
+            tool_clients,
+            usage_tracker,
             homeserver_url: "http://example.invalid".to_string(),
         });
 
@@ -377,6 +459,7 @@ mod tests {
         let status: serde_json::Value = status_resp.json().await.expect("status json");
         assert_eq!(status["classifier_model"], crate::classify::MODEL);
         assert_eq!(status["homeserver_url"], "http://example.invalid");
+        assert_eq!(status["omdb_configured"], false, "no OMDb key was configured for this test");
         // The client never synced, so it has no joined rooms — the route still works.
         assert_eq!(status["rooms"].as_array().expect("rooms array").len(), 0);
 
@@ -405,6 +488,17 @@ mod tests {
         assert!(skills_resp.status().is_success());
         let skills_json: serde_json::Value = skills_resp.json().await.expect("skills json");
         assert!(skills_json.as_array().expect("skills array").is_empty());
+
+        let usage_resp = http.get(format!("{base}/api/usage")).send().await.expect("GET /api/usage");
+        assert!(usage_resp.status().is_success());
+        let usage: serde_json::Value = usage_resp.json().await.expect("usage json");
+        assert_eq!(usage["input_tokens"], 120);
+        assert_eq!(usage["output_tokens"], 30);
+        assert_eq!(usage["request_count"], 1);
+        let by_label = usage["by_label"].as_array().expect("by_label array");
+        assert_eq!(by_label.len(), 1);
+        assert_eq!(by_label[0]["label"], "classify");
+        assert_eq!(by_label[0]["input_tokens"], 120);
 
         let _ = std::fs::remove_dir_all(&log_dir);
         let _ = std::fs::remove_dir_all(&skills_dir);

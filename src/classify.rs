@@ -4,13 +4,21 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
+use crate::usage::UsageTracker;
+
 pub const MODEL: &str = "claude-haiku-4-5";
 const TOOL_NAME: &str = "classify_message";
+/// Label `classify_message`'s calls are recorded under in `UsageTracker`.
+pub const USAGE_LABEL: &str = "classify";
 
-const SYSTEM_PROMPT: &str = "You classify a single chat message from a Matrix room into a \
+const SYSTEM_PROMPT_TEMPLATE: &str = "You classify a single chat message from a Matrix room into a \
 structured record. Always respond by calling the classify_message tool exactly once. Base \
 every field only on the message text you are given; do not invent sender, room, or timestamp \
-information that isn't in the text.";
+information that isn't in the text.\n\n\
+When intent is \"command\", set `command.name` to the exact command name or alias invoked, and \
+`command.args` to an object keyed by the exact argument names listed below for that command — \
+not a name you invent yourself. Only include an argument if its value actually appears in the \
+message text; never invent one. Known commands:\n{command_reference}";
 
 /// Structured analysis of a single free-text message, extracted by the LLM.
 ///
@@ -80,11 +88,24 @@ pub struct CommandInfo {
 
 /// Classifies a single message's free text into a `MessageAnalysis` by forcing
 /// the model to call the `classify_message` tool with our schema as its input.
-pub async fn classify_message(client: &Anthropic, message_text: &str) -> Result<MessageAnalysis> {
+///
+/// `command_reference` (`SkillRegistry::command_reference`) lists every loaded
+/// command's name, aliases, and expected `args` keys, so that when the message
+/// turns out to be a command, the model extracts `command.args` under the same
+/// key names the target skill's `resolve_args` will later validate against —
+/// without it, the model has no way to know a skill expects `name` rather than
+/// `strain`/`query`/anything else it might otherwise guess.
+pub async fn classify_message(
+    client: &Anthropic,
+    message_text: &str,
+    command_reference: &str,
+    usage_tracker: &UsageTracker,
+) -> Result<MessageAnalysis> {
     let tool = classify_tool()?;
+    let system_prompt = SYSTEM_PROMPT_TEMPLATE.replace("{command_reference}", command_reference);
 
     let params = MessageCreateBuilder::new(MODEL, 1024)
-        .system(SYSTEM_PROMPT)
+        .system(system_prompt)
         .user(message_text)
         .tools(vec![tool])
         .tool_choice(ToolChoice::Tool {
@@ -97,6 +118,8 @@ pub async fn classify_message(client: &Anthropic, message_text: &str) -> Result<
         .create(params)
         .await
         .context("classify_message request to Claude failed")?;
+
+    usage_tracker.record(USAGE_LABEL, &message.usage);
 
     for block in message.content {
         if let ContentBlock::ToolUse { name, input, .. } = block

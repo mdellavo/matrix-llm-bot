@@ -43,6 +43,13 @@ pub struct Config {
     /// source, not runtime state, so it's not git-ignored by default.
     #[serde(default = "default_skills_dir")]
     pub skills_dir: PathBuf,
+
+    /// OMDb API key (<https://www.omdbapi.com/apikey.aspx>) for the `imdb` skill's
+    /// movie/show lookups. Optional — not every deployment will use that skill; if
+    /// unset (or blank), the `imdb` skill replies with a clear "not configured"
+    /// message at invocation time instead of attempting a lookup.
+    #[serde(default)]
+    pub omdb_api_key: Option<String>,
 }
 
 fn default_device_name() -> String {

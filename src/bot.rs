@@ -15,6 +15,8 @@ use crate::config::Config;
 use crate::handler::on_room_message;
 use crate::message_log::MessageLogger;
 use crate::skills::SkillRegistry;
+use crate::tools::ToolClients;
+use crate::usage::UsageTracker;
 
 const SESSION_FILE_NAME: &str = "session.json";
 const DEVICE_ID_FILE_NAME: &str = "device_id";
@@ -23,6 +25,8 @@ pub struct Bot {
     client: Client,
     message_log: Arc<MessageLogger>,
     skills: Arc<SkillRegistry>,
+    tool_clients: Arc<ToolClients>,
+    usage_tracker: Arc<UsageTracker>,
 }
 
 impl Bot {
@@ -70,7 +74,13 @@ impl Bot {
         let skills = Arc::new(SkillRegistry::load(&config.skills_dir)?);
         client.add_event_handler_context(Arc::clone(&skills));
 
-        Ok(Self { client, message_log, skills })
+        let tool_clients = Arc::new(ToolClients::new(config.omdb_api_key.clone()));
+        client.add_event_handler_context(Arc::clone(&tool_clients));
+
+        let usage_tracker = Arc::new(UsageTracker::new());
+        client.add_event_handler_context(Arc::clone(&usage_tracker));
+
+        Ok(Self { client, message_log, skills, tool_clients, usage_tracker })
     }
 
     /// Restores a previously saved session if one exists at `<store_path>/session.json`
@@ -123,6 +133,19 @@ impl Bot {
     /// handler.
     pub fn skills(&self) -> Arc<SkillRegistry> {
         Arc::clone(&self.skills)
+    }
+
+    /// A clone of the shared HTTP-tool clients handle (Urban Dictionary/OMDb/Leafly),
+    /// for callers that need it outside the event handler.
+    pub fn tool_clients(&self) -> Arc<ToolClients> {
+        Arc::clone(&self.tool_clients)
+    }
+
+    /// A clone of the shared usage tracker handle (Claude API token/request
+    /// counts), for callers (e.g. the status server) that need to report it
+    /// without going through the event handler.
+    pub fn usage_tracker(&self) -> Arc<UsageTracker> {
+        Arc::clone(&self.usage_tracker)
     }
 
     /// Joins every room configured for monitoring. Already-joined rooms are skipped.

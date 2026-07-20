@@ -10,10 +10,13 @@ use tracing::warn;
 
 use crate::classify::{self, CommandInfo};
 use crate::message_log::{LoggedMessage, MessageLogger};
+use crate::tools::{self, ToolClients};
+use crate::usage::UsageTracker;
 
 const SKILL_FILE_NAME: &str = "SKILL.md";
 const FRONTMATTER_DELIMITER: &str = "---";
-const KNOWN_TOOLS: &[&str] = &["message_log", "room_info", "current_time"];
+const KNOWN_TOOLS: &[&str] =
+    &["message_log", "room_info", "current_time", "random_choice", "urban_dictionary", "imdb_lookup", "leafly_strain"];
 const RESERVED_NAME: &str = "help";
 const DEFAULT_MESSAGE_LOG_COUNT: usize = 5;
 const MAX_MESSAGE_LOG_COUNT: usize = 20;
@@ -63,6 +66,9 @@ enum ArgType {
     Integer,
     Number,
     Boolean,
+    /// An array of strings (e.g. `random`'s `choices`). `min`/`max` on an `Array`
+    /// argument bound the element *count*, not a numeric value — see `resolve_args`.
+    Array,
 }
 
 impl ArgType {
@@ -72,6 +78,7 @@ impl ArgType {
             ArgType::Integer => "integer",
             ArgType::Number => "number",
             ArgType::Boolean => "boolean",
+            ArgType::Array => "array of strings",
         }
     }
 
@@ -81,6 +88,7 @@ impl ArgType {
             ArgType::Integer => value.is_i64() || value.is_u64(),
             ArgType::Number => value.is_number(),
             ArgType::Boolean => value.is_boolean(),
+            ArgType::Array => value.as_array().is_some_and(|items| items.iter().all(|item| item.is_string())),
         }
     }
 }
@@ -200,6 +208,38 @@ impl SkillRegistry {
         skills.sort_by(|a, b| a.name.cmp(&b.name));
         skills
     }
+
+    /// Formats every loaded skill's name, aliases, and expected `args` keys/types
+    /// into a text block for the classifier's system prompt. Without this, the
+    /// classifier has no way to know that (say) `strain` expects an arg named
+    /// `name` rather than `strain`/`query`/whatever else it might guess — it would
+    /// have to invent a key name from nothing, which `resolve_args` then rejects as
+    /// missing. Giving it the exact declared key names up front is what lets
+    /// `command.args` actually line up with each skill's schema.
+    pub fn command_reference(&self) -> String {
+        let mut lines = vec!["- help: no arguments".to_string()];
+        for skill in self.list() {
+            let mut line = format!("- {}", skill.name);
+            if !skill.aliases.is_empty() {
+                line.push_str(&format!(" (aliases: {})", skill.aliases.join(", ")));
+            }
+            if skill.args.is_empty() {
+                line.push_str(": no arguments");
+            } else {
+                let args_desc: Vec<String> = skill
+                    .args
+                    .iter()
+                    .map(|arg| {
+                        let requiredness = if arg.required { "required" } else { "optional" };
+                        format!("{} ({}, {requiredness})", arg.name, arg.kind.label())
+                    })
+                    .collect();
+                line.push_str(&format!(": args {{ {} }}", args_desc.join(", ")));
+            }
+            lines.push(line);
+        }
+        lines.join("\n")
+    }
 }
 
 fn load_skill_file(path: &Path) -> Result<Skill> {
@@ -268,7 +308,7 @@ fn parse_skill(raw: &str) -> Result<Skill> {
         anyhow::ensure!(seen_arg_names.insert(arg.name.clone()), "duplicate argument name {:?}", arg.name);
         if arg.min.is_some() || arg.max.is_some() {
             anyhow::ensure!(
-                matches!(arg.kind, ArgType::Integer | ArgType::Number),
+                matches!(arg.kind, ArgType::Integer | ArgType::Number | ArgType::Array),
                 "argument {:?} declares min/max but its type ({}) isn't numeric",
                 arg.name,
                 arg.kind.label()
@@ -321,7 +361,19 @@ fn resolve_args(
                 if !spec.kind.matches(value) {
                     return Err(format!("argument '{}' must be a {}, got {value}", spec.name, spec.kind.label()));
                 }
-                if let Some(n) = value.as_f64() {
+                if spec.kind == ArgType::Array {
+                    let len = value.as_array().map(Vec::len).unwrap_or(0) as f64;
+                    if let Some(min) = spec.min
+                        && len < min
+                    {
+                        return Err(format!("argument '{}' must have at least {min} item(s)", spec.name));
+                    }
+                    if let Some(max) = spec.max
+                        && len > max
+                    {
+                        return Err(format!("argument '{}' must have at most {max} item(s)", spec.name));
+                    }
+                } else if let Some(n) = value.as_f64() {
                     if let Some(min) = spec.min
                         && n < min
                     {
@@ -353,14 +405,18 @@ fn resolve_args(
 /// if set, else `classify::MODEL`), along with the user's raw message text, validated
 /// command arguments, and any context its declared `tools` ask for (recent room
 /// history for `message_log`, room name/topic for `room_info`, the current UTC time
-/// for `current_time`) — and returns the generated reply.
+/// for `current_time`, or a live lookup for `random_choice`/`urban_dictionary`/
+/// `imdb_lookup`/`leafly_strain`) — and returns the generated reply.
 ///
 /// Never propagates an error up into the message-send path — on any failure this
 /// logs a `tracing::warn!` and returns a friendly fallback string instead, matching
 /// how `classify_message` failures are already handled one level up in `on_room_message`.
+#[allow(clippy::too_many_arguments)]
 pub async fn execute(
     anthropic: &Anthropic,
     message_log: &MessageLogger,
+    tool_clients: &ToolClients,
+    usage_tracker: &UsageTracker,
     room: &Room,
     skill: &Skill,
     message_text: &str,
@@ -418,6 +474,65 @@ pub async fn execute(
         user_turn.push_str(&format!("Current time (UTC): {}\n\n", chrono::Utc::now().to_rfc3339()));
     }
 
+    // Short-circuits before building any further context or calling Claude at all —
+    // same shape as the args-validation short-circuit above — since there's nothing
+    // useful to say without a key, and this shouldn't cost an LLM call to discover.
+    if skill.tools.iter().any(|tool| tool == "imdb_lookup") && !tool_clients.has_omdb_key() {
+        return "This command requires an OMDb API key that hasn't been configured yet. \
+                Ask the bot operator to set `omdb_api_key` in config.toml."
+            .to_string();
+    }
+
+    if skill.tools.iter().any(|tool| tool == "random_choice") {
+        let choices: Vec<String> = resolved_args
+            .get("choices")
+            .and_then(|value| value.as_array())
+            .map(|items| items.iter().filter_map(|item| item.as_str().map(String::from)).collect())
+            .unwrap_or_default();
+        user_turn.push_str(&tools::random_choice_context(&choices));
+    }
+
+    if skill.tools.iter().any(|tool| tool == "urban_dictionary") {
+        let term = resolved_args.get("term").and_then(|value| value.as_str());
+        match tools::urban_dictionary(tool_clients.http(), term).await {
+            Ok(context) => user_turn.push_str(&context),
+            Err(err) => {
+                warn!(?err, room_id, skill = %skill.name, "urban dictionary lookup failed");
+                user_turn.push_str(
+                    "(Urban Dictionary lookup failed due to a technical error — apologize and don't invent a definition.)\n\n",
+                );
+            }
+        }
+    }
+
+    if skill.tools.iter().any(|tool| tool == "imdb_lookup")
+        && let Some(title) = resolved_args.get("title").and_then(|value| value.as_str())
+    {
+        match tools::imdb_lookup(tool_clients.http(), tool_clients.omdb_api_key(), title).await {
+            Ok(context) => user_turn.push_str(&context),
+            Err(err) => {
+                warn!(?err, room_id, skill = %skill.name, "imdb lookup failed");
+                user_turn.push_str(
+                    "(IMDb lookup failed due to a technical error — apologize and don't invent details.)\n\n",
+                );
+            }
+        }
+    }
+
+    if skill.tools.iter().any(|tool| tool == "leafly_strain")
+        && let Some(name) = resolved_args.get("name").and_then(|value| value.as_str())
+    {
+        match tools::leafly_strain(tool_clients.http(), name).await {
+            Ok(context) => user_turn.push_str(&context),
+            Err(err) => {
+                warn!(?err, room_id, skill = %skill.name, "leafly lookup failed");
+                user_turn.push_str(
+                    "(Leafly lookup failed due to a technical error — apologize and don't invent details.)\n\n",
+                );
+            }
+        }
+    }
+
     user_turn.push_str(&format!("Message: {message_text}"));
     if !resolved_args.is_empty() {
         let args_value = serde_json::Value::Object(resolved_args);
@@ -426,7 +541,7 @@ pub async fn execute(
 
     let model = skill.model.as_deref().unwrap_or(classify::MODEL);
 
-    match run_prompt(anthropic, model, &skill.prompt, &user_turn).await {
+    match run_prompt(anthropic, model, &skill.prompt, &user_turn, usage_tracker, &skill.name).await {
         Ok(reply) => reply,
         Err(err) => {
             warn!(?err, skill = %skill.name, "skill prompt failed");
@@ -457,7 +572,14 @@ fn format_entry_tags(entry: &LoggedMessage) -> String {
 /// `user_message` the constructed user turn, and the first text block of the
 /// response is returned. Unlike `classify_message`, this omits `.tools()`/
 /// `.tool_choice()` entirely — there's no schema to fill in, just a generated reply.
-async fn run_prompt(client: &Anthropic, model: &str, system: &str, user_message: &str) -> Result<String> {
+async fn run_prompt(
+    client: &Anthropic,
+    model: &str,
+    system: &str,
+    user_message: &str,
+    usage_tracker: &UsageTracker,
+    label: &str,
+) -> Result<String> {
     let params = MessageCreateBuilder::new(model, 1024)
         .system(system)
         .user(user_message)
@@ -468,6 +590,8 @@ async fn run_prompt(client: &Anthropic, model: &str, system: &str, user_message:
         .create(params)
         .await
         .context("skill prompt request to Claude failed")?;
+
+    usage_tracker.record(label, &message.usage);
 
     for block in message.content {
         if let ContentBlock::Text { text } = block {
@@ -619,6 +743,20 @@ Say a friendly hello to the user.\n";
     }
 
     #[test]
+    fn allows_min_max_on_array_arg() {
+        let raw = "---\nname: x\ndescription: d\nargs:\n  - name: choices\n    type: array\n    min: 2\n---\nbody\n";
+        parse_skill(raw).expect("min/max should be allowed on an array-typed argument");
+    }
+
+    #[test]
+    fn array_type_accepts_string_arrays_and_rejects_others() {
+        assert!(ArgType::Array.matches(&serde_json::json!(["a", "b"])));
+        assert!(ArgType::Array.matches(&serde_json::json!([])), "empty array still type-matches");
+        assert!(!ArgType::Array.matches(&serde_json::json!([1, 2])), "non-string elements should not match");
+        assert!(!ArgType::Array.matches(&serde_json::json!("not an array")));
+    }
+
+    #[test]
     fn rejects_default_type_mismatch() {
         let raw = "---\nname: x\ndescription: d\nargs:\n  - name: count\n    type: integer\n    default: \"five\"\n---\nbody\n";
         let err = parse_skill(raw).unwrap_err();
@@ -747,6 +885,28 @@ Say a friendly hello to the user.\n";
     }
 
     #[test]
+    fn resolve_args_validates_array_length_bounds() {
+        let specs = vec![ArgSpec {
+            name: "choices".to_string(),
+            kind: ArgType::Array,
+            description: None,
+            required: true,
+            default: None,
+            min: Some(2.0),
+            max: Some(5.0),
+        }];
+
+        let err = resolve_args(&specs, &serde_json::json!({"choices": ["only-one"]})).unwrap_err();
+        assert!(err.contains("at least 2"), "{err}");
+
+        let err = resolve_args(&specs, &serde_json::json!({"choices": ["a", "b", "c", "d", "e", "f"]})).unwrap_err();
+        assert!(err.contains("at most 5"), "{err}");
+
+        let resolved = resolve_args(&specs, &serde_json::json!({"choices": ["a", "b", "c"]})).expect("in range");
+        assert_eq!(resolved.get("choices"), Some(&serde_json::json!(["a", "b", "c"])));
+    }
+
+    #[test]
     fn resolve_args_reports_missing_required_argument() {
         let specs = vec![ArgSpec {
             name: "query".to_string(),
@@ -788,6 +948,43 @@ Say a friendly hello to the user.\n";
         let define = registry.get("define").expect("define skill should be present");
         assert!(define.tools.is_empty(), "define should be a pure-prompt skill with no tools");
 
-        assert_eq!(registry.list().len(), 7, "expected all seven shipped skills to load");
+        let random = registry.get("random").expect("random skill should be present");
+        assert!(random.tools.iter().any(|tool| tool == "random_choice"));
+
+        let ud = registry.get("ud").expect("ud skill should be present");
+        assert!(ud.tools.iter().any(|tool| tool == "urban_dictionary"));
+        assert!(registry.get("urban").is_some(), "ud's `urban` alias should resolve");
+
+        let imdb = registry.get("imdb").expect("imdb skill should be present");
+        assert!(imdb.tools.iter().any(|tool| tool == "imdb_lookup"));
+
+        let strain = registry.get("strain").expect("strain skill should be present");
+        assert!(strain.tools.iter().any(|tool| tool == "leafly_strain"));
+
+        assert_eq!(registry.list().len(), 11, "expected all eleven shipped skills to load");
+    }
+
+    /// Regression test for a real bug: the classifier was given no way to learn a
+    /// skill's expected `args` key names, so it would guess a plausible-sounding
+    /// key (e.g. `strain` or `query` instead of `strain`'s declared `name`) that
+    /// `resolve_args` then rejected as missing. `command_reference`'s output is
+    /// embedded directly in the classifier's system prompt — this test locks in
+    /// that every declared arg name actually appears in it.
+    #[test]
+    fn command_reference_lists_every_skill_and_its_declared_arg_names() {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("skills");
+        let registry = SkillRegistry::load(&dir).expect("shipped skills dir should load");
+
+        let reference = registry.command_reference();
+
+        assert!(reference.contains("- help: no arguments"));
+        assert!(reference.contains("- strain"), "{reference}");
+        assert!(reference.contains("name (string, required)"), "{reference}");
+        assert!(reference.contains("- imdb"), "{reference}");
+        assert!(reference.contains("title (string, required)"), "{reference}");
+        assert!(reference.contains("- ud (aliases: urban)"), "{reference}");
+        assert!(reference.contains("term (string, optional)"), "{reference}");
+        assert!(reference.contains("- random"), "{reference}");
+        assert!(reference.contains("choices (array of strings, required)"), "{reference}");
     }
 }
