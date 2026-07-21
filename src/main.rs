@@ -1,6 +1,7 @@
 mod bot;
 mod classify;
 mod config;
+mod greeting;
 mod handler;
 mod message_log;
 mod skills;

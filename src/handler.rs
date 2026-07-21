@@ -18,6 +18,7 @@ use matrix_sdk::{
 use tracing::{debug, info, warn};
 
 use crate::classify::{self, Intent, MessageAnalysis, classify_message};
+use crate::greeting::GreetingCooldown;
 use crate::message_log::{LoggedMessage, MessageLogger};
 use crate::skills::{self, SkillRegistry};
 use crate::tools::ToolClients;
@@ -25,18 +26,47 @@ use crate::usage::UsageTracker;
 
 const UNKNOWN_COMMAND_REPLY: &str = "Unknown command. Try \"help\" to see available commands.";
 
-/// How often to refresh the room's typing indicator while a message is being
-/// processed. Matrix's typing state expires ~4s after the last notice
-/// (`matrix-sdk`'s own `TYPING_NOTICE_TIMEOUT`) unless refreshed, and
-/// classification plus response generation routinely take longer than that.
+/// Whether `generate_response` will actually produce a reply for this message,
+/// without doing any of the work of producing one. The single source of truth
+/// for both `generate_response`'s own dispatch and `on_room_message`'s decision
+/// to show a typing indicator — the indicator should only appear for messages
+/// the bot is actually about to answer, not every message that reaches
+/// classification, so it can't just be inlined separately in both places.
+///
+/// A `Command` whose `message_text` starts with `!` always gets a reply (see
+/// `generate_response`'s doc comment for why the prefix is required).
+/// `Intent::Greeting` bypasses `directed_at_bot` entirely — ported from gordy,
+/// which replied to any greeting from anyone in the room, not just ones
+/// addressed to the bot — gated instead by `should_greet` (the room's
+/// `GreetingCooldown`, checked exactly once by the caller; see
+/// `GreetingCooldown::try_greet`). Every other case — including a would-be
+/// command *without* its `!`, which falls back to plain chat handling — gets a
+/// reply only when `directed_at_bot` is true; `Acknowledgement` never gets one
+/// either way.
+fn will_generate_response(analysis: &MessageAnalysis, message_text: &str, directed_at_bot: bool, should_greet: bool) -> bool {
+    if analysis.intent == Intent::Command && message_text.trim_start().starts_with('!') {
+        return true;
+    }
+    if analysis.intent == Intent::Greeting {
+        return should_greet;
+    }
+    analysis.intent != Intent::Acknowledgement && directed_at_bot
+}
+
+/// How often to refresh the room's typing indicator while a response is being
+/// generated. Matrix's typing state expires ~4s after the last notice
+/// (`matrix-sdk`'s own `TYPING_NOTICE_TIMEOUT`) unless refreshed, and a skill or
+/// chat-reply Claude call routinely takes longer than that.
 const TYPING_REFRESH_INTERVAL: Duration = Duration::from_secs(3);
 
 /// Keeps a room's typing indicator active for as long as it's alive, by looping
-/// `Room::typing_notice(true)` in the background. Started before the first Claude
-/// call in `on_room_message`; either `stop`ped explicitly once a response is ready
-/// (clears the indicator immediately) or, on an early return (classification
-/// failed, no response needed), just dropped — which aborts the refresh loop and
-/// lets the indicator expire on its own within `TYPING_REFRESH_INTERVAL`.
+/// `Room::typing_notice(true)` in the background. `on_room_message` only starts
+/// one once `will_generate_response` confirms a reply is actually coming — not
+/// for every message that reaches classification — then `stop`s it explicitly
+/// once the response is ready (clearing the indicator immediately). If a
+/// `TypingIndicator` is ever dropped without `stop` being called, that still
+/// aborts the refresh loop and lets the indicator expire on its own within
+/// `TYPING_REFRESH_INTERVAL`, rather than looping forever.
 struct TypingIndicator {
     refresh_task: tokio::task::JoinHandle<()>,
 }
@@ -72,8 +102,9 @@ impl Drop for TypingIndicator {
 
 /// Registered as a sync event handler; fires for every `m.room.message` the bot receives
 /// in a room it has joined. `Ctx<Arc<Anthropic>>`, `Ctx<Arc<MessageLogger>>`,
-/// `Ctx<Arc<SkillRegistry>>`, `Ctx<Arc<ToolClients>>`, and `Ctx<Arc<UsageTracker>>` are
-/// injected via `Client::add_event_handler_context` in `bot.rs`.
+/// `Ctx<Arc<SkillRegistry>>`, `Ctx<Arc<ToolClients>>`, `Ctx<Arc<UsageTracker>>`, and
+/// `Ctx<Arc<GreetingCooldown>>` are injected via `Client::add_event_handler_context`
+/// in `bot.rs`.
 #[allow(clippy::too_many_arguments)]
 pub async fn on_room_message(
     event: OriginalSyncRoomMessageEvent,
@@ -84,6 +115,7 @@ pub async fn on_room_message(
     Ctx(skills): Ctx<Arc<SkillRegistry>>,
     Ctx(tool_clients): Ctx<Arc<ToolClients>>,
     Ctx(usage_tracker): Ctx<Arc<UsageTracker>>,
+    Ctx(greeting_cooldown): Ctx<Arc<GreetingCooldown>>,
 ) {
     if room.state() != RoomState::Joined {
         return;
@@ -100,8 +132,6 @@ pub async fn on_room_message(
     };
 
     info!(room = %room.room_id(), sender = %event.sender, "received message");
-
-    let typing = TypingIndicator::start(room.clone());
 
     let analysis = match classify_message(
         &anthropic,
@@ -143,12 +173,22 @@ pub async fn on_room_message(
 
     let directed_at_bot = is_directed_at_bot(&event, &room, &client).await;
 
+    // Checked (and, if true, consumed) exactly once per message here — see
+    // `GreetingCooldown::try_greet`'s doc comment on why calling it twice would
+    // be wrong — then threaded into both the typing-indicator gate below and
+    // `generate_response`, rather than each re-deriving it separately.
+    let should_greet = analysis.intent == Intent::Greeting && greeting_cooldown.try_greet(room.room_id().as_str());
+
+    let typing = will_generate_response(&analysis, &text_content.body, directed_at_bot, should_greet)
+        .then(|| TypingIndicator::start(room.clone()));
+
     let response = generate_response(
         &room,
         &analysis,
         &text_content.body,
         event.sender.as_str(),
         directed_at_bot,
+        should_greet,
         &anthropic,
         &message_log,
         &skills,
@@ -157,7 +197,9 @@ pub async fn on_room_message(
     )
     .await;
 
-    typing.stop(&room).await;
+    if let Some(typing) = typing {
+        typing.stop(&room).await;
+    }
 
     match response {
         Some(response) => {
@@ -211,6 +253,11 @@ async fn is_directed_at_bot(event: &OriginalSyncRoomMessageEvent, room: &Room, c
 /// message classified as a command but missing the prefix falls through to the
 /// same handling as any other intent, below.
 ///
+/// `Intent::Greeting` (ported from gordy — see `GreetingCooldown`) gets a fun,
+/// Claude-generated greeting (see `generate_greeting_reply`) whenever
+/// `should_greet` is true, regardless of `directed_at_bot` — gordy replied to
+/// any greeting from anyone in the room, not just ones addressed to the bot.
+///
 /// Every other intent (and a would-be command without its `!`) gets a real
 /// Claude-generated conversational reply (see `generate_chat_reply`), but only
 /// when `directed_at_bot` is true (an explicit `@mention` or a reply to one of the
@@ -224,12 +271,17 @@ async fn generate_response(
     message_text: &str,
     sender: &str,
     directed_at_bot: bool,
+    should_greet: bool,
     anthropic: &Anthropic,
     message_log: &MessageLogger,
     skills: &SkillRegistry,
     tool_clients: &ToolClients,
     usage_tracker: &UsageTracker,
 ) -> Option<String> {
+    if !will_generate_response(analysis, message_text, directed_at_bot, should_greet) {
+        return None;
+    }
+
     if analysis.intent == Intent::Command && message_text.trim_start().starts_with('!') {
         return Some(
             handle_command(
@@ -246,8 +298,8 @@ async fn generate_response(
         );
     }
 
-    if analysis.intent == Intent::Acknowledgement || !directed_at_bot {
-        return None;
+    if analysis.intent == Intent::Greeting {
+        return Some(generate_greeting_reply(room, message_text, sender, anthropic, message_log, usage_tracker).await);
     }
 
     Some(generate_chat_reply(room, message_text, sender, anthropic, message_log, usage_tracker).await)
@@ -278,6 +330,24 @@ Keep it brief (a sentence or two) unless the message clearly calls for more.";
 /// Label Claude API calls from `generate_chat_reply` are recorded under in `UsageTracker`.
 const CHAT_USAGE_LABEL: &str = "chat";
 
+/// System prompt for greeting replies (`generate_greeting_reply`) — ported from
+/// gordy's greeting behavior (any greeting from anyone in the room got a random
+/// word echoed back from a fixed list; see `GreetingCooldown`), but with an
+/// actual generated reply instead of an echo, and distinctly warmer/more
+/// unreservedly fun than `CHAT_SYSTEM_PROMPT`'s "informative first, mild snark"
+/// tone — a greeting isn't the place for snark.
+const GREETING_SYSTEM_PROMPT: &str = "You are a member of this Matrix chat room and someone just greeted \
+the room (\"hi\", \"good morning\", etc.) — not necessarily addressed at you specifically. Reply with a \
+genuinely fun, warm, and friendly greeting of your own: upbeat, welcoming, maybe a little playful. Don't \
+just echo the same greeting back flatly. You'll be given the room's recent chat history (sender and \
+message, oldest first) before the greeting you're replying to — use it if there's something worth calling \
+back to (greeting the specific person, referencing what's been going on), but don't force a callback if \
+there's nothing there; a simple enthusiastic greeting is fine on its own. Keep it brief — a sentence, \
+maybe two.";
+
+/// Label Claude API calls from `generate_greeting_reply` are recorded under in `UsageTracker`.
+const GREETING_USAGE_LABEL: &str = "greeting";
+
 /// Generates a free-form conversational reply to a message directed at the bot,
 /// grounded in the room's recent history (`MessageLogger::recent`) and who sent
 /// the message, using the same default model as the classifier (`classify::MODEL`)
@@ -290,6 +360,57 @@ async fn generate_chat_reply(
     message_log: &MessageLogger,
     usage_tracker: &UsageTracker,
 ) -> String {
+    generate_grounded_reply(
+        room,
+        message_text,
+        sender,
+        CHAT_SYSTEM_PROMPT,
+        CHAT_USAGE_LABEL,
+        anthropic,
+        message_log,
+        usage_tracker,
+    )
+    .await
+}
+
+/// Generates a fun, Claude-written greeting in reply to someone greeting the
+/// room — see `generate_response` and `GREETING_SYSTEM_PROMPT`.
+async fn generate_greeting_reply(
+    room: &Room,
+    message_text: &str,
+    sender: &str,
+    anthropic: &Anthropic,
+    message_log: &MessageLogger,
+    usage_tracker: &UsageTracker,
+) -> String {
+    generate_grounded_reply(
+        room,
+        message_text,
+        sender,
+        GREETING_SYSTEM_PROMPT,
+        GREETING_USAGE_LABEL,
+        anthropic,
+        message_log,
+        usage_tracker,
+    )
+    .await
+}
+
+/// Shared implementation behind `generate_chat_reply` and `generate_greeting_reply`:
+/// sends `message_text` (plus the room's recent history, via `format_chat_turn`) to
+/// Claude under `system_prompt`, recording usage under `usage_label`. The only
+/// difference between the two callers is which persona/prompt and label they pass.
+#[allow(clippy::too_many_arguments)]
+async fn generate_grounded_reply(
+    room: &Room,
+    message_text: &str,
+    sender: &str,
+    system_prompt: &str,
+    usage_label: &str,
+    anthropic: &Anthropic,
+    message_log: &MessageLogger,
+    usage_tracker: &UsageTracker,
+) -> String {
     // Fetch one extra entry and drop it if it's this same message: `on_room_message`
     // already logged the current message before calling this, so `recent` would
     // otherwise include it a second time (once in the history block, once as "the
@@ -297,7 +418,7 @@ async fn generate_chat_reply(
     let mut history = match message_log.recent(room.room_id().as_str(), CHAT_HISTORY_LIMIT + 1) {
         Ok(history) => history,
         Err(err) => {
-            warn!(?err, room = %room.room_id(), "failed to load chat history for chat reply; replying without it");
+            warn!(?err, room = %room.room_id(), "failed to load chat history for reply; replying without it");
             Vec::new()
         }
     };
@@ -308,19 +429,19 @@ async fn generate_chat_reply(
     let user_turn = format_chat_turn(&history, sender, message_text);
 
     let params = MessageCreateBuilder::new(classify::MODEL, 512)
-        .system(CHAT_SYSTEM_PROMPT)
+        .system(system_prompt)
         .user(user_turn)
         .build();
 
     let message = match anthropic.messages().create(params).await {
         Ok(message) => message,
         Err(err) => {
-            warn!(?err, "chat reply request to Claude failed");
+            warn!(?err, "reply generation request to Claude failed");
             return "Sorry, I couldn't come up with a reply to that.".to_string();
         }
     };
 
-    usage_tracker.record(CHAT_USAGE_LABEL, &message.usage);
+    usage_tracker.record(usage_label, classify::MODEL, &message.usage);
 
     for block in message.content {
         if let ContentBlock::Text { text } = block {
@@ -453,6 +574,65 @@ mod tests {
                 command: None,
             },
         }
+    }
+
+    fn analysis_with_intent(intent: Intent) -> MessageAnalysis {
+        MessageAnalysis {
+            intent,
+            confidence: 0.9,
+            requires_response: true,
+            summary: "test".to_string(),
+            sentiment: Sentiment::Neutral,
+            entities: vec![],
+            command: None,
+        }
+    }
+
+    #[test]
+    fn will_generate_response_requires_bang_prefix_for_commands() {
+        let analysis = analysis_with_intent(Intent::Command);
+        assert!(will_generate_response(&analysis, "!strain gsc", false, false));
+        assert!(
+            will_generate_response(&analysis, "  !strain gsc", false, false),
+            "leading whitespace before ! is still a command"
+        );
+        assert!(!will_generate_response(&analysis, "strain gsc", false, false), "no ! and not directed at bot");
+    }
+
+    #[test]
+    fn will_generate_response_falls_back_to_directed_at_bot_for_bangless_commands() {
+        let analysis = analysis_with_intent(Intent::Command);
+        assert!(
+            will_generate_response(&analysis, "strain gsc", true, false),
+            "no ! but directed at bot still gets a chat reply"
+        );
+    }
+
+    #[test]
+    fn will_generate_response_requires_directed_at_bot_for_non_commands() {
+        let analysis = analysis_with_intent(Intent::Chitchat);
+        assert!(will_generate_response(&analysis, "hey what's up", true, false));
+        assert!(!will_generate_response(&analysis, "hey what's up", false, false));
+    }
+
+    #[test]
+    fn will_generate_response_never_replies_to_acknowledgements() {
+        let analysis = analysis_with_intent(Intent::Acknowledgement);
+        assert!(!will_generate_response(&analysis, "thanks", true, true));
+        assert!(!will_generate_response(&analysis, "thanks", false, true));
+    }
+
+    #[test]
+    fn will_generate_response_greetings_bypass_directed_at_bot_but_require_should_greet() {
+        let analysis = analysis_with_intent(Intent::Greeting);
+        assert!(
+            will_generate_response(&analysis, "hi everyone", false, true),
+            "a greeting not addressed at the bot still gets a reply if should_greet is true"
+        );
+        assert!(
+            !will_generate_response(&analysis, "hi everyone", true, false),
+            "should_greet false (e.g. cooldown not elapsed) refuses even if directed at the bot"
+        );
     }
 
     #[test]

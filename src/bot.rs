@@ -12,6 +12,7 @@ use matrix_sdk::{
 use tracing::{info, warn};
 
 use crate::config::Config;
+use crate::greeting::GreetingCooldown;
 use crate::handler::on_room_message;
 use crate::message_log::MessageLogger;
 use crate::skills::SkillRegistry;
@@ -27,6 +28,7 @@ pub struct Bot {
     skills: Arc<SkillRegistry>,
     tool_clients: Arc<ToolClients>,
     usage_tracker: Arc<UsageTracker>,
+    greeting_cooldown: Arc<GreetingCooldown>,
 }
 
 impl Bot {
@@ -80,7 +82,10 @@ impl Bot {
         let usage_tracker = Arc::new(UsageTracker::new());
         client.add_event_handler_context(Arc::clone(&usage_tracker));
 
-        Ok(Self { client, message_log, skills, tool_clients, usage_tracker })
+        let greeting_cooldown = Arc::new(GreetingCooldown::new(crate::greeting::DEFAULT_COOLDOWN));
+        client.add_event_handler_context(Arc::clone(&greeting_cooldown));
+
+        Ok(Self { client, message_log, skills, tool_clients, usage_tracker, greeting_cooldown })
     }
 
     /// Restores a previously saved session if one exists at `<store_path>/session.json`
@@ -146,6 +151,13 @@ impl Bot {
     /// without going through the event handler.
     pub fn usage_tracker(&self) -> Arc<UsageTracker> {
         Arc::clone(&self.usage_tracker)
+    }
+
+    /// A clone of the shared per-room greeting-cooldown handle. No current
+    /// external consumer, but every other shared resource has this accessor.
+    #[allow(dead_code)]
+    pub fn greeting_cooldown(&self) -> Arc<GreetingCooldown> {
+        Arc::clone(&self.greeting_cooldown)
     }
 
     /// Joins every room configured for monitoring. Already-joined rooms are skipped.

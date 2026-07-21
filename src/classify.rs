@@ -119,7 +119,7 @@ pub async fn classify_message(
         .await
         .context("classify_message request to Claude failed")?;
 
-    usage_tracker.record(USAGE_LABEL, &message.usage);
+    usage_tracker.record(USAGE_LABEL, MODEL, &message.usage);
 
     for block in message.content {
         if let ContentBlock::ToolUse { name, input, .. } = block

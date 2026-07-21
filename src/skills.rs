@@ -591,7 +591,7 @@ async fn run_prompt(
         .await
         .context("skill prompt request to Claude failed")?;
 
-    usage_tracker.record(label, &message.usage);
+    usage_tracker.record(label, model, &message.usage);
 
     for block in message.content {
         if let ContentBlock::Text { text } = block {

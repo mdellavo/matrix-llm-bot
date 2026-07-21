@@ -190,10 +190,12 @@ const INDEX_HTML: &str = r#"<!doctype html>
     <dt>Input tokens</dt><dd id="usage-input-tokens">…</dd>
     <dt>Output tokens</dt><dd id="usage-output-tokens">…</dd>
     <dt>Requests</dt><dd id="usage-requests">…</dd>
+    <dt>Estimated cost</dt><dd id="usage-cost">…</dd>
   </dl>
+  <p id="usage-unpriced-note" style="display: none;"></p>
   <table>
     <thead>
-      <tr><th>Label</th><th>Input tokens</th><th>Output tokens</th><th>Total tokens</th><th>Requests</th></tr>
+      <tr><th>Label</th><th>Input tokens</th><th>Output tokens</th><th>Total tokens</th><th>Requests</th><th>Est. cost</th></tr>
     </thead>
     <tbody id="usage-body"></tbody>
   </table>
@@ -287,12 +289,16 @@ async function loadSkills() {
   }
 }
 
+function formatCost(usd) {
+  return `$${usd.toFixed(4)}`;
+}
+
 async function loadUsage() {
   const res = await fetch('/api/usage');
   const tbody = document.getElementById('usage-body');
   tbody.innerHTML = '';
   if (!res.ok) {
-    tbody.innerHTML = `<tr><td colspan="5">Failed to load usage: ${escapeHtml(await res.text())}</td></tr>`;
+    tbody.innerHTML = `<tr><td colspan="6">Failed to load usage: ${escapeHtml(await res.text())}</td></tr>`;
     return;
   }
   const usage = await res.json();
@@ -300,9 +306,18 @@ async function loadUsage() {
   document.getElementById('usage-input-tokens').textContent = usage.input_tokens;
   document.getElementById('usage-output-tokens').textContent = usage.output_tokens;
   document.getElementById('usage-requests').textContent = usage.request_count;
+  document.getElementById('usage-cost').textContent = formatCost(usage.estimated_cost_usd);
+
+  const unpricedNote = document.getElementById('usage-unpriced-note');
+  if (usage.unpriced_requests > 0) {
+    unpricedNote.style.display = '';
+    unpricedNote.textContent = `Note: ${usage.unpriced_requests} request(s) used a model with no known price and are not included in the cost estimate above.`;
+  } else {
+    unpricedNote.style.display = 'none';
+  }
 
   if (usage.by_label.length === 0) {
-    tbody.innerHTML = '<tr><td colspan="5">(no Claude API calls recorded yet)</td></tr>';
+    tbody.innerHTML = '<tr><td colspan="6">(no Claude API calls recorded yet)</td></tr>';
     return;
   }
   for (const entry of usage.by_label) {
@@ -313,6 +328,7 @@ async function loadUsage() {
       <td>${entry.output_tokens}</td>
       <td>${entry.input_tokens + entry.output_tokens}</td>
       <td>${entry.request_count}</td>
+      <td>${formatCost(entry.estimated_cost_usd)}${entry.unpriced_requests > 0 ? ' *' : ''}</td>
     `;
     tbody.appendChild(row);
   }
@@ -428,7 +444,7 @@ mod tests {
         let skills = Arc::new(SkillRegistry::load(&skills_dir).expect("load skills"));
         let tool_clients = Arc::new(ToolClients::new(None));
         let usage_tracker = Arc::new(UsageTracker::new());
-        usage_tracker.record("classify", &test_usage(120, 30));
+        usage_tracker.record("classify", "claude-haiku-4-5", &test_usage(120, 30));
 
         let state = Arc::new(AppState {
             start_time: Instant::now(),
@@ -495,6 +511,9 @@ mod tests {
         assert_eq!(usage["input_tokens"], 120);
         assert_eq!(usage["output_tokens"], 30);
         assert_eq!(usage["request_count"], 1);
+        // 120 input tokens @ $1.00/M + 30 output tokens @ $5.00/M for claude-haiku-4-5.
+        assert!((usage["estimated_cost_usd"].as_f64().expect("cost") - 0.00027).abs() < 1e-9);
+        assert_eq!(usage["unpriced_requests"], 0);
         let by_label = usage["by_label"].as_array().expect("by_label array");
         assert_eq!(by_label.len(), 1);
         assert_eq!(by_label[0]["label"], "classify");
