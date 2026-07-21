@@ -342,8 +342,8 @@ genuinely fun, warm, and friendly greeting of your own: upbeat, welcoming, maybe
 just echo the same greeting back flatly. You'll be given the room's recent chat history (sender and \
 message, oldest first) before the greeting you're replying to — use it if there's something worth calling \
 back to (greeting the specific person, referencing what's been going on), but don't force a callback if \
-there's nothing there; a simple enthusiastic greeting is fine on its own. Keep it brief — a sentence, \
-maybe two.";
+there's nothing there; a simple enthusiastic greeting is fine on its own. Keep it SHORT — anywhere from a \
+single word/exclamation (\"Heyyy!\") up to one short sentence at most. Never more than one sentence.";
 
 /// Label Claude API calls from `generate_greeting_reply` are recorded under in `UsageTracker`.
 const GREETING_USAGE_LABEL: &str = "greeting";

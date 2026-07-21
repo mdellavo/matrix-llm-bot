@@ -1,6 +1,8 @@
 # matrix-llm-bot
 
-A Rust Matrix chat bot built on [`matrix-sdk`](https://github.com/matrix-org/matrix-rust-sdk), with TLS and E2E encryption support out of the box. It joins a configurable set of rooms and, for every message it receives, calls Claude (via [`anthropic-sdk-rust`](https://crates.io/crates/anthropic-sdk-rust)) to classify the message into a structured `MessageAnalysis` (see `src/classify.rs`) — intent, sentiment, entities, whether it needs a reply at all, and (for commands) a name and arguments. Commands dispatch to **skills**: prompts loaded from `skills/<name>/SKILL.md`, modeled on Claude Code's Skills, each run through Claude to produce a real generated reply (see "Commands (skills)" below). Every other intent gets a real Claude-generated reply too — informative first, with a light, mildly snarky sense of humor, grounded in the room's recent chat history rather than replying in a vacuum (see `generate_chat_reply`/`CHAT_SYSTEM_PROMPT` in `src/handler.rs`) — but only when the message actually addresses the bot — an `@mention` or a reply to one of its own messages (see `is_directed_at_bot`) — so it doesn't jump into ambient conversation between humans. `Intent::Greeting` is the one exception: ported from *gordy* (a separate, existing Matrix bot referenced read-only during development — see "Commands (skills)" below), it replies to any greeting from anyone in the room, addressed at the bot or not, subject to a per-room 5-minute cooldown (`GreetingCooldown`, `src/greeting.rs`) so a busy room doesn't get a bot reply on every single "hi". Alongside the sync loop, a small [`axum`](https://github.com/tokio-rs/axum) HTTP server (`src/status_server.rs`) serves a status/debugging page and JSON API over the same data.
+A Rust Matrix chat bot built on [`matrix-sdk`](https://github.com/matrix-org/matrix-rust-sdk), with TLS and E2E encryption support out of the box.
+
+It joins a configured set of rooms and uses Claude to understand every message it sees — classifying intent, sentiment, and (for commands) arguments — before deciding whether and how to respond. Commands dispatch to **skills**: prompt files modeled on Claude Code's Skills. Casual messages get a real, Claude-generated reply too, but only when the bot is actually addressed (an `@mention` or a reply), except greetings, which get a fun reply regardless, on a cooldown. A small built-in HTTP server exposes a status/debugging page alongside the sync loop.
 
 ## Setup
 
@@ -15,7 +17,7 @@ A Rust Matrix chat bot built on [`matrix-sdk`](https://github.com/matrix-org/mat
    - `username` / `password` — the bot account's login credentials
    - `rooms` — room IDs (`!abc:example.org`) or aliases (`#room:example.org`) to join and monitor
 
-3. Set `ANTHROPIC_API_KEY` in the environment (used by the message classifier in `src/classify.rs`):
+3. Set `ANTHROPIC_API_KEY` in the environment:
 
    ```sh
    export ANTHROPIC_API_KEY="sk-ant-..."
@@ -31,7 +33,7 @@ A Rust Matrix chat bot built on [`matrix-sdk`](https://github.com/matrix-org/mat
    cargo run
    ```
 
-   By default it reads `config.toml` from the current directory; set `MATRIX_LLM_BOT_CONFIG` to point elsewhere. Set `RUST_LOG` (e.g. `RUST_LOG=debug`) to control log verbosity — this overrides the built-in default (`info`, with two chatty-but-harmless `matrix-sdk` internals quieted; see `DEFAULT_LOG_FILTER` in `src/main.rs`) entirely, so include `matrix_sdk_base`/`matrix_sdk_crypto` directives yourself if you set it and still want those quieted.
+   By default it reads `config.toml` from the current directory; set `MATRIX_LLM_BOT_CONFIG` to point elsewhere. Set `RUST_LOG` (e.g. `RUST_LOG=debug`) to control log verbosity.
 
 5. Open the status/debugging page at <http://127.0.0.1:8080> (or wherever `http_listen_addr` points).
 
@@ -64,95 +66,46 @@ provided below for the user in a clear, concise way. ...
 
 Frontmatter fields:
 
-- `name` / `description` (required) — the command name matched against the
-  classifier's extracted `command.name`, and the one-line description shown in `help`.
+- `name` / `description` (required) — the command name and its one-line description in `help`.
 - `usage` (optional) — a usage hint shown alongside the description in `help`.
-- `aliases` (optional) — other names that resolve to this skill (e.g. `history` /
-  `recent`), matched case-insensitively like `name`. An alias that collides with
-  another skill's name or another skill's alias fails the whole load at startup —
-  same ambiguous-dispatch reasoning as duplicate skill names, see below.
-- `model` (optional) — overrides which Claude model runs this skill's prompt (e.g.
-  `claude-sonnet-5` for a skill that needs more capability than the classifier's
-  default `claude-haiku-4-5`). Falls back to `classify::MODEL` if unset.
-- `tools` (optional) — capabilities the skill needs; the bot fetches the relevant
-  context and injects it before calling Claude. Recognized values:
-  - `message_log` — that room's recent messages (count from the `count` arg if
-    declared, default 5, capped at 20 either way).
+- `aliases` (optional) — other names that resolve to this skill.
+- `model` (optional) — overrides which Claude model runs this skill's prompt; defaults to the classifier's model.
+- `tools` (optional) — capabilities the skill needs; the bot fetches the relevant context and injects it before calling Claude:
+  - `message_log` — that room's recent messages.
   - `room_info` — the room's ID, name, and topic.
-  - `current_time` — the current UTC time (skills reasoning about "today"/"now" need
-    this explicitly; the model has no clock of its own).
-  - `random_choice` — a true random pick (real Rust randomness, not an LLM guess)
-    over the skill's `choices` argument.
-  - `urban_dictionary` / `imdb_lookup` / `leafly_strain` — real outbound HTTP calls
-    to Urban Dictionary, OMDb, and Leafly's (unofficial) consumer API, respectively;
-    see `src/tools.rs`. Claude itself never makes these calls or sees raw JSON — the
-    Rust code fetches and formats the result (or a clear "not found"/"lookup failed"
-    line) as context *before* the one completion call, same as every other tool.
-- `args` (optional) — declares expected arguments by name, `type`
-  (`string`/`integer`/`number`/`boolean`/`array` — `array` means an array of strings,
-  e.g. `random`'s `choices`), and optionally `description`, `required`, `default`,
-  and `min`/`max` (numeric types: value bounds; `array`: element-count bounds). If a
-  skill declares `args`, its invocation's parsed arguments are validated against this
-  schema before Claude is ever called — a missing required argument, wrong type, or
-  out-of-range value/length gets an immediate `Invalid arguments: ...` reply instead
-  of an LLM call. A skill that declares no `args` gets the classifier's raw extracted
-  arguments unvalidated (backward-compatible free-form behavior).
+  - `current_time` — the current UTC time.
+  - `random_choice` — a true random pick (real Rust randomness, not an LLM guess).
+  - `urban_dictionary` / `imdb_lookup` / `leafly_strain` — outbound HTTP calls to Urban Dictionary, OMDb, and Leafly, respectively (see `src/tools.rs`).
+- `args` (optional) — declares expected arguments (name, type, required/default/bounds). If declared, arguments are validated before Claude is ever called; a skill with no `args` gets the classifier's raw extracted arguments unvalidated.
 
-When a message classifies as `intent: command`, `handle_command` in `src/handler.rs`
-looks up `command.name` (case-insensitively, checking aliases too) in the loaded
-`SkillRegistry` (`src/skills.rs`) and, if found, sends the skill's prompt to Claude as
-the system prompt — along with the user's raw message text, the validated/defaulted
-command arguments, and any injected tool context — and replies with the generated text
-(`skills::execute`, a plain completion call with no forced tool use, unlike
-`classify_message`). `help` is a reserved, built-in command (not a skill file) that
-lists every loaded skill (including its aliases); an unrecognized or missing command
-name gets a friendly `Unknown command. Try "help"...` reply instead of silently
-falling through to the generic stub.
+A command's args are extracted by the same Claude call that classifies the message (`src/classify.rs`), matched against each skill's declared argument names so the classifier doesn't have to guess them. Commands only actually dispatch when the message starts with a literal `!` — the classifier can recognize command *intent* without one, but running a skill off just that guess would be too easy to trigger by accident.
 
 Eleven skills ship as worked examples under `skills/`:
 
 | Skill | Aliases | Tools | Demonstrates |
 | --- | --- | --- | --- |
-| `history` | `recent` | `message_log` | the original worked example — `aliases` + an `args` schema (`count`, defaulted/bounded) |
+| `history` | `recent` | `message_log` | aliases + a bounded/defaulted arg |
 | `room` | — | `room_info`, `current_time` | injecting room metadata and the current time |
 | `digest` | `summary` | `message_log` | thematic summarization vs. `history`'s raw listing |
-| `vibe` | — | `message_log` | reading the `sentiment` the classifier already tagged each message with |
-| `topics` | — | `message_log` | reading the `entities` the classifier already tagged each message with |
+| `vibe` | — | `message_log` | reading each message's classified sentiment |
+| `topics` | — | `message_log` | reading each message's tagged entities |
 | `standup` | — | `message_log`, `current_time` | combining two tools in one skill |
-| `define` | — | *(none)* | a pure-prompt skill with a required `string` argument and no tools at all |
-| `random` | — | `random_choice` | an `array`-typed arg (`choices`, `min: 2`) and real Rust-side randomness — Claude only phrases the already-made pick |
-| `ud` | `urban` | `urban_dictionary` | an optional arg with deliberately *no* default, so omitting it hits Urban Dictionary's own random-word behavior instead of a bot-side default |
-| `imdb` | — | `imdb_lookup` | an outbound HTTP call to a third-party API (OMDb) requiring a configured API key (`omdb_api_key`, see below) |
-| `strain` | — | `leafly_strain` | an outbound HTTP call plus real disambiguation logic (AKA-name parsing, last-exact-match-wins selection) ported faithfully from gordy |
+| `define` | — | *(none)* | a pure-prompt skill, no tools |
+| `random` | — | `random_choice` | real randomness — Claude only phrases the pick |
+| `ud` | `urban` | `urban_dictionary` | an optional arg with no default, so omitting it falls through to Urban Dictionary's own random-word behavior |
+| `imdb` | — | `imdb_lookup` | a third-party API call requiring a configured key |
+| `strain` | — | `leafly_strain` | an API call plus real disambiguation logic |
 
-`random`, `ud`, `imdb`, and `strain` are ported from *gordy*, a separate, existing Matrix bot referenced read-only during development. gordy's `help` needed no port (matrix-llm-bot already has an equivalent built-in), and its `pp` (procedural animated-GIF generation via PIL, no LLM involved, binary media output) was deliberately skipped as out of scope for a prompt/skill system. `imdb` was re-pointed from gordy's original scraping library to the documented OMDb API. The `imdb` skill needs `omdb_api_key` set in `config.toml` (see `config.toml.example`); without it, the skill replies with a clear "not configured" message instead of attempting a lookup or calling Claude at all.
+`random`, `ud`, `imdb`, and `strain` are ported from *gordy*, a separate Matrix bot referenced read-only during development; `imdb` was re-pointed from gordy's scraping approach to the documented OMDb API.
 
-`vibe` and `topics` are only possible because the `message_log` tool's injected
-context includes each message's sentiment and tagged entities (`format_entry_tags` in
-`src/skills.rs`) — data the classifier was already computing and logging, just not
-previously surfaced anywhere. Unlike `store_path` and `message_log_dir`, `skills_dir`
-holds source you write, not runtime state, so it's **not** git-ignored.
-
-A skill file with bad frontmatter, an unknown `tools`/`args` entry, or a missing
-`SKILL.md` is skipped with a `tracing::warn!` at startup — the bot still starts and
-every other skill still works. The things that *do* fail startup: two skills sharing
-the same `name` across different directories, or an `alias` colliding with another
-skill's name or alias — all ambiguous-dispatch situations the bot can't silently
-resolve on your behalf.
+A skill file with bad frontmatter or an unrecognized `tools`/`args` entry is skipped with a warning at startup — everything else still loads. Two skills sharing a `name`, or an alias colliding with another skill's name/alias, fails startup instead, since the bot can't resolve that ambiguity on your behalf.
 
 ## Notes
 
-- Session and E2E crypto state are persisted to `./data/store` (SQLite) so encryption keys survive restarts. This path is git-ignored, as is `config.toml`.
-- Device verification/cross-signing is **not** implemented — the bot will implicitly trust devices it encounters. Add explicit verification in `Bot::new` (`src/bot.rs`) before relying on this in encrypted rooms you care about.
-- `on_room_message` (`src/handler.rs`) shows a typing indicator only for messages that are actually about to get a reply — `will_generate_response` (the same check `generate_response` itself dispatches on: a `!`-prefixed command, or any other non-`Acknowledgement` intent that's `directed_at_bot`) gates whether a `TypingIndicator` is started at all, so the bot doesn't flicker "typing…" on every message that merely reaches classification. Once started, it loops `Room::typing_notice(true)` every `TYPING_REFRESH_INTERVAL` (3s) in the background, since Matrix's typing state expires after ~4s unless refreshed and a skill or chat-reply Claude call routinely takes longer than that. It's stopped (clearing the indicator immediately) once the response is ready to send.
-- Every reply (`send_message` in `src/handler.rs`) is directed at whoever sent the message that triggered it: the body is prefixed with a Markdown link to the sender's `matrix.to` URI (e.g. `[@alice:matrix.org](https://matrix.to/#/@alice:matrix.org): ...`), which clients render as a highlighted "pill," and the Matrix intentional-mention field (`m.mentions`) is set to that user so it actually notifies them rather than just naming them in the text.
-- Every message is classified via a forced tool call to Claude (`claude-haiku-4-5` — cheap and fast, well-suited to this constrained extraction task) before the bot decides whether/how to respond — see `MessageAnalysis` in `src/classify.rs` for the schema (intent, confidence, sentiment, entities, command). Message metadata already known from the Matrix event (sender, room, timestamp) is deliberately *not* part of that schema — it's attached in code, not re-derived by the model. The classifier's system prompt is built with `SkillRegistry::command_reference()` (`src/skills.rs`), which lists every loaded skill's name/aliases and its declared `args` key names/types — without this, the model has no way to know a skill expects (say) an arg named `name` rather than `strain`/`query`/anything else it might otherwise guess, and `resolve_args` would reject the mismatched key as missing.
-- The classifier can recognize command intent from natural language alone (it'll classify `strain gsc` as a command just as readily as `!strain gsc`), but `generate_response` (`src/handler.rs`) only actually dispatches to a skill when the raw message also starts with `!` — a deterministic, LLM-independent gate on top of the model's judgment, so a skill can't fire off an offhand sentence that merely sounds command-like. A message classified as a command but missing the `!` falls through to the normal chat-reply handling (only replied to if it's directed at the bot, per `is_directed_at_bot` below).
-- Every classified message — whether or not the bot replies — is appended as one JSON line to a per-room log file under `message_log_dir` (default `./data/messages`; git-ignored), one file per room named after its sanitized room ID (e.g. `_abcDEFghi_matrix.org.jsonl`), via `MessageLogger` in `src/message_log.rs`. Each line has `logged_at`, `room_id`, `event_id`, `sender`, `origin_server_ts_ms`, `body`, and the full `analysis` object. Logging is synchronous (a small `write()` under a `std::sync::Mutex`, one open file handle per room, held for the process lifetime); move it to `tokio::task::spawn_blocking` if message volume ever makes that a bottleneck.
-- `generate_response` in `src/handler.rs` handles `Intent::Command` messages via skills (see "Commands (skills)" above) regardless of addressing. Most other intents (questions, chitchat, ...) are answered by `generate_chat_reply` — a real Claude completion, but only when `is_directed_at_bot` returns true: the message either `@mentions` the bot (Matrix's `m.mentions`) or is a reply to one of the bot's own prior messages (resolved via `Room::event` on the `m.relates_to` target). The classifier's own `requires_response` judgment (text-only, no addressing signal) still gates everything first; without an explicit mention/reply on top of that, the bot stays silent rather than replying to every question a human asks another human. `Intent::Acknowledgement` never gets a reply either way. `CHAT_SYSTEM_PROMPT` gives the bot an informative-and-helpful-first personality with a light, mildly snarky sense of humor woven in (a dry aside, occasional teasing) rather than a formal-assistant tone — the humor is seasoning on top of an actual answer, not the point of the reply — with a good-natured boundary baked into the prompt (no targeting protected traits, no genuinely cutting remarks meant to hurt someone, no inventing personal details). Replies are grounded in the room's recent history: `generate_chat_reply` pulls the last `CHAT_HISTORY_LIMIT` (20) messages via `MessageLogger::recent` and formats them as a `sender: body` transcript ahead of the message being replied to, so the bot can call back to running jokes or a specific user's own history in the room instead of replying in a vacuum. Usage from these calls is tracked under the `"chat"` label (see `UsageTracker` below).
-- `Intent::Greeting` is handled separately, ported from gordy's greeting behavior (`gordy/bot.py`: any message whose exact body matched one of ~18 hardcoded greeting words got a random word echoed back from that same list, once per room per 5-minute window). Here it's driven by the classifier's `Intent::Greeting` instead of gordy's fixed word list (catches "good morning everyone" as readily as "hi"), replies bypass `is_directed_at_bot` entirely (matching gordy — any greeting from anyone in the room, not just ones addressed to the bot), and the reply itself is a real Claude completion (`generate_greeting_reply`/`GREETING_SYSTEM_PROMPT`, tracked under the `"greeting"` usage label) grounded in recent history the same way `generate_chat_reply` is — via a shared `generate_grounded_reply` helper — rather than an echoed word. The per-room cooldown is ported as `GreetingCooldown` (`src/greeting.rs`, 5-minute default): `on_room_message` calls `GreetingCooldown::try_greet` at most once per message, and threads the resulting `should_greet` bool into both the typing-indicator gate and `generate_response`, since calling `try_greet` a second time for the same message would incorrectly consume the cooldown.
-- The `message_log` skill tool reads via `MessageLogger::recent(room_id, limit)`, which parses that room's JSONL file from disk on every call — no in-memory cache.
-- The `random_choice`, `urban_dictionary`, `imdb_lookup`, and `leafly_strain` tools live in `src/tools.rs`, behind a shared `ToolClients` (one reused `reqwest::Client`, plus the optional OMDb key). Unlike the local tools, these make real outbound HTTP calls to third-party APIs — `reqwest` (with `rustls`, reusing matrix-sdk's already-compiled TLS stack rather than a second openssl-based one) and `rand` (true Rust-side randomness for `random_choice`, not an LLM guess) are the two dependencies this added. A lookup failure here (network/HTTP/parse error) is logged and turned into an explicit "(this lookup failed due to a technical error...)" line appended to the prompt context, so Claude apologizes instead of inventing an answer — a third failure-handling pattern alongside `message_log`'s silent skip and `run_prompt`'s generic fallback. No automated test hits any of these live APIs; verify them with a manual smoke test through an actual Matrix room.
-- Every Claude API call's token usage is accumulated in-memory by `UsageTracker` (`src/usage.rs`) — the classifier (`classify_message`, labeled `"classify"`), `generate_chat_reply` (labeled `"chat"`), and every skill's completion (`skills::execute`'s `run_prompt`, labeled by skill name) each record their `input_tokens`/`output_tokens` there right after the response comes back, along with the model that call actually used (a skill's own `model:` override if it has one — see "Commands (skills)" — not necessarily `classify::MODEL`, since cost depends on it). Each recorded call also gets an estimated USD cost via `price_per_million_tokens`, a hardcoded (not live-fetched) per-model pricing table; a call recorded under a model missing from that table still counts toward token/request totals but is tallied separately as `unpriced_requests` rather than silently treated as free. It's the number that actually answers "how much is this bot costing," and nothing else in the bot tracked it before. In-memory only — resets on restart, same as everything but the message log and the crypto store — and exposed via the status server's `/api/usage` (see below) and the status page's "Claude API usage" section (overall + per-label cost estimates, and a note if any requests went unpriced).
-- The status/debugging server (`src/status_server.rs`) runs as a separate `tokio::spawn`ed task alongside the sync loop, reading the same `Client`, `MessageLogger`, `SkillRegistry`, and `UsageTracker` the bot uses — it doesn't duplicate any state. Routes: `GET /` (HTML page — bot status, token usage totals and a per-label breakdown table, a room dropdown with recent classified messages, and a table of loaded commands), `GET /api/status` (bot user, homeserver, classifier model, uptime, joined rooms as JSON), `GET /api/rooms/{room_id}/messages?limit=N` (that room's recent `LoggedMessage`s as JSON), `GET /api/skills` (loaded commands' name/description/usage/tools/aliases/model as JSON), `GET /api/usage` (overall and per-label — `"classify"` or a skill name — token/request totals as JSON). **No authentication** — binds to `127.0.0.1` by default (`http_listen_addr` in config); only widen this deliberately, and put it behind your own auth/reverse proxy if you do.
-- `anthropic-sdk-rust` is a third-party community crate, not an Anthropic-maintained SDK — pin/review it accordingly. It also defines a `ServerTool::WebSearch` type that's never actually wired into the request builder (`MessageCreateParams.tools` only accepts custom `Tool`s) — so a `web_search` skill tool isn't feasible without bypassing the crate with a raw HTTP call, which we've deliberately not done.
+- Session and E2E crypto state persist to `./data/store` (SQLite); `config.toml` and `data/` are git-ignored. Device verification/cross-signing isn't implemented — the bot implicitly trusts devices it encounters (see `Bot::new` in `src/bot.rs` before relying on this for rooms you care about).
+- Every message is logged per-room as JSONL (`src/message_log.rs`), whether or not the bot replies to it — this is what skills like `history`/`digest`/`vibe` read from, and what the status page's room browser shows.
+- Non-command replies are Claude-generated, not canned, but gated: casual chat only gets a reply when the bot is actually addressed (`@mention` or a reply-to; see `is_directed_at_bot` in `src/handler.rs`), while greetings (ported from gordy) reply to anyone, on a per-room 5-minute cooldown (`src/greeting.rs`) so a busy room doesn't get greeted on every "hi".
+- Replies show a typing indicator while being generated and are always directed at (and `@`-mention) whoever triggered them.
+- Claude API token usage and an estimated USD cost are tracked in-memory per command/reply type and exposed on the status page (`src/usage.rs`) — cost estimates are based on a hardcoded pricing table, not fetched live.
+- The status/debugging server (`src/status_server.rs`) has **no authentication** and binds to `127.0.0.1` by default — only widen `http_listen_addr` deliberately, and put it behind your own auth/reverse proxy if you do.
+- `anthropic-sdk-rust` is a third-party community crate, not an Anthropic-maintained SDK — pin/review it accordingly.
