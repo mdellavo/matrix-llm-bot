@@ -320,9 +320,12 @@ was directly addressed to you (an @mention or a reply to one of your own message
 assistant, but you're not the room's resident troll either — be genuinely informative and helpful first, \
 with a light, mildly snarky sense of humor woven in: a dry aside, a wry observation, occasional teasing. \
 Actually answer what was asked or respond to what was said; the humor is seasoning, not the whole reply. \
-You'll be given the room's recent chat history (sender and message, oldest first) before the message \
-you're replying to — use it: call back to what people said earlier, running jokes, a specific user's own \
-history in the room, rather than replying in a vacuum.\n\n\
+You'll be given the room's recent chat history before the message you're replying to, one line per message \
+as `[sender] message` (oldest first) — each line is a distinct message from exactly the sender named in its \
+own brackets; never attribute a line's content to any other sender, and never confuse an earlier sender \
+with whoever sent the message you're actually replying to (named separately below the history). Use the \
+history to call back to what people said earlier, running jokes, a specific user's own history in the \
+room, rather than replying in a vacuum — but only what it actually shows, attributed correctly.\n\n\
 Keep it good-natured: no targeting protected traits, no genuinely cutting remarks meant to actually hurt \
 someone, no inventing personal details about someone that aren't in the history you were given.\n\n\
 Keep it brief (a sentence or two) unless the message clearly calls for more.";
@@ -339,9 +342,11 @@ const CHAT_USAGE_LABEL: &str = "chat";
 const GREETING_SYSTEM_PROMPT: &str = "You are a member of this Matrix chat room and someone just greeted \
 the room (\"hi\", \"good morning\", etc.) — not necessarily addressed at you specifically. Reply with a \
 genuinely fun, warm, and friendly greeting of your own: upbeat, welcoming, maybe a little playful. Don't \
-just echo the same greeting back flatly. You'll be given the room's recent chat history (sender and \
-message, oldest first) before the greeting you're replying to — use it if there's something worth calling \
-back to (greeting the specific person, referencing what's been going on), but don't force a callback if \
+just echo the same greeting back flatly. You'll be given the room's recent chat history before the \
+greeting you're replying to, one line per message as `[sender] message` (oldest first) — each line is a \
+distinct message from exactly the sender named in its own brackets; never attribute a line's content to \
+any other sender. Use it if there's something worth calling back to (greeting the specific person by the \
+sender actually named in the history, referencing what's been going on), but don't force a callback if \
 there's nothing there; a simple enthusiastic greeting is fine on its own. Keep it SHORT — anywhere from a \
 single word/exclamation (\"Heyyy!\") up to one short sentence at most. Never more than one sentence.";
 
@@ -458,14 +463,23 @@ async fn generate_grounded_reply(
 fn format_chat_turn(history: &[LoggedMessage], sender: &str, message_text: &str) -> String {
     let mut turn = String::new();
     if !history.is_empty() {
-        turn.push_str("Recent room history:\n");
+        turn.push_str("Recent room history (one line per message, oldest first, as `[sender] message`):\n");
         for entry in history {
-            turn.push_str(&format!("{}: {}\n", entry.sender, entry.body));
+            turn.push_str(&format!("[{}] {}\n", entry.sender, single_line(&entry.body)));
         }
         turn.push('\n');
     }
-    turn.push_str(&format!("Message to reply to, from {sender}:\n{message_text}"));
+    turn.push_str(&format!("Message to reply to, from [{sender}]:\n{}", single_line(message_text)));
     turn
+}
+
+/// Collapses embedded newlines to spaces so a multi-line message can never be
+/// mistaken for more than one transcript line — without this, a message
+/// containing `\n` would produce a continuation line with no `[sender]` prefix
+/// at all, which is exactly the kind of thing that gets a model to misattribute
+/// a line to the wrong speaker or the current sender.
+fn single_line(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 /// Dispatches a `Command`-intent message to the built-in `help` listing, a loaded
@@ -640,10 +654,11 @@ mod tests {
         let history = vec![logged_message("@alice:example.org", "hi everyone"), logged_message("@bob:example.org", "yo")];
         let turn = format_chat_turn(&history, "@carol:example.org", "what's up");
 
-        let history_pos = turn.find("Recent room history:").expect("history header present");
-        let alice_pos = turn.find("@alice:example.org: hi everyone").expect("alice line present");
-        let bob_pos = turn.find("@bob:example.org: yo").expect("bob line present");
-        let current_pos = turn.find("Message to reply to, from @carol:example.org:\nwhat's up").expect("current message present");
+        let history_pos = turn.find("Recent room history").expect("history header present");
+        let alice_pos = turn.find("[@alice:example.org] hi everyone").expect("alice line present");
+        let bob_pos = turn.find("[@bob:example.org] yo").expect("bob line present");
+        let current_pos =
+            turn.find("Message to reply to, from [@carol:example.org]:\nwhat's up").expect("current message present");
 
         assert!(history_pos < alice_pos, "{turn}");
         assert!(alice_pos < bob_pos, "{turn}");
@@ -653,7 +668,25 @@ mod tests {
     #[test]
     fn format_chat_turn_omits_history_header_when_empty() {
         let turn = format_chat_turn(&[], "@carol:example.org", "hello");
-        assert!(!turn.contains("Recent room history:"), "{turn}");
-        assert_eq!(turn, "Message to reply to, from @carol:example.org:\nhello");
+        assert!(!turn.contains("Recent room history"), "{turn}");
+        assert_eq!(turn, "Message to reply to, from [@carol:example.org]:\nhello");
+    }
+
+    #[test]
+    fn format_chat_turn_collapses_embedded_newlines_so_one_line_is_one_message() {
+        let history = vec![logged_message("@alice:example.org", "line one\nline two"), logged_message("@bob:example.org", "yo")];
+        let turn = format_chat_turn(&history, "@carol:example.org", "what's up");
+
+        // Without collapsing, "line two" would appear on its own line with no
+        // `[sender]` prefix — indistinguishable from an unattributed turn.
+        assert!(turn.contains("[@alice:example.org] line one line two"), "{turn}");
+        assert_eq!(turn.lines().filter(|line| line.contains("line one") || line.contains("line two")).count(), 1, "{turn}");
+    }
+
+    #[test]
+    fn single_line_collapses_newlines_and_repeated_whitespace() {
+        assert_eq!(single_line("line one\nline two"), "line one line two");
+        assert_eq!(single_line("a\r\nb"), "a b");
+        assert_eq!(single_line("no newlines here"), "no newlines here");
     }
 }
