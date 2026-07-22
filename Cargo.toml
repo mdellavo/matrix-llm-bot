@@ -9,6 +9,16 @@ anyhow = "1.0.103"
 axum = "0.8.9"
 chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
 matrix-sdk = { version = "0.18.0", features = ["bundled-sqlite", "markdown"] }
+# Not used directly — anthropic-sdk-rust depends on reqwest 0.12 with its default
+# (native-tls) features, a separate crate instance from our own rustls-only
+# reqwest 0.13 pin below that Cargo can't unify across that version gap. That
+# pulls in openssl-sys, which needs a system OpenSSL + pkg-config to build on
+# Linux (silently satisfied by macOS's Security framework instead, which is why
+# this doesn't show up locally). "vendored" makes openssl-sys build OpenSSL from
+# source and link statically instead — Cargo's feature unification applies it to
+# every use of openssl-sys in the tree, so this fixes anthropic-sdk-rust's copy
+# too even though we don't depend on openssl directly.
+openssl = { version = "0.10", features = ["vendored"] }
 # Matches a version already resolved transitively (via matrix-sdk-crypto's `ulid`
 # dependency), so this adds no new distinct `rand` major version to the build.
 rand = "0.10"

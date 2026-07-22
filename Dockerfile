@@ -2,10 +2,16 @@
 FROM rust:1-slim-bookworm AS builder
 WORKDIR /app
 
-# A C compiler is all matrix-sdk's bundled-sqlite feature needs to build SQLite
-# from source; TLS is rustls (see Cargo.toml), so no OpenSSL/pkg-config required.
+# build-essential (a C compiler) is all matrix-sdk's bundled-sqlite feature needs
+# to build SQLite from source. Our own HTTP client is rustls, not OpenSSL — but
+# anthropic-sdk-rust pulls in openssl-sys transitively via its own reqwest 0.12
+# dependency (default-tls), so `perl` is needed too: Cargo.toml's `openssl`
+# dependency (feature "vendored") makes openssl-sys build OpenSSL from source
+# instead of requiring a system OpenSSL + pkg-config, and that source build's
+# Configure script is Perl.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         build-essential \
+        perl \
     && rm -rf /var/lib/apt/lists/*
 
 COPY Cargo.toml Cargo.lock ./
