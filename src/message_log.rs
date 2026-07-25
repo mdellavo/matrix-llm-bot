@@ -11,8 +11,39 @@ use tracing::warn;
 
 use crate::classify::MessageAnalysis;
 
+/// The system/user turn sent to Claude for a single call — recorded alongside
+/// the message that triggered it (classification, a chat/greeting reply, or a
+/// skill command) so the status page can show exactly what was sent, not just
+/// what came back.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PromptRecord {
+    pub system: String,
+    pub user: String,
+}
+
+/// The outcome of `handler::generate_response`: the text actually sent (or a
+/// canned fallback, e.g. "unknown command"), which prompt produced it — `None`
+/// when no Claude call was made at all, such as an unrecognized command or a
+/// skill that short-circuited on invalid args — and a `label` identifying the
+/// kind of reply (`"chat"`, `"greeting"`, or a skill name) for display.
+#[derive(Debug, Clone)]
+pub struct GeneratedReply {
+    pub text: String,
+    pub prompt: Option<PromptRecord>,
+    pub label: String,
+}
+
+impl GeneratedReply {
+    /// A reply with no backing Claude call — a canned/fallback string, e.g.
+    /// "unknown command" or a skill's own "invalid arguments" message.
+    pub fn plain(text: impl Into<String>, label: impl Into<String>) -> Self {
+        Self { text: text.into(), prompt: None, label: label.into() }
+    }
+}
+
 /// A single logged message: the metadata the bot already has from the Matrix
-/// event, plus the `MessageAnalysis` produced by the classifier.
+/// event, the `MessageAnalysis` and prompt the classifier produced/used, and
+/// — if the bot replied — the reply's own prompt, text, and label.
 #[derive(Debug, Serialize)]
 struct MessageLogEntry<'a> {
     logged_at: String,
@@ -22,11 +53,39 @@ struct MessageLogEntry<'a> {
     origin_server_ts_ms: i64,
     body: &'a str,
     analysis: &'a MessageAnalysis,
+    classify_prompt: &'a PromptRecord,
+    classify_raw_json: &'a serde_json::Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    response_prompt: Option<&'a PromptRecord>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    response: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    response_label: Option<&'a str>,
+}
+
+/// Bundles every argument `MessageLogger::log` needs — grown too large for a
+/// plain parameter list once prompts/responses joined the metadata/analysis
+/// already there (matches the `HandlerContext` bundling in `handler.rs` for
+/// the same reason).
+pub struct MessageLogParams<'a> {
+    pub room_id: &'a str,
+    pub event_id: &'a str,
+    pub sender: &'a str,
+    pub origin_server_ts_ms: i64,
+    pub body: &'a str,
+    pub analysis: &'a MessageAnalysis,
+    pub classify_prompt: &'a PromptRecord,
+    pub classify_raw_json: &'a serde_json::Value,
+    /// `Some` whenever the bot generated (or attempted to generate) a reply —
+    /// `None` when the message never reached response generation at all (e.g.
+    /// `requires_response` was false).
+    pub response: Option<&'a GeneratedReply>,
 }
 
 /// Owned counterpart of `MessageLogEntry`, for reading log lines back — also
 /// serialized directly as the JSON response of the status server's message API
-/// (`src/status_server.rs`).
+/// (`src/status_server.rs`). The prompt/response fields default to `None` on
+/// deserialize so log lines written before they existed still parse.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LoggedMessage {
     pub logged_at: String,
@@ -36,6 +95,16 @@ pub struct LoggedMessage {
     pub origin_server_ts_ms: i64,
     pub body: String,
     pub analysis: MessageAnalysis,
+    #[serde(default)]
+    pub classify_prompt: Option<PromptRecord>,
+    #[serde(default)]
+    pub classify_raw_json: Option<serde_json::Value>,
+    #[serde(default)]
+    pub response_prompt: Option<PromptRecord>,
+    #[serde(default)]
+    pub response: Option<String>,
+    #[serde(default)]
+    pub response_label: Option<String>,
 }
 
 /// Appends one JSON object per line to a per-room log file — a durable record of
@@ -67,16 +136,10 @@ impl MessageLogger {
         })
     }
 
-    #[allow(clippy::too_many_arguments)]
-    pub fn log(
-        &self,
-        room_id: &str,
-        event_id: &str,
-        sender: &str,
-        origin_server_ts_ms: i64,
-        body: &str,
-        analysis: &MessageAnalysis,
-    ) -> Result<()> {
+    pub fn log(&self, params: MessageLogParams) -> Result<()> {
+        let MessageLogParams { room_id, event_id, sender, origin_server_ts_ms, body, analysis, classify_prompt, classify_raw_json, response } =
+            params;
+
         let entry = MessageLogEntry {
             logged_at: chrono::Utc::now().to_rfc3339(),
             room_id,
@@ -85,6 +148,11 @@ impl MessageLogger {
             origin_server_ts_ms,
             body,
             analysis,
+            classify_prompt,
+            classify_raw_json,
+            response_prompt: response.and_then(|response| response.prompt.as_ref()),
+            response: response.map(|response| response.text.as_str()),
+            response_label: response.map(|response| response.label.as_str()),
         };
         let line = serde_json::to_string(&entry).context("failed to serialize message log entry")?;
 
@@ -197,6 +265,11 @@ mod tests {
                 entities: vec![],
                 command: None,
             },
+            classify_prompt: None,
+            classify_raw_json: None,
+            response_prompt: None,
+            response: None,
+            response_label: None,
         }
     }
 

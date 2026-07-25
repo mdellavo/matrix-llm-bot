@@ -172,6 +172,11 @@ const INDEX_HTML: &str = r#"<!doctype html>
   th { background: #8881; }
   select, input, button { font: inherit; }
   .controls { margin: 1rem 0; display: flex; gap: 0.5rem; align-items: center; }
+  .details-row td { background: rgba(136, 136, 136, 0.06); }
+  .details-block { margin-bottom: 0.75rem; }
+  .details-block:last-child { margin-bottom: 0; }
+  .details-block pre { white-space: pre-wrap; word-break: break-word; max-height: 300px; overflow: auto; background: #8881; padding: 0.5rem; border-radius: 4px; margin: 0.25rem 0; }
+  .details-block summary { cursor: pointer; }
 </style>
 </head>
 <body>
@@ -210,7 +215,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
 
   <table>
     <thead>
-      <tr><th>Logged at</th><th>Sender</th><th>Intent</th><th>Sentiment</th><th>Reply?</th><th>Body</th></tr>
+      <tr><th>Logged at</th><th>Sender</th><th>Intent</th><th>Sentiment</th><th>Reply?</th><th>Body</th><th>Details</th></tr>
     </thead>
     <tbody id="messages-body"></tbody>
   </table>
@@ -237,6 +242,50 @@ function formatUptime(seconds) {
   return `${h}h ${m}m ${s}s`;
 }
 
+// A prompt (system + user turn) actually sent to Claude, rendered as two
+// collapsible <details> blocks — or a note when no prompt was recorded, either
+// because the log line predates prompt logging or no Claude call was made
+// (e.g. a canned "unknown command" reply).
+function renderPrompt(prompt) {
+  if (!prompt) return '<p><em>(no prompt recorded)</em></p>';
+  return `
+    <details><summary>System prompt</summary><pre>${escapeHtml(prompt.system)}</pre></details>
+    <details><summary>User turn</summary><pre>${escapeHtml(prompt.user)}</pre></details>
+  `;
+}
+
+// The classification and response prompts/output for one message, shown in
+// the details row a "Details" button toggles open — the raw classify JSON is
+// collapsed behind its own link since it's rarely needed and can be sizable.
+function renderMessageDetails(m, idx) {
+  const rawJsonId = `raw-json-${idx}`;
+  const rawJsonBlock = m.classify_raw_json
+    ? `<button type="button" class="show-raw-json" data-target="${rawJsonId}">Show raw classify JSON</button>
+       <pre class="raw-json" id="${rawJsonId}" style="display: none;">${escapeHtml(JSON.stringify(m.classify_raw_json, null, 2))}</pre>`
+    : '<p><em>(no raw classify JSON recorded)</em></p>';
+
+  let responseBlock;
+  if (m.response == null) {
+    responseBlock = '<p><em>(no response generated)</em></p>';
+  } else {
+    responseBlock = `<pre>${escapeHtml(m.response)}</pre>${
+      m.response_prompt ? renderPrompt(m.response_prompt) : '<p><em>(canned reply — no Claude call)</em></p>'
+    }`;
+  }
+
+  return `
+    <div class="details-block">
+      <strong>Classification prompt</strong>
+      ${renderPrompt(m.classify_prompt)}
+      ${rawJsonBlock}
+    </div>
+    <div class="details-block">
+      <strong>Response${m.response_label ? ` (${escapeHtml(m.response_label)})` : ''}</strong>
+      ${responseBlock}
+    </div>
+  `;
+}
+
 async function loadMessages(roomId) {
   if (!roomId) return;
   const limit = document.getElementById('limit').value || 20;
@@ -244,11 +293,11 @@ async function loadMessages(roomId) {
   const tbody = document.getElementById('messages-body');
   tbody.innerHTML = '';
   if (!res.ok) {
-    tbody.innerHTML = `<tr><td colspan="6">Failed to load messages: ${escapeHtml(await res.text())}</td></tr>`;
+    tbody.innerHTML = `<tr><td colspan="7">Failed to load messages: ${escapeHtml(await res.text())}</td></tr>`;
     return;
   }
   const messages = await res.json();
-  for (const m of messages) {
+  messages.forEach((m, idx) => {
     const row = document.createElement('tr');
     row.innerHTML = `
       <td>${escapeHtml(m.logged_at)}</td>
@@ -257,10 +306,35 @@ async function loadMessages(roomId) {
       <td>${escapeHtml(m.analysis.sentiment)}</td>
       <td>${m.analysis.requires_response ? 'yes' : 'no'}</td>
       <td>${escapeHtml(m.body)}</td>
+      <td><button type="button" class="toggle-details" data-target="details-${idx}">Details</button></td>
     `;
     tbody.appendChild(row);
-  }
+
+    const detailsRow = document.createElement('tr');
+    detailsRow.className = 'details-row';
+    detailsRow.id = `details-${idx}`;
+    detailsRow.style.display = 'none';
+    detailsRow.innerHTML = `<td colspan="7">${renderMessageDetails(m, idx)}</td>`;
+    tbody.appendChild(detailsRow);
+  });
 }
+
+// Delegated on the (repeatedly rebuilt) tbody itself, rather than per-button,
+// so listeners never need re-attaching after `loadMessages` clears/repopulates it.
+document.getElementById('messages-body').addEventListener('click', (e) => {
+  const toggleBtn = e.target.closest('.toggle-details');
+  if (toggleBtn) {
+    const row = document.getElementById(toggleBtn.dataset.target);
+    if (row) row.style.display = row.style.display === 'none' ? '' : 'none';
+    return;
+  }
+  const rawLink = e.target.closest('.show-raw-json');
+  if (rawLink) {
+    e.preventDefault();
+    const pre = document.getElementById(rawLink.dataset.target);
+    if (pre) pre.style.display = pre.style.display === 'none' ? '' : 'none';
+  }
+});
 
 async function loadSkills() {
   const res = await fetch('/api/skills');
@@ -382,7 +456,7 @@ mod tests {
 
     use super::*;
     use crate::classify::{Intent, MessageAnalysis, Sentiment};
-    use crate::message_log::LoggedMessage;
+    use crate::message_log::{GeneratedReply, LoggedMessage, MessageLogParams, PromptRecord};
     use crate::usage::UsageTracker;
 
     fn test_usage(input_tokens: u32, output_tokens: u32) -> anthropic_sdk::types::Usage {
@@ -433,11 +507,38 @@ mod tests {
         let message_log = Arc::new(MessageLogger::open(&log_dir).expect("open message log"));
 
         let room_id = "!test:example.org";
+        let classify_prompt = PromptRecord { system: "classify system".to_string(), user: "classify user".to_string() };
+        let classify_raw_json = serde_json::json!({"intent": "chitchat"});
         message_log
-            .log(room_id, "$event1", "@alice:example.org", 1_000, "hello there", &test_analysis("alice says hi"))
+            .log(MessageLogParams {
+                room_id,
+                event_id: "$event1",
+                sender: "@alice:example.org",
+                origin_server_ts_ms: 1_000,
+                body: "hello there",
+                analysis: &test_analysis("alice says hi"),
+                classify_prompt: &classify_prompt,
+                classify_raw_json: &classify_raw_json,
+                response: None,
+            })
             .expect("log message 1");
+        let reply = GeneratedReply {
+            text: "hi alice!".to_string(),
+            prompt: Some(PromptRecord { system: "chat system".to_string(), user: "chat user".to_string() }),
+            label: "chat".to_string(),
+        };
         message_log
-            .log(room_id, "$event2", "@bob:example.org", 2_000, "hi alice", &test_analysis("bob says hi"))
+            .log(MessageLogParams {
+                room_id,
+                event_id: "$event2",
+                sender: "@bob:example.org",
+                origin_server_ts_ms: 2_000,
+                body: "hi alice",
+                analysis: &test_analysis("bob says hi"),
+                classify_prompt: &classify_prompt,
+                classify_raw_json: &classify_raw_json,
+                response: Some(&reply),
+            })
             .expect("log message 2");
 
         let skills_dir = unique_temp_dir("status-server-skills");
@@ -489,7 +590,13 @@ mod tests {
         assert_eq!(messages.len(), 2);
         assert_eq!(messages[0].sender, "@alice:example.org");
         assert_eq!(messages[0].analysis.summary, "alice says hi");
+        assert_eq!(messages[0].classify_prompt.as_ref().expect("classify prompt").system, "classify system");
+        assert_eq!(messages[0].classify_raw_json.as_ref().expect("classify raw json")["intent"], "chitchat");
+        assert!(messages[0].response.is_none(), "message 1 was logged with no response");
         assert_eq!(messages[1].sender, "@bob:example.org");
+        assert_eq!(messages[1].response.as_deref(), Some("hi alice!"));
+        assert_eq!(messages[1].response_label.as_deref(), Some("chat"));
+        assert_eq!(messages[1].response_prompt.as_ref().expect("response prompt").user, "chat user");
 
         let empty_room_resp = http
             .get(format!("{base}/api/rooms/!nobody-here:example.org/messages"))

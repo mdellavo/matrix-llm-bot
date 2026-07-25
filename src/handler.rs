@@ -17,10 +17,10 @@ use matrix_sdk::{
 };
 use tracing::{debug, info, warn};
 
-use crate::classify::{Intent, MessageAnalysis, classify_message};
+use crate::classify::{ClassifyOutcome, Intent, MessageAnalysis, classify_message};
 use crate::greeting::GreetingCooldown;
 use crate::ignore::IgnoredUsers;
-use crate::message_log::{self, LoggedMessage, MessageLogger};
+use crate::message_log::{self, GeneratedReply, LoggedMessage, MessageLogParams, MessageLogger, PromptRecord};
 use crate::skills::{self, SkillRegistry};
 use crate::tools::ToolClients;
 use crate::usage::UsageTracker;
@@ -153,10 +153,9 @@ pub async fn on_room_message(event: OriginalSyncRoomMessageEvent, room: Room, cl
 
     info!(room = %room.room_id(), sender = %event.sender, "received message");
 
-    // Fetched before this message is logged below, so it never appears twice
-    // (once in the history block, once as "the message to classify") — same
-    // reasoning as the dedup in `generate_grounded_reply`, just unneeded here
-    // since logging always happens after classification, not before.
+    // Fetched before this message is itself logged (which now happens once,
+    // at the end of this function, after any response is generated), so it
+    // never appears in its own classification context.
     let classify_history = match message_log.recent(room.room_id().as_str(), CLASSIFY_HISTORY_LIMIT) {
         Ok(history) => history,
         Err(err) => {
@@ -165,7 +164,7 @@ pub async fn on_room_message(event: OriginalSyncRoomMessageEvent, room: Room, cl
         }
     };
 
-    let analysis = match classify_message(
+    let ClassifyOutcome { analysis, prompt: classify_prompt, raw_json: classify_raw_json } = match classify_message(
         &anthropic,
         &text_content.body,
         event.sender.as_str(),
@@ -175,7 +174,7 @@ pub async fn on_room_message(event: OriginalSyncRoomMessageEvent, room: Room, cl
     )
     .await
     {
-        Ok(analysis) => analysis,
+        Ok(outcome) => outcome,
         Err(err) => {
             warn!(?err, room = %room.room_id(), "failed to classify message");
             return;
@@ -190,54 +189,64 @@ pub async fn on_room_message(event: OriginalSyncRoomMessageEvent, room: Room, cl
         "classified message"
     );
 
-    if let Err(err) = message_log.log(
-        room.room_id().as_str(),
-        event.event_id.as_str(),
-        event.sender.as_str(),
-        event.origin_server_ts.get().into(),
-        &text_content.body,
-        &analysis,
-    ) {
+    // `None` unless a response is actually attempted below — kept as a single
+    // `Option<GeneratedReply>` so there's exactly one `message_log.log` call
+    // (further down) covering every case: no response needed, not directed at
+    // the bot, or a real generated reply.
+    let response = if !analysis.requires_response {
+        None
+    } else {
+        let directed_at_bot = is_directed_at_bot(&event, &room, &client).await;
+
+        // Checked (and, if true, consumed) exactly once per message here — see
+        // `GreetingCooldown::try_greet`'s doc comment on why calling it twice
+        // would be wrong — then threaded into both the typing-indicator gate
+        // below and `generate_response`, rather than each re-deriving it
+        // separately.
+        let should_greet = analysis.intent == Intent::Greeting && greeting_cooldown.try_greet(room.room_id().as_str());
+
+        let typing = will_generate_response(&analysis, &text_content.body, directed_at_bot, should_greet)
+            .then(|| TypingIndicator::start(room.clone()));
+
+        let response = generate_response(
+            &room,
+            &analysis,
+            &text_content.body,
+            event.sender.as_str(),
+            directed_at_bot,
+            should_greet,
+            &anthropic,
+            &message_log,
+            &skills,
+            &tool_clients,
+            &usage_tracker,
+        )
+        .await;
+
+        if let Some(typing) = typing {
+            typing.stop(&room).await;
+        }
+
+        response
+    };
+
+    if let Err(err) = message_log.log(MessageLogParams {
+        room_id: room.room_id().as_str(),
+        event_id: event.event_id.as_str(),
+        sender: event.sender.as_str(),
+        origin_server_ts_ms: event.origin_server_ts.get().into(),
+        body: &text_content.body,
+        analysis: &analysis,
+        classify_prompt: &classify_prompt,
+        classify_raw_json: &classify_raw_json,
+        response: response.as_ref(),
+    }) {
         warn!(?err, room = %room.room_id(), "failed to write message log entry");
-    }
-
-    if !analysis.requires_response {
-        return;
-    }
-
-    let directed_at_bot = is_directed_at_bot(&event, &room, &client).await;
-
-    // Checked (and, if true, consumed) exactly once per message here — see
-    // `GreetingCooldown::try_greet`'s doc comment on why calling it twice would
-    // be wrong — then threaded into both the typing-indicator gate below and
-    // `generate_response`, rather than each re-deriving it separately.
-    let should_greet = analysis.intent == Intent::Greeting && greeting_cooldown.try_greet(room.room_id().as_str());
-
-    let typing = will_generate_response(&analysis, &text_content.body, directed_at_bot, should_greet)
-        .then(|| TypingIndicator::start(room.clone()));
-
-    let response = generate_response(
-        &room,
-        &analysis,
-        &text_content.body,
-        event.sender.as_str(),
-        directed_at_bot,
-        should_greet,
-        &anthropic,
-        &message_log,
-        &skills,
-        &tool_clients,
-        &usage_tracker,
-    )
-    .await;
-
-    if let Some(typing) = typing {
-        typing.stop(&room).await;
     }
 
     match response {
         Some(response) => {
-            if let Err(err) = send_message(&room, &event.sender, &response).await {
+            if let Err(err) = send_message(&room, &event.sender, &response.text).await {
                 warn!(?err, room = %room.room_id(), "failed to send response");
             }
         }
@@ -311,7 +320,7 @@ async fn generate_response(
     skills: &SkillRegistry,
     tool_clients: &ToolClients,
     usage_tracker: &UsageTracker,
-) -> Option<String> {
+) -> Option<GeneratedReply> {
     if !will_generate_response(analysis, message_text, directed_at_bot, should_greet) {
         return None;
     }
@@ -411,7 +420,7 @@ async fn generate_chat_reply(
     anthropic: &Anthropic,
     message_log: &MessageLogger,
     usage_tracker: &UsageTracker,
-) -> String {
+) -> GeneratedReply {
     generate_grounded_reply(
         room,
         message_text,
@@ -435,7 +444,7 @@ async fn generate_greeting_reply(
     anthropic: &Anthropic,
     message_log: &MessageLogger,
     usage_tracker: &UsageTracker,
-) -> String {
+) -> GeneratedReply {
     generate_grounded_reply(
         room,
         message_text,
@@ -466,23 +475,19 @@ async fn generate_grounded_reply(
     anthropic: &Anthropic,
     message_log: &MessageLogger,
     usage_tracker: &UsageTracker,
-) -> String {
-    // Fetch one extra entry and drop it if it's this same message: `on_room_message`
-    // already logged the current message before calling this, so `recent` would
-    // otherwise include it a second time (once in the history block, once as "the
-    // message to reply to").
-    let mut history = match message_log.recent(room.room_id().as_str(), CHAT_HISTORY_LIMIT + 1) {
+) -> GeneratedReply {
+    // `on_room_message` logs the current message only after this call returns,
+    // so `recent` never includes it — no dedup needed here.
+    let history = match message_log.recent(room.room_id().as_str(), CHAT_HISTORY_LIMIT) {
         Ok(history) => history,
         Err(err) => {
             warn!(?err, room = %room.room_id(), "failed to load chat history for reply; replying without it");
             Vec::new()
         }
     };
-    if matches!(history.last(), Some(last) if last.sender == sender && last.body == message_text) {
-        history.pop();
-    }
 
     let user_turn = format_chat_turn(&history, sender, message_text);
+    let prompt = PromptRecord { system: system_prompt.to_string(), user: user_turn.clone() };
 
     let params = MessageCreateBuilder::new(model, 512)
         .system(system_prompt)
@@ -493,7 +498,11 @@ async fn generate_grounded_reply(
         Ok(message) => message,
         Err(err) => {
             warn!(?err, "reply generation request to Claude failed");
-            return "Sorry, I couldn't come up with a reply to that.".to_string();
+            return GeneratedReply {
+                text: "Sorry, I couldn't come up with a reply to that.".to_string(),
+                prompt: Some(prompt),
+                label: usage_label.to_string(),
+            };
         }
     };
 
@@ -509,11 +518,15 @@ async fn generate_grounded_reply(
                 response = %text,
                 "generated grounded reply"
             );
-            return text;
+            return GeneratedReply { text, prompt: Some(prompt), label: usage_label.to_string() };
         }
     }
 
-    "Sorry, I couldn't come up with a reply to that.".to_string()
+    GeneratedReply {
+        text: "Sorry, I couldn't come up with a reply to that.".to_string(),
+        prompt: Some(prompt),
+        label: usage_label.to_string(),
+    }
 }
 
 /// Renders recent room history plus the message being replied to into the single
@@ -538,16 +551,16 @@ async fn handle_command(
     skills: &SkillRegistry,
     tool_clients: &ToolClients,
     usage_tracker: &UsageTracker,
-) -> String {
+) -> GeneratedReply {
     let Some(command) = &analysis.command else {
-        return UNKNOWN_COMMAND_REPLY.to_string();
+        return GeneratedReply::plain(UNKNOWN_COMMAND_REPLY, "unknown_command");
     };
     let Some(name) = command.name.as_deref() else {
-        return UNKNOWN_COMMAND_REPLY.to_string();
+        return GeneratedReply::plain(UNKNOWN_COMMAND_REPLY, "unknown_command");
     };
 
     if name.eq_ignore_ascii_case("help") {
-        return help_reply(skills);
+        return GeneratedReply::plain(help_reply(skills), "help");
     }
 
     match skills.get(name) {
@@ -564,7 +577,7 @@ async fn handle_command(
             )
             .await
         }
-        None => UNKNOWN_COMMAND_REPLY.to_string(),
+        None => GeneratedReply::plain(UNKNOWN_COMMAND_REPLY, "unknown_command"),
     }
 }
 
@@ -630,6 +643,11 @@ mod tests {
                 entities: vec![],
                 command: None,
             },
+            classify_prompt: None,
+            classify_raw_json: None,
+            response_prompt: None,
+            response: None,
+            response_label: None,
         }
     }
 

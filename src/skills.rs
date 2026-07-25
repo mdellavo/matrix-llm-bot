@@ -9,7 +9,7 @@ use serde::Deserialize;
 use tracing::{debug, warn};
 
 use crate::classify::{self, CommandInfo};
-use crate::message_log::{LoggedMessage, MessageLogger};
+use crate::message_log::{GeneratedReply, LoggedMessage, MessageLogger, PromptRecord};
 use crate::tools::{self, ToolClients};
 use crate::usage::UsageTracker;
 
@@ -421,13 +421,13 @@ pub async fn execute(
     skill: &Skill,
     message_text: &str,
     command: &CommandInfo,
-) -> String {
+) -> GeneratedReply {
     let resolved_args = if skill.args.is_empty() {
         command.args.as_object().cloned().unwrap_or_default()
     } else {
         match resolve_args(&skill.args, &command.args) {
             Ok(resolved) => resolved,
-            Err(message) => return format!("Invalid arguments: {message}"),
+            Err(message) => return GeneratedReply::plain(format!("Invalid arguments: {message}"), &skill.name),
         }
     };
 
@@ -478,9 +478,11 @@ pub async fn execute(
     // same shape as the args-validation short-circuit above — since there's nothing
     // useful to say without a key, and this shouldn't cost an LLM call to discover.
     if skill.tools.iter().any(|tool| tool == "imdb_lookup") && !tool_clients.has_omdb_key() {
-        return "This command requires an OMDb API key that hasn't been configured yet. \
-                Ask the bot operator to set `omdb_api_key` in config.toml."
-            .to_string();
+        return GeneratedReply::plain(
+            "This command requires an OMDb API key that hasn't been configured yet. \
+             Ask the bot operator to set `omdb_api_key` in config.toml.",
+            &skill.name,
+        );
     }
 
     if skill.tools.iter().any(|tool| tool == "random_choice") {
@@ -551,11 +553,19 @@ pub async fn execute(
                 response = %reply,
                 "generated skill reply"
             );
-            reply
+            GeneratedReply {
+                text: reply,
+                prompt: Some(PromptRecord { system: skill.prompt.clone(), user: user_turn }),
+                label: skill.name.clone(),
+            }
         }
         Err(err) => {
             warn!(?err, skill = %skill.name, "skill prompt failed");
-            "Sorry, that command failed.".to_string()
+            GeneratedReply {
+                text: "Sorry, that command failed.".to_string(),
+                prompt: Some(PromptRecord { system: skill.prompt.clone(), user: user_turn }),
+                label: skill.name.clone(),
+            }
         }
     }
 }

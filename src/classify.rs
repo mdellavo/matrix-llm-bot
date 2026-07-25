@@ -4,7 +4,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-use crate::message_log::{LoggedMessage, format_history_block, single_line};
+use crate::message_log::{LoggedMessage, PromptRecord, format_history_block, single_line};
 use crate::usage::UsageTracker;
 
 pub const MODEL: &str = "claude-haiku-4-5";
@@ -93,6 +93,17 @@ pub struct CommandInfo {
     pub args: serde_json::Value,
 }
 
+/// Everything `classify_message` produces: the typed `analysis` every caller
+/// actually needs, plus the exact `prompt` sent and the `raw_json` tool-call
+/// input the model returned before it was parsed into `analysis` — recorded by
+/// the caller (`handler::on_room_message`) so the status page can show both.
+#[derive(Debug, Clone)]
+pub struct ClassifyOutcome {
+    pub analysis: MessageAnalysis,
+    pub prompt: PromptRecord,
+    pub raw_json: serde_json::Value,
+}
+
 /// Classifies a single message's free text into a `MessageAnalysis` by forcing
 /// the model to call the `classify_message` tool with our schema as its input.
 ///
@@ -115,7 +126,7 @@ pub async fn classify_message(
     history: &[LoggedMessage],
     command_reference: &str,
     usage_tracker: &UsageTracker,
-) -> Result<MessageAnalysis> {
+) -> Result<ClassifyOutcome> {
     let tool = classify_tool()?;
     let system_prompt = SYSTEM_PROMPT_TEMPLATE.replace("{command_reference}", command_reference);
 
@@ -123,8 +134,8 @@ pub async fn classify_message(
     user_turn.push_str(&format!("Message to classify, from [{sender}]:\n{}", single_line(message_text)));
 
     let params = MessageCreateBuilder::new(MODEL, 1024)
-        .system(system_prompt)
-        .user(user_turn)
+        .system(system_prompt.clone())
+        .user(user_turn.clone())
         .tools(vec![tool])
         .tool_choice(ToolChoice::Tool {
             name: TOOL_NAME.to_string(),
@@ -143,8 +154,12 @@ pub async fn classify_message(
         if let ContentBlock::ToolUse { name, input, .. } = block
             && name == TOOL_NAME
         {
-            return serde_json::from_value(input)
-                .context("failed to parse classify_message tool input");
+            let analysis = serde_json::from_value(input.clone()).context("failed to parse classify_message tool input")?;
+            return Ok(ClassifyOutcome {
+                analysis,
+                prompt: PromptRecord { system: system_prompt, user: user_turn },
+                raw_json: input,
+            });
         }
     }
 
