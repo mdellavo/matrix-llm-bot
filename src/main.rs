@@ -3,6 +3,7 @@ mod classify;
 mod config;
 mod greeting;
 mod handler;
+mod ignore;
 mod message_log;
 mod skills;
 mod status_server;

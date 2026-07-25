@@ -13,7 +13,8 @@ use tracing::{info, warn};
 
 use crate::config::Config;
 use crate::greeting::GreetingCooldown;
-use crate::handler::on_room_message;
+use crate::handler::{HandlerContext, on_room_message};
+use crate::ignore::IgnoredUsers;
 use crate::message_log::MessageLogger;
 use crate::skills::SkillRegistry;
 use crate::tools::ToolClients;
@@ -29,6 +30,7 @@ pub struct Bot {
     tool_clients: Arc<ToolClients>,
     usage_tracker: Arc<UsageTracker>,
     greeting_cooldown: Arc<GreetingCooldown>,
+    ignored_users: Arc<IgnoredUsers>,
 }
 
 impl Bot {
@@ -62,30 +64,32 @@ impl Bot {
         // matrix-sdk's default behavior. For production use, add explicit device
         // verification/cross-signing here before relying on encrypted rooms.
 
-        // Reads ANTHROPIC_API_KEY from the environment. Wrapped in an Arc (rather than
-        // relying on Anthropic being Clone, which it isn't) so it can be shared into the
-        // event handler as context.
+        // Reads ANTHROPIC_API_KEY from the environment.
         let anthropic = Arc::new(
             Anthropic::from_env().context("failed to create Anthropic client (is ANTHROPIC_API_KEY set?)")?,
         );
-        client.add_event_handler_context(anthropic);
-
         let message_log = Arc::new(MessageLogger::open(&config.message_log_dir)?);
-        client.add_event_handler_context(Arc::clone(&message_log));
-
         let skills = Arc::new(SkillRegistry::load(&config.skills_dir)?);
-        client.add_event_handler_context(Arc::clone(&skills));
-
         let tool_clients = Arc::new(ToolClients::new(config.omdb_api_key.clone()));
-        client.add_event_handler_context(Arc::clone(&tool_clients));
-
         let usage_tracker = Arc::new(UsageTracker::new());
-        client.add_event_handler_context(Arc::clone(&usage_tracker));
-
         let greeting_cooldown = Arc::new(GreetingCooldown::new(crate::greeting::DEFAULT_COOLDOWN));
-        client.add_event_handler_context(Arc::clone(&greeting_cooldown));
+        let ignored_users = Arc::new(IgnoredUsers::new(config.ignored_users.clone()));
 
-        Ok(Self { client, message_log, skills, tool_clients, usage_tracker, greeting_cooldown })
+        // Bundled into one `HandlerContext` (see its doc comment in `handler.rs`)
+        // and registered as a single event-handler context, rather than one
+        // `add_event_handler_context` call per resource — matrix-sdk's
+        // `EventHandler` trait only supports so many separate `Ctx<T>` params.
+        client.add_event_handler_context(Arc::new(HandlerContext {
+            anthropic,
+            message_log: Arc::clone(&message_log),
+            skills: Arc::clone(&skills),
+            tool_clients: Arc::clone(&tool_clients),
+            usage_tracker: Arc::clone(&usage_tracker),
+            greeting_cooldown: Arc::clone(&greeting_cooldown),
+            ignored_users: Arc::clone(&ignored_users),
+        }));
+
+        Ok(Self { client, message_log, skills, tool_clients, usage_tracker, greeting_cooldown, ignored_users })
     }
 
     /// Restores a previously saved session if one exists at `<store_path>/session.json`
@@ -158,6 +162,13 @@ impl Bot {
     #[allow(dead_code)]
     pub fn greeting_cooldown(&self) -> Arc<GreetingCooldown> {
         Arc::clone(&self.greeting_cooldown)
+    }
+
+    /// A clone of the shared ignored-users set. No current external consumer,
+    /// but every other shared resource has this accessor.
+    #[allow(dead_code)]
+    pub fn ignored_users(&self) -> Arc<IgnoredUsers> {
+        Arc::clone(&self.ignored_users)
     }
 
     /// Joins every room configured for monitoring. Already-joined rooms are skipped.

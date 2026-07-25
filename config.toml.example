@@ -31,3 +31,8 @@ rooms = ["#some-room:matrix.org"]
 # skill's movie/show lookups. If unset, the `imdb` skill replies with a clear
 # "not configured" message instead of attempting a lookup.
 # omdb_api_key = "your-key-here"
+
+# Optional: Matrix user IDs whose messages the bot ignores entirely — dropped
+# before classification, logging, or any reply, so they never show up in
+# message history either. Defaults to empty (ignore nobody).
+# ignored_users = ["@spammer:example.org"]

@@ -50,6 +50,13 @@ pub struct Config {
     /// message at invocation time instead of attempting a lookup.
     #[serde(default)]
     pub omdb_api_key: Option<String>,
+
+    /// Matrix user IDs (`@user:example.org`) whose messages the bot ignores
+    /// entirely — dropped in `on_room_message` before classification, logging,
+    /// or any reply, so they never show up in message history either. Defaults
+    /// to empty (ignore nobody). See `IgnoredUsers` (`src/ignore.rs`).
+    #[serde(default)]
+    pub ignored_users: Vec<String>,
 }
 
 fn default_device_name() -> String {

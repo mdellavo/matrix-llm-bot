@@ -17,8 +17,9 @@ use matrix_sdk::{
 };
 use tracing::{debug, info, warn};
 
-use crate::classify::{self, Intent, MessageAnalysis, classify_message};
+use crate::classify::{Intent, MessageAnalysis, classify_message};
 use crate::greeting::GreetingCooldown;
+use crate::ignore::IgnoredUsers;
 use crate::message_log::{LoggedMessage, MessageLogger};
 use crate::skills::{self, SkillRegistry};
 use crate::tools::ToolClients;
@@ -100,29 +101,48 @@ impl Drop for TypingIndicator {
     }
 }
 
-/// Registered as a sync event handler; fires for every `m.room.message` the bot receives
-/// in a room it has joined. `Ctx<Arc<Anthropic>>`, `Ctx<Arc<MessageLogger>>`,
-/// `Ctx<Arc<SkillRegistry>>`, `Ctx<Arc<ToolClients>>`, `Ctx<Arc<UsageTracker>>`, and
-/// `Ctx<Arc<GreetingCooldown>>` are injected via `Client::add_event_handler_context`
-/// in `bot.rs`.
-#[allow(clippy::too_many_arguments)]
-pub async fn on_room_message(
-    event: OriginalSyncRoomMessageEvent,
-    room: Room,
-    client: Client,
-    Ctx(anthropic): Ctx<Arc<Anthropic>>,
-    Ctx(message_log): Ctx<Arc<MessageLogger>>,
-    Ctx(skills): Ctx<Arc<SkillRegistry>>,
-    Ctx(tool_clients): Ctx<Arc<ToolClients>>,
-    Ctx(usage_tracker): Ctx<Arc<UsageTracker>>,
-    Ctx(greeting_cooldown): Ctx<Arc<GreetingCooldown>>,
-) {
+/// Every piece of state `on_room_message` needs beyond the event/room/client
+/// themselves, bundled into a single `Ctx` extractor. matrix-sdk's
+/// `EventHandler` trait is only implemented for handlers with up to 8 total
+/// non-event parameters (room, client, and every separate `Ctx<T>` combined —
+/// see `impl_event_handler!` in matrix-sdk's `event_handler` module); one
+/// `Ctx<T>` per resource ran out of budget once `GreetingCooldown` and
+/// `IgnoredUsers` were added, so everything is bundled here instead, leaving
+/// room to add more without hitting that ceiling again.
+#[derive(Clone)]
+pub struct HandlerContext {
+    pub anthropic: Arc<Anthropic>,
+    pub message_log: Arc<MessageLogger>,
+    pub skills: Arc<SkillRegistry>,
+    pub tool_clients: Arc<ToolClients>,
+    pub usage_tracker: Arc<UsageTracker>,
+    pub greeting_cooldown: Arc<GreetingCooldown>,
+    pub ignored_users: Arc<IgnoredUsers>,
+}
+
+/// Registered as a sync event handler; fires for every `m.room.message` the bot
+/// receives in a room it has joined. `Ctx<Arc<HandlerContext>>` is injected via
+/// `Client::add_event_handler_context` in `bot.rs`.
+pub async fn on_room_message(event: OriginalSyncRoomMessageEvent, room: Room, client: Client, Ctx(ctx): Ctx<Arc<HandlerContext>>) {
+    // Cloning out into identically-typed locals (cheap — just Arc refcount
+    // bumps) rather than writing `ctx.foo` everywhere below keeps this
+    // function's body unchanged from before the bundling.
+    let HandlerContext { anthropic, message_log, skills, tool_clients, usage_tracker, greeting_cooldown, ignored_users } =
+        (*ctx).clone();
+
     if room.state() != RoomState::Joined {
         return;
     }
 
     // Never respond to our own messages.
     if Some(event.sender.as_ref()) == client.user_id() {
+        return;
+    }
+
+    // Ignored users are dropped before anything else — no classification, no
+    // logging, no reply — so they never show up in message history either.
+    if ignored_users.contains(event.sender.as_str()) {
+        debug!(room = %room.room_id(), sender = %event.sender, "ignoring message from ignored user");
         return;
     }
 
@@ -333,6 +353,13 @@ Keep it brief (a sentence or two) unless the message clearly calls for more.";
 /// Label Claude API calls from `generate_chat_reply` are recorded under in `UsageTracker`.
 const CHAT_USAGE_LABEL: &str = "chat";
 
+/// Model used for `generate_chat_reply`'s and `generate_greeting_reply`'s
+/// Claude-generated replies — its own constant (rather than reusing
+/// `classify::MODEL` directly) so both can be tuned independently of the
+/// classifier without touching every other caller that defaults to
+/// `classify::MODEL`.
+const CHAT_MODEL: &str = "claude-opus-4-8";
+
 /// System prompt for greeting replies (`generate_greeting_reply`) — ported from
 /// gordy's greeting behavior (any greeting from anyone in the room got a random
 /// word echoed back from a fixed list; see `GreetingCooldown`), but with an
@@ -355,8 +382,7 @@ const GREETING_USAGE_LABEL: &str = "greeting";
 
 /// Generates a free-form conversational reply to a message directed at the bot,
 /// grounded in the room's recent history (`MessageLogger::recent`) and who sent
-/// the message, using the same default model as the classifier (`classify::MODEL`)
-/// — see `generate_response` and `CHAT_SYSTEM_PROMPT`.
+/// the message, using `CHAT_MODEL` — see `generate_response` and `CHAT_SYSTEM_PROMPT`.
 async fn generate_chat_reply(
     room: &Room,
     message_text: &str,
@@ -371,6 +397,7 @@ async fn generate_chat_reply(
         sender,
         CHAT_SYSTEM_PROMPT,
         CHAT_USAGE_LABEL,
+        CHAT_MODEL,
         anthropic,
         message_log,
         usage_tracker,
@@ -379,7 +406,7 @@ async fn generate_chat_reply(
 }
 
 /// Generates a fun, Claude-written greeting in reply to someone greeting the
-/// room — see `generate_response` and `GREETING_SYSTEM_PROMPT`.
+/// room, using `CHAT_MODEL` — see `generate_response` and `GREETING_SYSTEM_PROMPT`.
 async fn generate_greeting_reply(
     room: &Room,
     message_text: &str,
@@ -394,6 +421,7 @@ async fn generate_greeting_reply(
         sender,
         GREETING_SYSTEM_PROMPT,
         GREETING_USAGE_LABEL,
+        CHAT_MODEL,
         anthropic,
         message_log,
         usage_tracker,
@@ -404,7 +432,8 @@ async fn generate_greeting_reply(
 /// Shared implementation behind `generate_chat_reply` and `generate_greeting_reply`:
 /// sends `message_text` (plus the room's recent history, via `format_chat_turn`) to
 /// Claude under `system_prompt`, recording usage under `usage_label`. The only
-/// difference between the two callers is which persona/prompt and label they pass.
+/// difference between the two callers is which persona/prompt, label, and model
+/// they pass.
 #[allow(clippy::too_many_arguments)]
 async fn generate_grounded_reply(
     room: &Room,
@@ -412,6 +441,7 @@ async fn generate_grounded_reply(
     sender: &str,
     system_prompt: &str,
     usage_label: &str,
+    model: &str,
     anthropic: &Anthropic,
     message_log: &MessageLogger,
     usage_tracker: &UsageTracker,
@@ -433,9 +463,9 @@ async fn generate_grounded_reply(
 
     let user_turn = format_chat_turn(&history, sender, message_text);
 
-    let params = MessageCreateBuilder::new(classify::MODEL, 512)
+    let params = MessageCreateBuilder::new(model, 512)
         .system(system_prompt)
-        .user(user_turn)
+        .user(user_turn.clone())
         .build();
 
     let message = match anthropic.messages().create(params).await {
@@ -446,10 +476,18 @@ async fn generate_grounded_reply(
         }
     };
 
-    usage_tracker.record(usage_label, classify::MODEL, &message.usage);
+    usage_tracker.record(usage_label, model, &message.usage);
 
     for block in message.content {
         if let ContentBlock::Text { text } = block {
+            debug!(
+                usage_label,
+                trigger_message = message_text,
+                system_prompt,
+                user_turn = %user_turn,
+                response = %text,
+                "generated grounded reply"
+            );
             return text;
         }
     }

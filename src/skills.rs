@@ -6,7 +6,7 @@ use anthropic_sdk::Anthropic;
 use anyhow::{Context, Result};
 use matrix_sdk::room::Room;
 use serde::Deserialize;
-use tracing::warn;
+use tracing::{debug, warn};
 
 use crate::classify::{self, CommandInfo};
 use crate::message_log::{LoggedMessage, MessageLogger};
@@ -542,7 +542,17 @@ pub async fn execute(
     let model = skill.model.as_deref().unwrap_or(classify::MODEL);
 
     match run_prompt(anthropic, model, &skill.prompt, &user_turn, usage_tracker, &skill.name).await {
-        Ok(reply) => reply,
+        Ok(reply) => {
+            debug!(
+                skill = %skill.name,
+                trigger_message = message_text,
+                system_prompt = %skill.prompt,
+                user_turn = %user_turn,
+                response = %reply,
+                "generated skill reply"
+            );
+            reply
+        }
         Err(err) => {
             warn!(?err, skill = %skill.name, "skill prompt failed");
             "Sorry, that command failed.".to_string()
