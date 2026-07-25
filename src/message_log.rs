@@ -147,3 +147,91 @@ fn sanitize_filename(raw: &str) -> String {
         .map(|c| if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') { c } else { '_' })
         .collect()
 }
+
+/// Formats `history` as a "recent room history" block, one line per message as
+/// `[sender] message` (oldest first), or an empty string if `history` is empty.
+/// Shared by every Claude call grounded in recent room messages — chat/greeting
+/// replies (`handler.rs`) and message classification (`classify.rs`) — so the
+/// transcript format (and the misattribution fix below) stays consistent
+/// everywhere it's used.
+pub fn format_history_block(history: &[LoggedMessage]) -> String {
+    if history.is_empty() {
+        return String::new();
+    }
+    let mut block = String::from("Recent room history (one line per message, oldest first, as `[sender] message`):\n");
+    for entry in history {
+        block.push_str(&format!("[{}] {}\n", entry.sender, single_line(&entry.body)));
+    }
+    block.push('\n');
+    block
+}
+
+/// Collapses embedded newlines/repeated whitespace to spaces so a multi-line
+/// message can never be mistaken for more than one transcript line — without
+/// this, a message containing `\n` would produce a continuation line with no
+/// `[sender]` prefix at all, which is exactly the kind of thing that gets a
+/// model to misattribute a line to the wrong speaker or the current sender.
+pub fn single_line(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::classify::{Intent, MessageAnalysis, Sentiment};
+
+    fn logged_message(sender: &str, body: &str) -> LoggedMessage {
+        LoggedMessage {
+            logged_at: "2026-01-01T00:00:00Z".to_string(),
+            room_id: "!room:example.org".to_string(),
+            event_id: "$event".to_string(),
+            sender: sender.to_string(),
+            origin_server_ts_ms: 0,
+            body: body.to_string(),
+            analysis: MessageAnalysis {
+                intent: Intent::Chitchat,
+                confidence: 0.9,
+                requires_response: false,
+                summary: "test".to_string(),
+                sentiment: Sentiment::Neutral,
+                entities: vec![],
+                command: None,
+            },
+        }
+    }
+
+    #[test]
+    fn format_history_block_is_empty_for_no_history() {
+        assert_eq!(format_history_block(&[]), "");
+    }
+
+    #[test]
+    fn format_history_block_lists_one_line_per_message_oldest_first() {
+        let history = vec![logged_message("@alice:example.org", "hi everyone"), logged_message("@bob:example.org", "yo")];
+        let block = format_history_block(&history);
+
+        assert!(block.starts_with("Recent room history"), "{block}");
+        let alice_pos = block.find("[@alice:example.org] hi everyone").expect("alice line present");
+        let bob_pos = block.find("[@bob:example.org] yo").expect("bob line present");
+        assert!(alice_pos < bob_pos, "{block}");
+        assert!(block.ends_with('\n'), "{block}");
+    }
+
+    #[test]
+    fn format_history_block_collapses_embedded_newlines_so_one_line_is_one_message() {
+        let history = vec![logged_message("@alice:example.org", "line one\nline two")];
+        let block = format_history_block(&history);
+
+        // Without collapsing, "line two" would appear on its own line with no
+        // `[sender]` prefix — indistinguishable from an unattributed line.
+        assert!(block.contains("[@alice:example.org] line one line two"), "{block}");
+        assert_eq!(block.lines().filter(|line| line.contains("line one") || line.contains("line two")).count(), 1, "{block}");
+    }
+
+    #[test]
+    fn single_line_collapses_newlines_and_repeated_whitespace() {
+        assert_eq!(single_line("line one\nline two"), "line one line two");
+        assert_eq!(single_line("a\r\nb"), "a b");
+        assert_eq!(single_line("no newlines here"), "no newlines here");
+    }
+}

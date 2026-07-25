@@ -4,6 +4,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
+use crate::message_log::{LoggedMessage, format_history_block, single_line};
 use crate::usage::UsageTracker;
 
 pub const MODEL: &str = "claude-haiku-4-5";
@@ -12,9 +13,15 @@ const TOOL_NAME: &str = "classify_message";
 pub const USAGE_LABEL: &str = "classify";
 
 const SYSTEM_PROMPT_TEMPLATE: &str = "You classify a single chat message from a Matrix room into a \
-structured record. Always respond by calling the classify_message tool exactly once. Base \
-every field only on the message text you are given; do not invent sender, room, or timestamp \
-information that isn't in the text.\n\n\
+structured record. Always respond by calling the classify_message tool exactly once. You may be \
+given the room's recent chat history for context, one line per message as `[sender] message` \
+(oldest first) — each line is a distinct message from exactly the sender named in its own \
+brackets; never attribute a line's content to any other sender. The message to classify is given \
+separately afterward, marked `Message to classify, from [sender]`; classify only that message, \
+using the history for context (e.g. a short reply like \"yeah\" or \"no\" only makes sense in \
+light of what preceded it) — never classify a history line itself or confuse its sender with the \
+message's actual sender. Base every field only on the message text you are given; do not invent \
+sender, room, or timestamp information that isn't in the text.\n\n\
 When intent is \"command\", set `command.name` to the exact command name or alias invoked, and \
 `command.args` to an object keyed by the exact argument names listed below for that command — \
 not a name you invent yourself. Only include an argument if its value actually appears in the \
@@ -89,6 +96,12 @@ pub struct CommandInfo {
 /// Classifies a single message's free text into a `MessageAnalysis` by forcing
 /// the model to call the `classify_message` tool with our schema as its input.
 ///
+/// `history` (typically `MessageLogger::recent`, called before this message is
+/// itself logged) is rendered via `format_history_block` ahead of the message,
+/// giving the classifier the same room context chat/greeting replies already
+/// get — a short message like "yeah" or "gsc" is otherwise ambiguous without
+/// knowing what it's replying to.
+///
 /// `command_reference` (`SkillRegistry::command_reference`) lists every loaded
 /// command's name, aliases, and expected `args` keys, so that when the message
 /// turns out to be a command, the model extracts `command.args` under the same
@@ -98,15 +111,20 @@ pub struct CommandInfo {
 pub async fn classify_message(
     client: &Anthropic,
     message_text: &str,
+    sender: &str,
+    history: &[LoggedMessage],
     command_reference: &str,
     usage_tracker: &UsageTracker,
 ) -> Result<MessageAnalysis> {
     let tool = classify_tool()?;
     let system_prompt = SYSTEM_PROMPT_TEMPLATE.replace("{command_reference}", command_reference);
 
+    let mut user_turn = format_history_block(history);
+    user_turn.push_str(&format!("Message to classify, from [{sender}]:\n{}", single_line(message_text)));
+
     let params = MessageCreateBuilder::new(MODEL, 1024)
         .system(system_prompt)
-        .user(message_text)
+        .user(user_turn)
         .tools(vec![tool])
         .tool_choice(ToolChoice::Tool {
             name: TOOL_NAME.to_string(),

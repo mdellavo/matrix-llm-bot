@@ -20,7 +20,7 @@ use tracing::{debug, info, warn};
 use crate::classify::{Intent, MessageAnalysis, classify_message};
 use crate::greeting::GreetingCooldown;
 use crate::ignore::IgnoredUsers;
-use crate::message_log::{LoggedMessage, MessageLogger};
+use crate::message_log::{self, LoggedMessage, MessageLogger};
 use crate::skills::{self, SkillRegistry};
 use crate::tools::ToolClients;
 use crate::usage::UsageTracker;
@@ -153,9 +153,23 @@ pub async fn on_room_message(event: OriginalSyncRoomMessageEvent, room: Room, cl
 
     info!(room = %room.room_id(), sender = %event.sender, "received message");
 
+    // Fetched before this message is logged below, so it never appears twice
+    // (once in the history block, once as "the message to classify") — same
+    // reasoning as the dedup in `generate_grounded_reply`, just unneeded here
+    // since logging always happens after classification, not before.
+    let classify_history = match message_log.recent(room.room_id().as_str(), CLASSIFY_HISTORY_LIMIT) {
+        Ok(history) => history,
+        Err(err) => {
+            warn!(?err, room = %room.room_id(), "failed to load room history for classification; classifying without it");
+            Vec::new()
+        }
+    };
+
     let analysis = match classify_message(
         &anthropic,
         &text_content.body,
+        event.sender.as_str(),
+        &classify_history,
         &skills.command_reference(),
         &usage_tracker,
     )
@@ -330,6 +344,13 @@ async fn generate_response(
 /// specific user's own history in the room — instead of replying in a vacuum.
 const CHAT_HISTORY_LIMIT: usize = 20;
 
+/// Number of recent room messages fed into `classify_message` as context.
+/// Smaller than `CHAT_HISTORY_LIMIT` since classification runs on every
+/// message the bot sees (not just ones it replies to), so its per-call token
+/// cost matters more at volume — just enough for the classifier to make sense
+/// of short replies like "yeah" or "gsc" without ballooning the common case.
+const CLASSIFY_HISTORY_LIMIT: usize = 10;
+
 /// System prompt for the bot's free-form conversational replies (as opposed to a
 /// skill's prompt or the classifier's structured tool call) — informative and
 /// helpful first, with a light, mildly snarky sense of humor woven in, rather
@@ -496,28 +517,12 @@ async fn generate_grounded_reply(
 }
 
 /// Renders recent room history plus the message being replied to into the single
-/// user-turn string sent to Claude: one `sender: body` line per historical
-/// message (oldest first), then the current message and who sent it.
+/// user-turn string sent to Claude: `format_history_block`'s transcript, then the
+/// current message and who sent it.
 fn format_chat_turn(history: &[LoggedMessage], sender: &str, message_text: &str) -> String {
-    let mut turn = String::new();
-    if !history.is_empty() {
-        turn.push_str("Recent room history (one line per message, oldest first, as `[sender] message`):\n");
-        for entry in history {
-            turn.push_str(&format!("[{}] {}\n", entry.sender, single_line(&entry.body)));
-        }
-        turn.push('\n');
-    }
-    turn.push_str(&format!("Message to reply to, from [{sender}]:\n{}", single_line(message_text)));
+    let mut turn = message_log::format_history_block(history);
+    turn.push_str(&format!("Message to reply to, from [{sender}]:\n{}", message_log::single_line(message_text)));
     turn
-}
-
-/// Collapses embedded newlines to spaces so a multi-line message can never be
-/// mistaken for more than one transcript line — without this, a message
-/// containing `\n` would produce a continuation line with no `[sender]` prefix
-/// at all, which is exactly the kind of thing that gets a model to misattribute
-/// a line to the wrong speaker or the current sender.
-fn single_line(text: &str) -> String {
-    text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 /// Dispatches a `Command`-intent message to the built-in `help` listing, a loaded
@@ -719,12 +724,5 @@ mod tests {
         // `[sender]` prefix — indistinguishable from an unattributed turn.
         assert!(turn.contains("[@alice:example.org] line one line two"), "{turn}");
         assert_eq!(turn.lines().filter(|line| line.contains("line one") || line.contains("line two")).count(), 1, "{turn}");
-    }
-
-    #[test]
-    fn single_line_collapses_newlines_and_repeated_whitespace() {
-        assert_eq!(single_line("line one\nline two"), "line one line two");
-        assert_eq!(single_line("a\r\nb"), "a b");
-        assert_eq!(single_line("no newlines here"), "no newlines here");
     }
 }
