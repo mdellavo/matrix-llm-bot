@@ -1,11 +1,12 @@
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
-use anthropic_sdk::types::{ContentBlock, MessageCreateBuilder};
-use anthropic_sdk::Anthropic;
 use anyhow::{Context, Result};
 use matrix_sdk::room::Room;
 use serde::Deserialize;
+use threatflux_anthropic_sdk::Client as Anthropic;
+use threatflux_anthropic_sdk::builders::message_builder::MessageBuilder;
+use threatflux_anthropic_sdk::models::ContentBlock;
 use tracing::{debug, warn};
 
 use crate::classify::{self, CommandInfo};
@@ -600,21 +601,23 @@ async fn run_prompt(
     usage_tracker: &UsageTracker,
     label: &str,
 ) -> Result<String> {
-    let params = MessageCreateBuilder::new(model, 1024)
+    let params = MessageBuilder::new()
+        .model(model)
+        .max_tokens(1024)
         .system(system)
         .user(user_message)
         .build();
 
     let message = client
         .messages()
-        .create(params)
+        .create(params, None)
         .await
         .context("skill prompt request to Claude failed")?;
 
     usage_tracker.record(label, model, &message.usage);
 
     for block in message.content {
-        if let ContentBlock::Text { text } = block {
+        if let ContentBlock::Text { text, .. } = block {
             return Ok(text);
         }
     }

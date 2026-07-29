@@ -1,8 +1,6 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use anthropic_sdk::types::{ContentBlock, MessageCreateBuilder};
-use anthropic_sdk::Anthropic;
 use matrix_sdk::{
     Client, RoomState,
     event_handler::Ctx,
@@ -15,6 +13,9 @@ use matrix_sdk::{
         },
     },
 };
+use threatflux_anthropic_sdk::Client as Anthropic;
+use threatflux_anthropic_sdk::builders::message_builder::MessageBuilder;
+use threatflux_anthropic_sdk::models::ContentBlock;
 use tracing::{debug, info, warn};
 
 use crate::classify::{ClassifyOutcome, Intent, MessageAnalysis, classify_message};
@@ -489,12 +490,14 @@ async fn generate_grounded_reply(
     let user_turn = format_chat_turn(&history, sender, message_text);
     let prompt = PromptRecord { system: system_prompt.to_string(), user: user_turn.clone() };
 
-    let params = MessageCreateBuilder::new(model, 512)
+    let params = MessageBuilder::new()
+        .model(model)
+        .max_tokens(512)
         .system(system_prompt)
         .user(user_turn.clone())
         .build();
 
-    let message = match anthropic.messages().create(params).await {
+    let message = match anthropic.messages().create(params, None).await {
         Ok(message) => message,
         Err(err) => {
             warn!(?err, "reply generation request to Claude failed");
@@ -509,7 +512,7 @@ async fn generate_grounded_reply(
     usage_tracker.record(usage_label, model, &message.usage);
 
     for block in message.content {
-        if let ContentBlock::Text { text } = block {
+        if let ContentBlock::Text { text, .. } = block {
             debug!(
                 usage_label,
                 trigger_message = message_text,

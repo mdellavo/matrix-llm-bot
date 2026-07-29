@@ -459,13 +459,15 @@ mod tests {
     use crate::message_log::{GeneratedReply, LoggedMessage, MessageLogParams, PromptRecord};
     use crate::usage::UsageTracker;
 
-    fn test_usage(input_tokens: u32, output_tokens: u32) -> anthropic_sdk::types::Usage {
-        anthropic_sdk::types::Usage {
+    fn test_usage(input_tokens: u32, output_tokens: u32) -> threatflux_anthropic_sdk::models::Usage {
+        threatflux_anthropic_sdk::models::Usage {
             input_tokens,
             output_tokens,
-            cache_creation_input_tokens: None,
-            cache_read_input_tokens: None,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 0,
+            cache_creation: None,
             server_tool_use: None,
+            inference_geo: None,
             service_tier: None,
         }
     }

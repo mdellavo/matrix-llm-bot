@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::sync::Mutex;
 
-use anthropic_sdk::types::Usage;
+use threatflux_anthropic_sdk::models::Usage;
 use serde::Serialize;
 
 /// USD price per million input/output tokens, for the models this bot might
@@ -137,9 +137,11 @@ mod tests {
         Usage {
             input_tokens,
             output_tokens,
-            cache_creation_input_tokens: None,
-            cache_read_input_tokens: None,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 0,
+            cache_creation: None,
             server_tool_use: None,
+            inference_geo: None,
             service_tier: None,
         }
     }

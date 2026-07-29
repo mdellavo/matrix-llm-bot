@@ -1,8 +1,9 @@
-use anthropic_sdk::types::{ContentBlock, MessageCreateBuilder, Tool, ToolChoice, ToolInputSchema};
-use anthropic_sdk::Anthropic;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use threatflux_anthropic_sdk::Client as Anthropic;
+use threatflux_anthropic_sdk::builders::message_builder::MessageBuilder;
+use threatflux_anthropic_sdk::models::{ContentBlock, Tool, ToolChoice};
 
 use crate::message_log::{LoggedMessage, PromptRecord, format_history_block, single_line};
 use crate::usage::UsageTracker;
@@ -133,7 +134,9 @@ pub async fn classify_message(
     let mut user_turn = format_history_block(history);
     user_turn.push_str(&format!("Message to classify, from [{sender}]:\n{}", single_line(message_text)));
 
-    let params = MessageCreateBuilder::new(MODEL, 1024)
+    let params = MessageBuilder::new()
+        .model(MODEL)
+        .max_tokens(1024)
         .system(system_prompt.clone())
         .user(user_turn.clone())
         .tools(vec![tool])
@@ -144,7 +147,7 @@ pub async fn classify_message(
 
     let message = client
         .messages()
-        .create(params)
+        .create(params, None)
         .await
         .context("classify_message request to Claude failed")?;
 
@@ -223,12 +226,9 @@ fn classify_tool() -> Result<Tool> {
         "required": ["intent", "confidence", "requires_response", "summary", "sentiment", "entities"]
     });
 
-    let input_schema: ToolInputSchema =
-        serde_json::from_value(schema_json).context("invalid classify_message tool schema")?;
-
-    Ok(Tool {
-        name: TOOL_NAME.to_string(),
-        description: "Record a structured classification of the user's message.".to_string(),
-        input_schema,
-    })
+    Ok(Tool::new(
+        TOOL_NAME,
+        "Record a structured classification of the user's message.",
+        schema_json,
+    ))
 }

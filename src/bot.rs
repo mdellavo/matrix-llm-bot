@@ -1,7 +1,7 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use anthropic_sdk::Anthropic;
+use threatflux_anthropic_sdk::Client as Anthropic;
 use anyhow::{Context, Result};
 use matrix_sdk::{
     Client,
