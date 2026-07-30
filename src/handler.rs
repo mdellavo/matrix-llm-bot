@@ -25,7 +25,7 @@ use crate::message_log::{self, GeneratedReply, LoggedMessage, MessageLogParams, 
 use crate::skills::{self, SkillRegistry};
 use crate::throttle::{RATE_LIMITED_REPLY, Throttle, is_rate_limited};
 use crate::tools::ToolClients;
-use crate::usage::UsageTracker;
+use crate::usage::{COST_LIMIT_REPLY, UsageTracker};
 
 const UNKNOWN_COMMAND_REPLY: &str = "Unknown command. Try \"help\" to see available commands.";
 
@@ -498,6 +498,9 @@ async fn generate_grounded_reply(
     usage_tracker: &UsageTracker,
     rate_limit: &Throttle,
 ) -> GeneratedReply {
+    if usage_tracker.over_cost_limit() {
+        return GeneratedReply::plain(COST_LIMIT_REPLY, usage_label);
+    }
     if rate_limit.remaining().is_some() {
         return GeneratedReply::plain(RATE_LIMITED_REPLY, usage_label);
     }

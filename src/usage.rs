@@ -32,6 +32,13 @@ fn estimate_cost_usd(model: &str, usage: &Usage) -> Option<f64> {
     )
 }
 
+/// Friendly reply text used by any call site that short-circuits a Claude call
+/// because `UsageTracker::over_cost_limit()` is true — shown to the user
+/// instead of silently skipping, so hitting the operator's budget cap doesn't
+/// look like the bot is simply broken.
+pub const COST_LIMIT_REPLY: &str =
+    "The Claude API cost limit configured for this bot has been reached — ask the bot operator to raise it.";
+
 /// Running token/request/cost total for one label (`"classify"`, or a skill name)
 /// or for all calls combined.
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
@@ -78,12 +85,15 @@ pub struct LabeledUsage {
 
 /// Point-in-time view returned by `UsageTracker::snapshot` for the status
 /// server: overall totals plus a per-label breakdown (only labels actually
-/// invoked so far appear), sorted by label name.
+/// invoked so far appear), sorted by label name, plus the configured cost
+/// limit (if any) and whether it's currently been reached.
 #[derive(Debug, Clone, Serialize)]
 pub struct UsageSnapshot {
     #[serde(flatten)]
     pub overall: UsageTotals,
     pub by_label: Vec<LabeledUsage>,
+    pub cost_limit_usd: Option<f64>,
+    pub cost_limit_reached: bool,
 }
 
 /// Accumulates Claude API token usage (and its estimated USD cost) across every
@@ -96,9 +106,16 @@ pub struct UsageSnapshot {
 /// Persisted as a JSON snapshot at `path` (see `open`/`persist`), rewritten
 /// after every `record` call, so totals survive a restart instead of resetting
 /// to zero — unlike most of the bot's other in-memory-only state.
+///
+/// `cost_limit_usd` (from `Config::cost_limit_usd`, not persisted — it's
+/// re-read from config on every startup) is an operator-set hard cap: once
+/// `over_cost_limit` reports true, every Claude call site checks in via it and
+/// stops making API calls entirely, the same way they check `Throttle` for an
+/// active rate-limit cooldown.
 #[derive(Debug)]
 pub struct UsageTracker {
     path: PathBuf,
+    cost_limit_usd: Option<f64>,
     inner: Mutex<Inner>,
 }
 
@@ -116,7 +133,7 @@ impl UsageTracker {
     /// from an incompatible older version) is logged and also starts from
     /// zero, rather than failing the whole bot's startup over what is
     /// ultimately just a cost estimate.
-    pub fn open(path: &Path) -> Result<Self> {
+    pub fn open(path: &Path, cost_limit_usd: Option<f64>) -> Result<Self> {
         if let Some(parent) = path.parent().filter(|parent| !parent.as_os_str().is_empty()) {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("failed to create usage state dir at {}", parent.display()))?;
@@ -133,7 +150,20 @@ impl UsageTracker {
             }
         };
 
-        Ok(Self { path: path.to_path_buf(), inner: Mutex::new(inner) })
+        Ok(Self { path: path.to_path_buf(), cost_limit_usd, inner: Mutex::new(inner) })
+    }
+
+    /// Whether cumulative estimated cost has reached `cost_limit_usd` — always
+    /// `false` when no limit is configured. Checked by every Claude call site
+    /// before firing a request (see the type docs above), so exceeding the
+    /// operator's budget cap stops further API calls rather than just being
+    /// visible after the fact.
+    pub fn over_cost_limit(&self) -> bool {
+        let Some(limit) = self.cost_limit_usd else {
+            return false;
+        };
+        let inner = self.inner.lock().expect("usage tracker mutex poisoned");
+        inner.overall.estimated_cost_usd >= limit
     }
 
     /// Records one completed Claude API call's token usage (and estimated cost —
@@ -168,7 +198,8 @@ impl UsageTracker {
             .map(|(label, totals)| LabeledUsage { label: label.clone(), totals: *totals })
             .collect();
         by_label.sort_by(|a, b| a.label.cmp(&b.label));
-        UsageSnapshot { overall: inner.overall, by_label }
+        let cost_limit_reached = self.cost_limit_usd.is_some_and(|limit| inner.overall.estimated_cost_usd >= limit);
+        UsageSnapshot { overall: inner.overall, by_label, cost_limit_usd: self.cost_limit_usd, cost_limit_reached }
     }
 }
 
@@ -202,7 +233,7 @@ mod tests {
 
     #[test]
     fn records_accumulate_overall_and_per_label_totals() {
-        let tracker = UsageTracker::open(&unique_state_path("accumulate")).expect("open tracker");
+        let tracker = UsageTracker::open(&unique_state_path("accumulate"), None).expect("open tracker");
         tracker.record("classify", "claude-haiku-4-5", &usage(100, 20));
         tracker.record("classify", "claude-haiku-4-5", &usage(50, 10));
         tracker.record("strain", "claude-haiku-4-5", &usage(200, 40));
@@ -230,7 +261,7 @@ mod tests {
 
     #[test]
     fn snapshot_of_empty_tracker_has_zeroed_totals_and_no_labels() {
-        let tracker = UsageTracker::open(&unique_state_path("empty")).expect("open tracker");
+        let tracker = UsageTracker::open(&unique_state_path("empty"), None).expect("open tracker");
         let snapshot = tracker.snapshot();
         assert_eq!(snapshot.overall.total_tokens(), 0);
         assert_eq!(snapshot.overall.request_count, 0);
@@ -239,7 +270,7 @@ mod tests {
 
     #[test]
     fn record_estimates_cost_for_a_known_model() {
-        let tracker = UsageTracker::open(&unique_state_path("known-cost")).expect("open tracker");
+        let tracker = UsageTracker::open(&unique_state_path("known-cost"), None).expect("open tracker");
         // 1,000,000 input tokens @ $1.00/M + 1,000,000 output tokens @ $5.00/M = $6.00.
         tracker.record("classify", "claude-haiku-4-5", &usage(1_000_000, 1_000_000));
 
@@ -250,7 +281,7 @@ mod tests {
 
     #[test]
     fn record_flags_unpriced_requests_for_an_unknown_model_without_estimating_cost() {
-        let tracker = UsageTracker::open(&unique_state_path("unpriced")).expect("open tracker");
+        let tracker = UsageTracker::open(&unique_state_path("unpriced"), None).expect("open tracker");
         tracker.record("strain", "some-future-model", &usage(1_000_000, 1_000_000));
 
         let snapshot = tracker.snapshot();
@@ -264,12 +295,12 @@ mod tests {
     fn totals_survive_reopening_the_same_state_path() {
         let path = unique_state_path("persist-roundtrip");
 
-        let tracker = UsageTracker::open(&path).expect("open tracker");
+        let tracker = UsageTracker::open(&path, None).expect("open tracker");
         tracker.record("classify", "claude-haiku-4-5", &usage(100, 20));
         tracker.record("strain", "claude-haiku-4-5", &usage(200, 40));
         drop(tracker);
 
-        let reopened = UsageTracker::open(&path).expect("reopen tracker from persisted state");
+        let reopened = UsageTracker::open(&path, None).expect("reopen tracker from persisted state");
         let snapshot = reopened.snapshot();
         assert_eq!(snapshot.overall.input_tokens, 300);
         assert_eq!(snapshot.overall.output_tokens, 60);
@@ -286,10 +317,35 @@ mod tests {
         std::fs::create_dir_all(path.parent().expect("parent dir")).expect("create parent dir");
         std::fs::write(&path, "not valid json").expect("write malformed state file");
 
-        let tracker = UsageTracker::open(&path).expect("open tracker despite malformed file");
+        let tracker = UsageTracker::open(&path, None).expect("open tracker despite malformed file");
         let snapshot = tracker.snapshot();
         assert_eq!(snapshot.overall.request_count, 0);
 
         let _ = std::fs::remove_dir_all(path.parent().expect("parent dir"));
+    }
+
+    #[test]
+    fn no_cost_limit_never_reports_over_limit() {
+        let tracker = UsageTracker::open(&unique_state_path("no-limit"), None).expect("open tracker");
+        tracker.record("classify", "claude-opus-4-8", &usage(1_000_000, 1_000_000));
+        assert!(!tracker.over_cost_limit());
+
+        let snapshot = tracker.snapshot();
+        assert_eq!(snapshot.cost_limit_usd, None);
+        assert!(!snapshot.cost_limit_reached);
+    }
+
+    #[test]
+    fn over_cost_limit_trips_once_estimated_cost_reaches_the_configured_limit() {
+        let tracker = UsageTracker::open(&unique_state_path("cost-limit"), Some(1.0)).expect("open tracker");
+        // 100,000 input tokens @ $5.00/M + 100,000 output tokens @ $25.00/M = $3.00 for claude-opus-4-8.
+        assert!(!tracker.over_cost_limit(), "should not be over the limit before any calls");
+
+        tracker.record("classify", "claude-opus-4-8", &usage(100_000, 100_000));
+        assert!(tracker.over_cost_limit(), "should be over the $1.00 limit after a $3.00 call");
+
+        let snapshot = tracker.snapshot();
+        assert_eq!(snapshot.cost_limit_usd, Some(1.0));
+        assert!(snapshot.cost_limit_reached);
     }
 }

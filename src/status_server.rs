@@ -203,8 +203,10 @@ const INDEX_HTML: &str = r#"<!doctype html>
     <dt>Output tokens</dt><dd id="usage-output-tokens">…</dd>
     <dt>Requests</dt><dd id="usage-requests">…</dd>
     <dt>Estimated cost</dt><dd id="usage-cost">…</dd>
+    <dt>Cost limit</dt><dd id="usage-cost-limit">…</dd>
   </dl>
   <p id="usage-unpriced-note" style="display: none;"></p>
+  <p id="usage-cost-limit-note" style="display: none;"></p>
   <table>
     <thead>
       <tr><th>Label</th><th>Input tokens</th><th>Output tokens</th><th>Total tokens</th><th>Requests</th><th>Est. cost</th></tr>
@@ -388,6 +390,7 @@ async function loadUsage() {
   document.getElementById('usage-output-tokens').textContent = usage.output_tokens;
   document.getElementById('usage-requests').textContent = usage.request_count;
   document.getElementById('usage-cost').textContent = formatCost(usage.estimated_cost_usd);
+  document.getElementById('usage-cost-limit').textContent = usage.cost_limit_usd == null ? 'none' : formatCost(usage.cost_limit_usd);
 
   const unpricedNote = document.getElementById('usage-unpriced-note');
   if (usage.unpriced_requests > 0) {
@@ -395,6 +398,14 @@ async function loadUsage() {
     unpricedNote.textContent = `Note: ${usage.unpriced_requests} request(s) used a model with no known price and are not included in the cost estimate above.`;
   } else {
     unpricedNote.style.display = 'none';
+  }
+
+  const costLimitNote = document.getElementById('usage-cost-limit-note');
+  if (usage.cost_limit_reached) {
+    costLimitNote.style.display = '';
+    costLimitNote.textContent = 'Cost limit reached — the bot has stopped making Claude API calls until the limit is raised or usage state is reset.';
+  } else {
+    costLimitNote.style.display = 'none';
   }
 
   if (usage.by_label.length === 0) {
@@ -557,7 +568,7 @@ mod tests {
         let skills = Arc::new(SkillRegistry::load(&skills_dir).expect("load skills"));
         let tool_clients = Arc::new(ToolClients::new(None));
         let usage_state_path = unique_temp_dir("status-server-usage").join("usage.json");
-        let usage_tracker = Arc::new(UsageTracker::open(&usage_state_path).expect("open usage tracker"));
+        let usage_tracker = Arc::new(UsageTracker::open(&usage_state_path, None).expect("open usage tracker"));
         usage_tracker.record("classify", "claude-haiku-4-5", &test_usage(120, 30));
         let rate_limit = Arc::new(Throttle::new(std::time::Duration::from_secs(60)));
 

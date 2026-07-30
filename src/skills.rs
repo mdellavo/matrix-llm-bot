@@ -13,7 +13,7 @@ use crate::classify::{self, CommandInfo};
 use crate::message_log::{GeneratedReply, LoggedMessage, MessageLogger, PromptRecord};
 use crate::throttle::{RATE_LIMITED_REPLY, Throttle, is_rate_limited};
 use crate::tools::{self, ToolClients};
-use crate::usage::UsageTracker;
+use crate::usage::{COST_LIMIT_REPLY, UsageTracker};
 
 const SKILL_FILE_NAME: &str = "SKILL.md";
 const FRONTMATTER_DELIMITER: &str = "---";
@@ -427,7 +427,11 @@ pub async fn execute(
 ) -> GeneratedReply {
     // Short-circuits before validating args or building any context — same
     // reasoning as the OMDb-key check below: there's nothing useful to say
-    // while throttled, so don't do the extra work just to discover that.
+    // while over the cost limit or throttled, so don't do the extra work just
+    // to discover that.
+    if usage_tracker.over_cost_limit() {
+        return GeneratedReply::plain(COST_LIMIT_REPLY, &skill.name);
+    }
     if rate_limit.remaining().is_some() {
         return GeneratedReply::plain(RATE_LIMITED_REPLY, &skill.name);
     }

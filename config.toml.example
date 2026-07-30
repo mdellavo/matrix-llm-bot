@@ -45,3 +45,9 @@ rooms = ["#some-room:matrix.org"]
 # Optional: how long (in seconds) to pause outgoing Claude API calls after one
 # comes back rate-limited (HTTP 429), before trying again. Defaults to 60.
 # rate_limit_backoff_secs = 60
+
+# Optional: hard cap on cumulative estimated Claude API cost in USD. Once
+# reached, every Claude call site (classifier, chat/greeting replies, skills)
+# stops making API calls entirely until the limit is raised or the persisted
+# usage state (usage_state_path) is reset. Unset (the default) means no limit.
+# cost_limit_usd = 5.00

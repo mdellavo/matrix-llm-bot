@@ -130,6 +130,9 @@ pub async fn classify_message(
     usage_tracker: &UsageTracker,
     rate_limit: &Throttle,
 ) -> Result<ClassifyOutcome> {
+    if usage_tracker.over_cost_limit() {
+        anyhow::bail!("Claude API cost limit reached; not classifying");
+    }
     if let Some(remaining) = rate_limit.remaining() {
         anyhow::bail!("Claude API is rate-limited; not classifying for another {remaining:?}");
     }

@@ -69,6 +69,14 @@ pub struct Config {
     /// (`src/throttle.rs`). Defaults to 60 seconds.
     #[serde(default = "default_rate_limit_backoff_secs")]
     pub rate_limit_backoff_secs: u64,
+
+    /// Hard cap on cumulative estimated Claude API cost in USD (see
+    /// `UsageTracker`). Once accumulated cost reaches this, every Claude call
+    /// site (classifier, chat/greeting replies, skills) stops making API
+    /// calls entirely, until the limit is raised or the persisted usage state
+    /// (`usage_state_path`) is reset. `None` (the default) means no limit.
+    #[serde(default)]
+    pub cost_limit_usd: Option<f64>,
 }
 
 fn default_device_name() -> String {

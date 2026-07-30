@@ -74,7 +74,8 @@ impl Bot {
         let skills = Arc::new(SkillRegistry::load(&config.skills_dir)?);
         let tool_clients = Arc::new(ToolClients::new(config.omdb_api_key.clone()));
         let usage_tracker = Arc::new(
-            UsageTracker::open(&config.usage_state_path).context("failed to load persisted Claude API usage stats")?,
+            UsageTracker::open(&config.usage_state_path, config.cost_limit_usd)
+                .context("failed to load persisted Claude API usage stats")?,
         );
         let greeting_cooldown = Arc::new(GreetingCooldown::new(crate::greeting::DEFAULT_COOLDOWN));
         let ignored_users = Arc::new(IgnoredUsers::new(config.ignored_users.clone()));
