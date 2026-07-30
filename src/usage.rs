@@ -1,8 +1,11 @@
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
+use anyhow::{Context, Result};
+use serde::{Deserialize, Serialize};
 use threatflux_anthropic_sdk::models::Usage;
-use serde::Serialize;
+use tracing::warn;
 
 /// USD price per million input/output tokens, for the models this bot might
 /// plausibly use (the default `claude-haiku-4-5` — see `classify::MODEL` — plus
@@ -31,7 +34,7 @@ fn estimate_cost_usd(model: &str, usage: &Usage) -> Option<f64> {
 
 /// Running token/request/cost total for one label (`"classify"`, or a skill name)
 /// or for all calls combined.
-#[derive(Debug, Clone, Copy, Default, Serialize)]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
 pub struct UsageTotals {
     pub input_tokens: u64,
     pub output_tokens: u64,
@@ -89,32 +92,72 @@ pub struct UsageSnapshot {
 /// `"chat"`), and each skill's prompt (`skills::execute`'s `run_prompt`, labeled
 /// by skill name). Anthropic bills by token, so this is the number that actually
 /// answers "how much is this bot costing," which nothing else in the bot tracks.
-/// In-memory only (resets on restart) — same as every other piece of the bot's
-/// state besides the message log and the crypto store.
-#[derive(Debug, Default)]
+///
+/// Persisted as a JSON snapshot at `path` (see `open`/`persist`), rewritten
+/// after every `record` call, so totals survive a restart instead of resetting
+/// to zero — unlike most of the bot's other in-memory-only state.
+#[derive(Debug)]
 pub struct UsageTracker {
+    path: PathBuf,
     inner: Mutex<Inner>,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Serialize, Deserialize)]
 struct Inner {
     overall: UsageTotals,
     by_label: HashMap<String, UsageTotals>,
 }
 
 impl UsageTracker {
-    pub fn new() -> Self {
-        Self::default()
+    /// Loads previously persisted totals from `path` (a JSON snapshot rewritten
+    /// after every `record` call — see `persist`), so usage/cost tracking
+    /// survives a restart instead of resetting to zero. A missing file (first
+    /// run) starts from zero; a present-but-unparseable one (e.g. left over
+    /// from an incompatible older version) is logged and also starts from
+    /// zero, rather than failing the whole bot's startup over what is
+    /// ultimately just a cost estimate.
+    pub fn open(path: &Path) -> Result<Self> {
+        if let Some(parent) = path.parent().filter(|parent| !parent.as_os_str().is_empty()) {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("failed to create usage state dir at {}", parent.display()))?;
+        }
+
+        let inner = match std::fs::read_to_string(path) {
+            Ok(raw) => serde_json::from_str(&raw).unwrap_or_else(|err| {
+                warn!(?err, path = %path.display(), "failed to parse persisted usage state; starting from zero");
+                Inner::default()
+            }),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Inner::default(),
+            Err(err) => {
+                return Err(err).with_context(|| format!("failed to read usage state file at {}", path.display()));
+            }
+        };
+
+        Ok(Self { path: path.to_path_buf(), inner: Mutex::new(inner) })
     }
 
     /// Records one completed Claude API call's token usage (and estimated cost —
-    /// see `estimate_cost_usd`) under `label`. `model` is whichever model this
-    /// particular call actually used — a skill's own `model:` override if it has
-    /// one, not necessarily `classify::MODEL` — since cost depends on it.
+    /// see `estimate_cost_usd`) under `label`, then persists the updated totals
+    /// to `path` (see `persist`). `model` is whichever model this particular
+    /// call actually used — a skill's own `model:` override if it has one, not
+    /// necessarily `classify::MODEL` — since cost depends on it.
     pub fn record(&self, label: &str, model: &str, usage: &Usage) {
         let mut inner = self.inner.lock().expect("usage tracker mutex poisoned");
         inner.overall.add(model, usage);
         inner.by_label.entry(label.to_string()).or_default().add(model, usage);
+
+        if let Err(err) = self.persist(&inner) {
+            warn!(?err, path = %self.path.display(), "failed to persist usage state");
+        }
+    }
+
+    /// Overwrites `path` with the current snapshot. A plain overwrite rather
+    /// than the write-temp-then-rename `MessageLogger`/`bot.rs` session file use
+    /// — a partial write here only costs an approximate usage/cost estimate,
+    /// not state the bot depends on for correctness.
+    fn persist(&self, inner: &Inner) -> Result<()> {
+        let raw = serde_json::to_string_pretty(inner).context("failed to serialize usage state")?;
+        std::fs::write(&self.path, raw).with_context(|| format!("failed to write usage state file at {}", self.path.display()))
     }
 
     pub fn snapshot(&self) -> UsageSnapshot {
@@ -133,6 +176,17 @@ impl UsageTracker {
 mod tests {
     use super::*;
 
+    /// A path to a not-yet-existing file under a fresh temp directory, so each
+    /// test gets its own isolated persisted-state file — `UsageTracker::open`
+    /// creates the file (and its parent dir) on first `record`.
+    fn unique_state_path(label: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock is after the unix epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!("matrix-llm-bot-test-usage-{label}-{nanos}")).join("usage.json")
+    }
+
     fn usage(input_tokens: u32, output_tokens: u32) -> Usage {
         Usage {
             input_tokens,
@@ -148,7 +202,7 @@ mod tests {
 
     #[test]
     fn records_accumulate_overall_and_per_label_totals() {
-        let tracker = UsageTracker::new();
+        let tracker = UsageTracker::open(&unique_state_path("accumulate")).expect("open tracker");
         tracker.record("classify", "claude-haiku-4-5", &usage(100, 20));
         tracker.record("classify", "claude-haiku-4-5", &usage(50, 10));
         tracker.record("strain", "claude-haiku-4-5", &usage(200, 40));
@@ -176,7 +230,7 @@ mod tests {
 
     #[test]
     fn snapshot_of_empty_tracker_has_zeroed_totals_and_no_labels() {
-        let tracker = UsageTracker::new();
+        let tracker = UsageTracker::open(&unique_state_path("empty")).expect("open tracker");
         let snapshot = tracker.snapshot();
         assert_eq!(snapshot.overall.total_tokens(), 0);
         assert_eq!(snapshot.overall.request_count, 0);
@@ -185,7 +239,7 @@ mod tests {
 
     #[test]
     fn record_estimates_cost_for_a_known_model() {
-        let tracker = UsageTracker::new();
+        let tracker = UsageTracker::open(&unique_state_path("known-cost")).expect("open tracker");
         // 1,000,000 input tokens @ $1.00/M + 1,000,000 output tokens @ $5.00/M = $6.00.
         tracker.record("classify", "claude-haiku-4-5", &usage(1_000_000, 1_000_000));
 
@@ -196,7 +250,7 @@ mod tests {
 
     #[test]
     fn record_flags_unpriced_requests_for_an_unknown_model_without_estimating_cost() {
-        let tracker = UsageTracker::new();
+        let tracker = UsageTracker::open(&unique_state_path("unpriced")).expect("open tracker");
         tracker.record("strain", "some-future-model", &usage(1_000_000, 1_000_000));
 
         let snapshot = tracker.snapshot();
@@ -204,5 +258,38 @@ mod tests {
         assert_eq!(snapshot.overall.unpriced_requests, 1);
         let strain = snapshot.by_label.iter().find(|l| l.label == "strain").expect("strain label");
         assert_eq!(strain.totals.unpriced_requests, 1);
+    }
+
+    #[test]
+    fn totals_survive_reopening_the_same_state_path() {
+        let path = unique_state_path("persist-roundtrip");
+
+        let tracker = UsageTracker::open(&path).expect("open tracker");
+        tracker.record("classify", "claude-haiku-4-5", &usage(100, 20));
+        tracker.record("strain", "claude-haiku-4-5", &usage(200, 40));
+        drop(tracker);
+
+        let reopened = UsageTracker::open(&path).expect("reopen tracker from persisted state");
+        let snapshot = reopened.snapshot();
+        assert_eq!(snapshot.overall.input_tokens, 300);
+        assert_eq!(snapshot.overall.output_tokens, 60);
+        assert_eq!(snapshot.overall.request_count, 2);
+        let strain = snapshot.by_label.iter().find(|l| l.label == "strain").expect("strain label");
+        assert_eq!(strain.totals.input_tokens, 200);
+
+        let _ = std::fs::remove_dir_all(path.parent().expect("parent dir"));
+    }
+
+    #[test]
+    fn open_starts_from_zero_on_malformed_state_file() {
+        let path = unique_state_path("malformed");
+        std::fs::create_dir_all(path.parent().expect("parent dir")).expect("create parent dir");
+        std::fs::write(&path, "not valid json").expect("write malformed state file");
+
+        let tracker = UsageTracker::open(&path).expect("open tracker despite malformed file");
+        let snapshot = tracker.snapshot();
+        assert_eq!(snapshot.overall.request_count, 0);
+
+        let _ = std::fs::remove_dir_all(path.parent().expect("parent dir"));
     }
 }

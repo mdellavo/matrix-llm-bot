@@ -6,6 +6,7 @@ use threatflux_anthropic_sdk::builders::message_builder::MessageBuilder;
 use threatflux_anthropic_sdk::models::{ContentBlock, Tool, ToolChoice};
 
 use crate::message_log::{LoggedMessage, PromptRecord, format_history_block, single_line};
+use crate::throttle::{Throttle, is_rate_limited};
 use crate::usage::UsageTracker;
 
 pub const MODEL: &str = "claude-haiku-4-5";
@@ -127,7 +128,12 @@ pub async fn classify_message(
     history: &[LoggedMessage],
     command_reference: &str,
     usage_tracker: &UsageTracker,
+    rate_limit: &Throttle,
 ) -> Result<ClassifyOutcome> {
+    if let Some(remaining) = rate_limit.remaining() {
+        anyhow::bail!("Claude API is rate-limited; not classifying for another {remaining:?}");
+    }
+
     let tool = classify_tool()?;
     let system_prompt = SYSTEM_PROMPT_TEMPLATE.replace("{command_reference}", command_reference);
 
@@ -145,11 +151,15 @@ pub async fn classify_message(
         })
         .build();
 
-    let message = client
-        .messages()
-        .create(params, None)
-        .await
-        .context("classify_message request to Claude failed")?;
+    let message = match client.messages().create(params, None).await {
+        Ok(message) => message,
+        Err(err) => {
+            if is_rate_limited(&err) {
+                rate_limit.note_rate_limited();
+            }
+            return Err(anyhow::Error::new(err).context("classify_message request to Claude failed"));
+        }
+    };
 
     usage_tracker.record(USAGE_LABEL, MODEL, &message.usage);
 

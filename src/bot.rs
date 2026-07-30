@@ -1,7 +1,6 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use threatflux_anthropic_sdk::Client as Anthropic;
 use anyhow::{Context, Result};
 use matrix_sdk::{
     Client,
@@ -9,6 +8,7 @@ use matrix_sdk::{
     config::SyncSettings,
     ruma::{DeviceId, RoomOrAliasId},
 };
+use threatflux_anthropic_sdk::Client as Anthropic;
 use tracing::{info, warn};
 
 use crate::config::Config;
@@ -17,6 +17,7 @@ use crate::handler::{HandlerContext, on_room_message};
 use crate::ignore::IgnoredUsers;
 use crate::message_log::MessageLogger;
 use crate::skills::SkillRegistry;
+use crate::throttle::Throttle;
 use crate::tools::ToolClients;
 use crate::usage::UsageTracker;
 
@@ -31,6 +32,7 @@ pub struct Bot {
     usage_tracker: Arc<UsageTracker>,
     greeting_cooldown: Arc<GreetingCooldown>,
     ignored_users: Arc<IgnoredUsers>,
+    rate_limit: Arc<Throttle>,
 }
 
 impl Bot {
@@ -71,9 +73,12 @@ impl Bot {
         let message_log = Arc::new(MessageLogger::open(&config.message_log_dir)?);
         let skills = Arc::new(SkillRegistry::load(&config.skills_dir)?);
         let tool_clients = Arc::new(ToolClients::new(config.omdb_api_key.clone()));
-        let usage_tracker = Arc::new(UsageTracker::new());
+        let usage_tracker = Arc::new(
+            UsageTracker::open(&config.usage_state_path).context("failed to load persisted Claude API usage stats")?,
+        );
         let greeting_cooldown = Arc::new(GreetingCooldown::new(crate::greeting::DEFAULT_COOLDOWN));
         let ignored_users = Arc::new(IgnoredUsers::new(config.ignored_users.clone()));
+        let rate_limit = Arc::new(Throttle::new(std::time::Duration::from_secs(config.rate_limit_backoff_secs)));
 
         // Bundled into one `HandlerContext` (see its doc comment in `handler.rs`)
         // and registered as a single event-handler context, rather than one
@@ -87,9 +92,10 @@ impl Bot {
             usage_tracker: Arc::clone(&usage_tracker),
             greeting_cooldown: Arc::clone(&greeting_cooldown),
             ignored_users: Arc::clone(&ignored_users),
+            rate_limit: Arc::clone(&rate_limit),
         }));
 
-        Ok(Self { client, message_log, skills, tool_clients, usage_tracker, greeting_cooldown, ignored_users })
+        Ok(Self { client, message_log, skills, tool_clients, usage_tracker, greeting_cooldown, ignored_users, rate_limit })
     }
 
     /// Restores a previously saved session if one exists at `<store_path>/session.json`
@@ -169,6 +175,13 @@ impl Bot {
     #[allow(dead_code)]
     pub fn ignored_users(&self) -> Arc<IgnoredUsers> {
         Arc::clone(&self.ignored_users)
+    }
+
+    /// A clone of the shared Claude API rate-limit throttle, for callers (e.g.
+    /// the status server) that need to report whether the bot is currently
+    /// throttled without going through the event handler.
+    pub fn rate_limit(&self) -> Arc<Throttle> {
+        Arc::clone(&self.rate_limit)
     }
 
     /// Joins every room configured for monitoring. Already-joined rooms are skipped.

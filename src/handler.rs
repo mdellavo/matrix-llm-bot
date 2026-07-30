@@ -23,6 +23,7 @@ use crate::greeting::GreetingCooldown;
 use crate::ignore::IgnoredUsers;
 use crate::message_log::{self, GeneratedReply, LoggedMessage, MessageLogParams, MessageLogger, PromptRecord};
 use crate::skills::{self, SkillRegistry};
+use crate::throttle::{RATE_LIMITED_REPLY, Throttle, is_rate_limited};
 use crate::tools::ToolClients;
 use crate::usage::UsageTracker;
 
@@ -119,6 +120,7 @@ pub struct HandlerContext {
     pub usage_tracker: Arc<UsageTracker>,
     pub greeting_cooldown: Arc<GreetingCooldown>,
     pub ignored_users: Arc<IgnoredUsers>,
+    pub rate_limit: Arc<Throttle>,
 }
 
 /// Registered as a sync event handler; fires for every `m.room.message` the bot
@@ -128,8 +130,16 @@ pub async fn on_room_message(event: OriginalSyncRoomMessageEvent, room: Room, cl
     // Cloning out into identically-typed locals (cheap — just Arc refcount
     // bumps) rather than writing `ctx.foo` everywhere below keeps this
     // function's body unchanged from before the bundling.
-    let HandlerContext { anthropic, message_log, skills, tool_clients, usage_tracker, greeting_cooldown, ignored_users } =
-        (*ctx).clone();
+    let HandlerContext {
+        anthropic,
+        message_log,
+        skills,
+        tool_clients,
+        usage_tracker,
+        greeting_cooldown,
+        ignored_users,
+        rate_limit,
+    } = (*ctx).clone();
 
     if room.state() != RoomState::Joined {
         return;
@@ -172,6 +182,7 @@ pub async fn on_room_message(event: OriginalSyncRoomMessageEvent, room: Room, cl
         &classify_history,
         &skills.command_reference(),
         &usage_tracker,
+        &rate_limit,
     )
     .await
     {
@@ -221,6 +232,7 @@ pub async fn on_room_message(event: OriginalSyncRoomMessageEvent, room: Room, cl
             &skills,
             &tool_clients,
             &usage_tracker,
+            &rate_limit,
         )
         .await;
 
@@ -321,6 +333,7 @@ async fn generate_response(
     skills: &SkillRegistry,
     tool_clients: &ToolClients,
     usage_tracker: &UsageTracker,
+    rate_limit: &Throttle,
 ) -> Option<GeneratedReply> {
     if !will_generate_response(analysis, message_text, directed_at_bot, should_greet) {
         return None;
@@ -337,16 +350,19 @@ async fn generate_response(
                 skills,
                 tool_clients,
                 usage_tracker,
+                rate_limit,
             )
             .await,
         );
     }
 
     if analysis.intent == Intent::Greeting {
-        return Some(generate_greeting_reply(room, message_text, sender, anthropic, message_log, usage_tracker).await);
+        return Some(
+            generate_greeting_reply(room, message_text, sender, anthropic, message_log, usage_tracker, rate_limit).await,
+        );
     }
 
-    Some(generate_chat_reply(room, message_text, sender, anthropic, message_log, usage_tracker).await)
+    Some(generate_chat_reply(room, message_text, sender, anthropic, message_log, usage_tracker, rate_limit).await)
 }
 
 /// Number of recent room messages fed into `generate_chat_reply` as context, so
@@ -421,6 +437,7 @@ async fn generate_chat_reply(
     anthropic: &Anthropic,
     message_log: &MessageLogger,
     usage_tracker: &UsageTracker,
+    rate_limit: &Throttle,
 ) -> GeneratedReply {
     generate_grounded_reply(
         room,
@@ -432,6 +449,7 @@ async fn generate_chat_reply(
         anthropic,
         message_log,
         usage_tracker,
+        rate_limit,
     )
     .await
 }
@@ -445,6 +463,7 @@ async fn generate_greeting_reply(
     anthropic: &Anthropic,
     message_log: &MessageLogger,
     usage_tracker: &UsageTracker,
+    rate_limit: &Throttle,
 ) -> GeneratedReply {
     generate_grounded_reply(
         room,
@@ -456,6 +475,7 @@ async fn generate_greeting_reply(
         anthropic,
         message_log,
         usage_tracker,
+        rate_limit,
     )
     .await
 }
@@ -476,7 +496,12 @@ async fn generate_grounded_reply(
     anthropic: &Anthropic,
     message_log: &MessageLogger,
     usage_tracker: &UsageTracker,
+    rate_limit: &Throttle,
 ) -> GeneratedReply {
+    if rate_limit.remaining().is_some() {
+        return GeneratedReply::plain(RATE_LIMITED_REPLY, usage_label);
+    }
+
     // `on_room_message` logs the current message only after this call returns,
     // so `recent` never includes it — no dedup needed here.
     let history = match message_log.recent(room.room_id().as_str(), CHAT_HISTORY_LIMIT) {
@@ -500,6 +525,9 @@ async fn generate_grounded_reply(
     let message = match anthropic.messages().create(params, None).await {
         Ok(message) => message,
         Err(err) => {
+            if is_rate_limited(&err) {
+                rate_limit.note_rate_limited();
+            }
             warn!(?err, "reply generation request to Claude failed");
             return GeneratedReply {
                 text: "Sorry, I couldn't come up with a reply to that.".to_string(),
@@ -554,6 +582,7 @@ async fn handle_command(
     skills: &SkillRegistry,
     tool_clients: &ToolClients,
     usage_tracker: &UsageTracker,
+    rate_limit: &Throttle,
 ) -> GeneratedReply {
     let Some(command) = &analysis.command else {
         return GeneratedReply::plain(UNKNOWN_COMMAND_REPLY, "unknown_command");
@@ -573,6 +602,7 @@ async fn handle_command(
                 message_log,
                 tool_clients,
                 usage_tracker,
+                rate_limit,
                 room,
                 skill,
                 message_text,

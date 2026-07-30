@@ -16,6 +16,7 @@ use tracing::info;
 
 use crate::message_log::MessageLogger;
 use crate::skills::SkillRegistry;
+use crate::throttle::Throttle;
 use crate::tools::ToolClients;
 use crate::usage::UsageTracker;
 
@@ -33,6 +34,7 @@ pub struct AppState {
     pub skills: Arc<SkillRegistry>,
     pub tool_clients: Arc<ToolClients>,
     pub usage_tracker: Arc<UsageTracker>,
+    pub rate_limit: Arc<Throttle>,
     pub homeserver_url: String,
 }
 
@@ -68,6 +70,9 @@ struct StatusResponse {
     uptime_seconds: u64,
     /// Whether an OMDb API key is configured — the `imdb` skill needs one to work.
     omdb_configured: bool,
+    /// Seconds left in an active Claude API rate-limit cooldown (see
+    /// `Throttle`) — `None` when the bot isn't currently throttled.
+    rate_limited_seconds_remaining: Option<u64>,
     rooms: Vec<RoomSummary>,
 }
 
@@ -94,6 +99,7 @@ async fn api_status(State(state): State<Arc<AppState>>) -> Json<StatusResponse> 
         classifier_model: crate::classify::MODEL,
         uptime_seconds: state.start_time.elapsed().as_secs(),
         omdb_configured: state.tool_clients.has_omdb_key(),
+        rate_limited_seconds_remaining: state.rate_limit.remaining().map(|remaining| remaining.as_secs()),
         rooms,
     })
 }
@@ -187,6 +193,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
     <dt>Classifier model</dt><dd id="model">…</dd>
     <dt>Uptime</dt><dd id="uptime">…</dd>
     <dt>OMDb configured</dt><dd id="omdb-configured">…</dd>
+    <dt>Claude API rate limit</dt><dd id="rate-limited">…</dd>
   </dl>
 
   <h2>Claude API usage</h2>
@@ -416,6 +423,9 @@ async function loadStatus(selectFirstRoom) {
   document.getElementById('model').textContent = data.classifier_model;
   document.getElementById('uptime').textContent = formatUptime(data.uptime_seconds);
   document.getElementById('omdb-configured').textContent = data.omdb_configured ? 'yes' : 'no';
+  document.getElementById('rate-limited').textContent = data.rate_limited_seconds_remaining == null
+    ? 'not throttled'
+    : `throttled — retrying in ${data.rate_limited_seconds_remaining}s`;
 
   const roomSelect = document.getElementById('room-select');
   const previousValue = roomSelect.value;
@@ -546,8 +556,10 @@ mod tests {
         let skills_dir = unique_temp_dir("status-server-skills");
         let skills = Arc::new(SkillRegistry::load(&skills_dir).expect("load skills"));
         let tool_clients = Arc::new(ToolClients::new(None));
-        let usage_tracker = Arc::new(UsageTracker::new());
+        let usage_state_path = unique_temp_dir("status-server-usage").join("usage.json");
+        let usage_tracker = Arc::new(UsageTracker::open(&usage_state_path).expect("open usage tracker"));
         usage_tracker.record("classify", "claude-haiku-4-5", &test_usage(120, 30));
+        let rate_limit = Arc::new(Throttle::new(std::time::Duration::from_secs(60)));
 
         let state = Arc::new(AppState {
             start_time: Instant::now(),
@@ -556,6 +568,7 @@ mod tests {
             skills,
             tool_clients,
             usage_tracker,
+            rate_limit,
             homeserver_url: "http://example.invalid".to_string(),
         });
 
@@ -579,6 +592,7 @@ mod tests {
         assert_eq!(status["classifier_model"], crate::classify::MODEL);
         assert_eq!(status["homeserver_url"], "http://example.invalid");
         assert_eq!(status["omdb_configured"], false, "no OMDb key was configured for this test");
+        assert!(status["rate_limited_seconds_remaining"].is_null(), "not throttled in this test");
         // The client never synced, so it has no joined rooms — the route still works.
         assert_eq!(status["rooms"].as_array().expect("rooms array").len(), 0);
 
@@ -630,5 +644,6 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&log_dir);
         let _ = std::fs::remove_dir_all(&skills_dir);
+        let _ = std::fs::remove_dir_all(usage_state_path.parent().expect("parent dir"));
     }
 }

@@ -57,6 +57,18 @@ pub struct Config {
     /// to empty (ignore nobody). See `IgnoredUsers` (`src/ignore.rs`).
     #[serde(default)]
     pub ignored_users: Vec<String>,
+
+    /// Where accumulated Claude API token/request usage (see `UsageTracker`) is
+    /// persisted as a JSON snapshot, so it survives a restart instead of
+    /// resetting to zero. Defaults to "./data/usage.json".
+    #[serde(default = "default_usage_state_path")]
+    pub usage_state_path: PathBuf,
+
+    /// How long to pause outgoing Claude API calls after one comes back
+    /// rate-limited (HTTP 429), before trying again — see `Throttle`
+    /// (`src/throttle.rs`). Defaults to 60 seconds.
+    #[serde(default = "default_rate_limit_backoff_secs")]
+    pub rate_limit_backoff_secs: u64,
 }
 
 fn default_device_name() -> String {
@@ -77,6 +89,14 @@ fn default_http_listen_addr() -> SocketAddr {
 
 fn default_skills_dir() -> PathBuf {
     PathBuf::from("./skills")
+}
+
+fn default_usage_state_path() -> PathBuf {
+    PathBuf::from("./data/usage.json")
+}
+
+fn default_rate_limit_backoff_secs() -> u64 {
+    60
 }
 
 impl Config {

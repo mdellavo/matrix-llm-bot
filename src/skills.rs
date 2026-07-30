@@ -11,6 +11,7 @@ use tracing::{debug, warn};
 
 use crate::classify::{self, CommandInfo};
 use crate::message_log::{GeneratedReply, LoggedMessage, MessageLogger, PromptRecord};
+use crate::throttle::{RATE_LIMITED_REPLY, Throttle, is_rate_limited};
 use crate::tools::{self, ToolClients};
 use crate::usage::UsageTracker;
 
@@ -418,11 +419,19 @@ pub async fn execute(
     message_log: &MessageLogger,
     tool_clients: &ToolClients,
     usage_tracker: &UsageTracker,
+    rate_limit: &Throttle,
     room: &Room,
     skill: &Skill,
     message_text: &str,
     command: &CommandInfo,
 ) -> GeneratedReply {
+    // Short-circuits before validating args or building any context — same
+    // reasoning as the OMDb-key check below: there's nothing useful to say
+    // while throttled, so don't do the extra work just to discover that.
+    if rate_limit.remaining().is_some() {
+        return GeneratedReply::plain(RATE_LIMITED_REPLY, &skill.name);
+    }
+
     let resolved_args = if skill.args.is_empty() {
         command.args.as_object().cloned().unwrap_or_default()
     } else {
@@ -544,7 +553,7 @@ pub async fn execute(
 
     let model = skill.model.as_deref().unwrap_or(classify::MODEL);
 
-    match run_prompt(anthropic, model, &skill.prompt, &user_turn, usage_tracker, &skill.name).await {
+    match run_prompt(anthropic, model, &skill.prompt, &user_turn, usage_tracker, &skill.name, rate_limit).await {
         Ok(reply) => {
             debug!(
                 skill = %skill.name,
@@ -600,6 +609,7 @@ async fn run_prompt(
     user_message: &str,
     usage_tracker: &UsageTracker,
     label: &str,
+    rate_limit: &Throttle,
 ) -> Result<String> {
     let params = MessageBuilder::new()
         .model(model)
@@ -608,11 +618,15 @@ async fn run_prompt(
         .user(user_message)
         .build();
 
-    let message = client
-        .messages()
-        .create(params, None)
-        .await
-        .context("skill prompt request to Claude failed")?;
+    let message = match client.messages().create(params, None).await {
+        Ok(message) => message,
+        Err(err) => {
+            if is_rate_limited(&err) {
+                rate_limit.note_rate_limited();
+            }
+            return Err(anyhow::Error::new(err).context("skill prompt request to Claude failed"));
+        }
+    };
 
     usage_tracker.record(label, model, &message.usage);
 

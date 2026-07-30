@@ -36,3 +36,12 @@ rooms = ["#some-room:matrix.org"]
 # before classification, logging, or any reply, so they never show up in
 # message history either. Defaults to empty (ignore nobody).
 # ignored_users = ["@spammer:example.org"]
+
+# Optional: where accumulated Claude API token/request usage is persisted as a
+# JSON snapshot, so it survives a restart instead of resetting to zero.
+# Defaults to "./data/usage.json".
+# usage_state_path = "./data/usage.json"
+
+# Optional: how long (in seconds) to pause outgoing Claude API calls after one
+# comes back rate-limited (HTTP 429), before trying again. Defaults to 60.
+# rate_limit_backoff_secs = 60
