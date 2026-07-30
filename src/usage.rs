@@ -22,14 +22,29 @@ fn price_per_million_tokens(model: &str) -> Option<(f64, f64)> {
     }
 }
 
-/// Estimated USD cost of one completion, or `None` if `model` isn't in
-/// `price_per_million_tokens`'s table.
+/// Estimated USD cost of one completion's tokens, or `None` if `model` isn't
+/// in `price_per_million_tokens`'s table. Excludes server-side tool fees (e.g.
+/// web search) — see `web_search_cost_usd`, added separately in `add` since
+/// it doesn't depend on the model's per-token price.
 fn estimate_cost_usd(model: &str, usage: &Usage) -> Option<f64> {
     let (input_price, output_price) = price_per_million_tokens(model)?;
     Some(
         (f64::from(usage.input_tokens) / 1_000_000.0) * input_price
             + (f64::from(usage.output_tokens) / 1_000_000.0) * output_price,
     )
+}
+
+/// USD price per web search the model performs via the built-in `web_search`
+/// server-side tool (`generate_chat_reply` — see `handler.rs`), independent of
+/// which model made the call. Not fetched live; keep in sync with Anthropic's
+/// published pricing if it changes.
+const WEB_SEARCH_PRICE_PER_REQUEST: f64 = 0.01;
+
+/// Estimated USD cost of one completion's web searches (`0.0` if it made
+/// none) — see `WEB_SEARCH_PRICE_PER_REQUEST`.
+fn web_search_cost_usd(usage: &Usage) -> f64 {
+    let requests = usage.server_tool_use.as_ref().map_or(0, |server_tool_use| server_tool_use.web_search_requests);
+    f64::from(requests) * WEB_SEARCH_PRICE_PER_REQUEST
 }
 
 /// Friendly reply text used by any call site that short-circuits a Claude call
@@ -46,13 +61,15 @@ pub struct UsageTotals {
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub request_count: u64,
-    /// Sum of each recorded request's estimated cost — see `estimate_cost_usd`.
-    /// Doesn't include `unpriced_requests`' tokens, since there's no price to
-    /// apply to them.
+    /// Sum of each recorded request's estimated token cost (`estimate_cost_usd`)
+    /// plus any web search fees (`web_search_cost_usd`, always known regardless
+    /// of the model). Doesn't include `unpriced_requests`' token cost, since
+    /// there's no per-token price to apply to them.
     pub estimated_cost_usd: f64,
     /// Requests recorded under a model missing from `price_per_million_tokens`.
-    /// Their tokens are still counted above, but left out of
-    /// `estimated_cost_usd` rather than silently treated as free.
+    /// Their tokens (and any web search fees) are still counted above, but
+    /// their token cost is left out of `estimated_cost_usd` rather than
+    /// silently treated as free.
     pub unpriced_requests: u64,
 }
 
@@ -69,9 +86,13 @@ impl UsageTotals {
         self.input_tokens += u64::from(usage.input_tokens);
         self.output_tokens += u64::from(usage.output_tokens);
         self.request_count += 1;
+        let search_cost = web_search_cost_usd(usage);
         match estimate_cost_usd(model, usage) {
-            Some(cost) => self.estimated_cost_usd += cost,
-            None => self.unpriced_requests += 1,
+            Some(cost) => self.estimated_cost_usd += cost + search_cost,
+            None => {
+                self.estimated_cost_usd += search_cost;
+                self.unpriced_requests += 1;
+            }
         }
     }
 }
@@ -231,6 +252,13 @@ mod tests {
         }
     }
 
+    fn usage_with_web_searches(input_tokens: u32, output_tokens: u32, web_search_requests: u32) -> Usage {
+        Usage {
+            server_tool_use: Some(threatflux_anthropic_sdk::models::ServerToolUsage { web_search_requests }),
+            ..usage(input_tokens, output_tokens)
+        }
+    }
+
     #[test]
     fn records_accumulate_overall_and_per_label_totals() {
         let tracker = UsageTracker::open(&unique_state_path("accumulate"), None).expect("open tracker");
@@ -277,6 +305,30 @@ mod tests {
         let snapshot = tracker.snapshot();
         assert!((snapshot.overall.estimated_cost_usd - 6.0).abs() < 1e-9, "{}", snapshot.overall.estimated_cost_usd);
         assert_eq!(snapshot.overall.unpriced_requests, 0);
+    }
+
+    #[test]
+    fn record_adds_web_search_fees_on_top_of_token_cost() {
+        let tracker = UsageTracker::open(&unique_state_path("web-search-cost"), None).expect("open tracker");
+        // 100,000 input tokens @ $3.00/M + 100,000 output tokens @ $15.00/M = $1.80 for
+        // claude-sonnet-5, plus 3 web searches @ $0.01 each = $0.03.
+        tracker.record("chat", "claude-sonnet-5", &usage_with_web_searches(100_000, 100_000, 3));
+
+        let snapshot = tracker.snapshot();
+        assert!((snapshot.overall.estimated_cost_usd - 1.83).abs() < 1e-9, "{}", snapshot.overall.estimated_cost_usd);
+        assert_eq!(snapshot.overall.unpriced_requests, 0);
+    }
+
+    #[test]
+    fn record_counts_web_search_fees_even_for_an_unpriced_model() {
+        let tracker = UsageTracker::open(&unique_state_path("web-search-unpriced"), None).expect("open tracker");
+        tracker.record("chat", "some-future-model", &usage_with_web_searches(100, 100, 2));
+
+        let snapshot = tracker.snapshot();
+        // The model's own tokens are unpriced, but the 2 web searches @ $0.01
+        // each are still a known cost and must not be dropped.
+        assert!((snapshot.overall.estimated_cost_usd - 0.02).abs() < 1e-9, "{}", snapshot.overall.estimated_cost_usd);
+        assert_eq!(snapshot.overall.unpriced_requests, 1);
     }
 
     #[test]

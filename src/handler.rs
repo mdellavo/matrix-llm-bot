@@ -15,7 +15,7 @@ use matrix_sdk::{
 };
 use threatflux_anthropic_sdk::Client as Anthropic;
 use threatflux_anthropic_sdk::builders::message_builder::MessageBuilder;
-use threatflux_anthropic_sdk::models::ContentBlock;
+use threatflux_anthropic_sdk::models::{ContentBlock, Tool};
 use tracing::{debug, info, warn};
 
 use crate::classify::{ClassifyOutcome, Intent, MessageAnalysis, classify_message};
@@ -395,6 +395,9 @@ history to call back to what people said earlier, running jokes, a specific user
 room, rather than replying in a vacuum — but only what it actually shows, attributed correctly.\n\n\
 Keep it good-natured: no targeting protected traits, no genuinely cutting remarks meant to actually hurt \
 someone, no inventing personal details about someone that aren't in the history you were given.\n\n\
+You have a web search tool — use it when answering needs current information (news, prices, recent \
+events, anything you're not confident is still accurate) rather than guessing or relying on stale \
+training data; don't bother searching for ordinary conversation that doesn't need it.\n\n\
 Keep it brief (a sentence or two) unless the message clearly calls for more.";
 
 /// Label Claude API calls from `generate_chat_reply` are recorded under in `UsageTracker`.
@@ -446,6 +449,7 @@ async fn generate_chat_reply(
         CHAT_SYSTEM_PROMPT,
         CHAT_USAGE_LABEL,
         CHAT_MODEL,
+        vec![Tool::web_search()],
         anthropic,
         message_log,
         usage_tracker,
@@ -456,6 +460,7 @@ async fn generate_chat_reply(
 
 /// Generates a fun, Claude-written greeting in reply to someone greeting the
 /// room, using `CHAT_MODEL` — see `generate_response` and `GREETING_SYSTEM_PROMPT`.
+/// No tools — a greeting never needs to look anything up.
 async fn generate_greeting_reply(
     room: &Room,
     message_text: &str,
@@ -472,6 +477,7 @@ async fn generate_greeting_reply(
         GREETING_SYSTEM_PROMPT,
         GREETING_USAGE_LABEL,
         CHAT_MODEL,
+        Vec::new(),
         anthropic,
         message_log,
         usage_tracker,
@@ -483,8 +489,8 @@ async fn generate_greeting_reply(
 /// Shared implementation behind `generate_chat_reply` and `generate_greeting_reply`:
 /// sends `message_text` (plus the room's recent history, via `format_chat_turn`) to
 /// Claude under `system_prompt`, recording usage under `usage_label`. The only
-/// difference between the two callers is which persona/prompt, label, and model
-/// they pass.
+/// difference between the two callers is which persona/prompt, label, model, and
+/// server-side `tools` (e.g. web search for chat, none for greetings) they pass.
 #[allow(clippy::too_many_arguments)]
 async fn generate_grounded_reply(
     room: &Room,
@@ -493,6 +499,7 @@ async fn generate_grounded_reply(
     system_prompt: &str,
     usage_label: &str,
     model: &str,
+    tools: Vec<Tool>,
     anthropic: &Anthropic,
     message_log: &MessageLogger,
     usage_tracker: &UsageTracker,
@@ -518,12 +525,16 @@ async fn generate_grounded_reply(
     let user_turn = format_chat_turn(&history, sender, message_text);
     let prompt = PromptRecord { system: system_prompt.to_string(), user: user_turn.clone() };
 
-    let params = MessageBuilder::new()
-        .model(model)
-        .max_tokens(512)
-        .system(system_prompt)
-        .user(user_turn.clone())
-        .build();
+    // A tool-enabled reply's own generated tokens cover not just the answer
+    // but a search query and (if the model searches more than once) further
+    // follow-up text, so it gets more headroom than a plain completion.
+    let max_tokens = if tools.is_empty() { 512 } else { 1024 };
+
+    let mut builder = MessageBuilder::new().model(model).max_tokens(max_tokens).system(system_prompt).user(user_turn.clone());
+    if !tools.is_empty() {
+        builder = builder.tools(tools);
+    }
+    let params = builder.build();
 
     let message = match anthropic.messages().create(params, None).await {
         Ok(message) => message,
@@ -542,18 +553,17 @@ async fn generate_grounded_reply(
 
     usage_tracker.record(usage_label, model, &message.usage);
 
-    for block in message.content {
-        if let ContentBlock::Text { text, .. } = block {
-            debug!(
-                usage_label,
-                trigger_message = message_text,
-                system_prompt,
-                user_turn = %user_turn,
-                response = %text,
-                "generated grounded reply"
-            );
-            return GeneratedReply { text, prompt: Some(prompt), label: usage_label.to_string() };
-        }
+    let text = collect_text_blocks(message.content);
+    if !text.is_empty() {
+        debug!(
+            usage_label,
+            trigger_message = message_text,
+            system_prompt,
+            user_turn = %user_turn,
+            response = %text,
+            "generated grounded reply"
+        );
+        return GeneratedReply { text, prompt: Some(prompt), label: usage_label.to_string() };
     }
 
     GeneratedReply {
@@ -570,6 +580,23 @@ fn format_chat_turn(history: &[LoggedMessage], sender: &str, message_text: &str)
     let mut turn = message_log::format_history_block(history);
     turn.push_str(&format!("Message to reply to, from [{sender}]:\n{}", message_log::single_line(message_text)));
     turn
+}
+
+/// Concatenates every `Text` block in `content`, in order, joined by blank
+/// lines. A tool-enabled response (e.g. `generate_chat_reply`'s web search)
+/// routinely interleaves text with a server-side tool call/result — "let me
+/// check that" before the search, the actual answer after — so returning only
+/// the first `Text` block would silently drop everything the model said once
+/// it started searching.
+fn collect_text_blocks(content: Vec<ContentBlock>) -> String {
+    content
+        .into_iter()
+        .filter_map(|block| match block {
+            ContentBlock::Text { text, .. } => Some(text),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n")
 }
 
 /// Dispatches a `Command`-intent message to the built-in `help` listing, a loaded
@@ -778,5 +805,42 @@ mod tests {
         // `[sender]` prefix — indistinguishable from an unattributed turn.
         assert!(turn.contains("[@alice:example.org] line one line two"), "{turn}");
         assert_eq!(turn.lines().filter(|line| line.contains("line one") || line.contains("line two")).count(), 1, "{turn}");
+    }
+
+    fn text_block(text: &str) -> ContentBlock {
+        ContentBlock::Text { text: text.to_string(), citations: None, cache_control: None }
+    }
+
+    #[test]
+    fn collect_text_blocks_joins_multiple_text_blocks_in_order() {
+        let content = vec![text_block("let me check that"), text_block("here's the answer")];
+        assert_eq!(collect_text_blocks(content), "let me check that\n\nhere's the answer");
+    }
+
+    #[test]
+    fn collect_text_blocks_skips_non_text_blocks_between_text() {
+        // A web-search reply routinely interleaves text with the server-side
+        // tool call/result — those must not end up in the returned text, and
+        // must not stop collection of the text blocks that follow them.
+        let content = vec![
+            text_block("let me search for that"),
+            ContentBlock::ServerToolUse {
+                id: "srvtoolu_1".to_string(),
+                name: "web_search".to_string(),
+                input: Some(serde_json::json!({"query": "test"})),
+            },
+            text_block("here's what I found"),
+        ];
+        assert_eq!(collect_text_blocks(content), "let me search for that\n\nhere's what I found");
+    }
+
+    #[test]
+    fn collect_text_blocks_is_empty_for_no_text_blocks() {
+        let content = vec![ContentBlock::ServerToolUse {
+            id: "srvtoolu_1".to_string(),
+            name: "web_search".to_string(),
+            input: None,
+        }];
+        assert_eq!(collect_text_blocks(content), "");
     }
 }
