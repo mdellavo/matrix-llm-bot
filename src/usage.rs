@@ -24,8 +24,8 @@ fn price_per_million_tokens(model: &str) -> Option<(f64, f64)> {
 
 /// Estimated USD cost of one completion's tokens, or `None` if `model` isn't
 /// in `price_per_million_tokens`'s table. Excludes server-side tool fees (e.g.
-/// web search) — see `web_search_cost_usd`, added separately in `add` since
-/// it doesn't depend on the model's per-token price.
+/// web search) — added separately in `UsageTotals::add` since they don't
+/// depend on the model's per-token price.
 fn estimate_cost_usd(model: &str, usage: &Usage) -> Option<f64> {
     let (input_price, output_price) = price_per_million_tokens(model)?;
     Some(
@@ -40,11 +40,9 @@ fn estimate_cost_usd(model: &str, usage: &Usage) -> Option<f64> {
 /// published pricing if it changes.
 const WEB_SEARCH_PRICE_PER_REQUEST: f64 = 0.01;
 
-/// Estimated USD cost of one completion's web searches (`0.0` if it made
-/// none) — see `WEB_SEARCH_PRICE_PER_REQUEST`.
-fn web_search_cost_usd(usage: &Usage) -> f64 {
-    let requests = usage.server_tool_use.as_ref().map_or(0, |server_tool_use| server_tool_use.web_search_requests);
-    f64::from(requests) * WEB_SEARCH_PRICE_PER_REQUEST
+/// Number of web searches the model performed for one completion (`0` if none).
+fn web_search_request_count(usage: &Usage) -> u32 {
+    usage.server_tool_use.as_ref().map_or(0, |server_tool_use| server_tool_use.web_search_requests)
 }
 
 /// Friendly reply text used by any call site that short-circuits a Claude call
@@ -62,15 +60,26 @@ pub struct UsageTotals {
     pub output_tokens: u64,
     pub request_count: u64,
     /// Sum of each recorded request's estimated token cost (`estimate_cost_usd`)
-    /// plus any web search fees (`web_search_cost_usd`, always known regardless
-    /// of the model). Doesn't include `unpriced_requests`' token cost, since
-    /// there's no per-token price to apply to them.
+    /// plus any web search fees (`web_search_requests` × `WEB_SEARCH_PRICE_PER_REQUEST`,
+    /// always known regardless of the model). Doesn't include `unpriced_requests`'
+    /// token cost, since there's no per-token price to apply to them.
     pub estimated_cost_usd: f64,
     /// Requests recorded under a model missing from `price_per_million_tokens`.
     /// Their tokens (and any web search fees) are still counted above, but
     /// their token cost is left out of `estimated_cost_usd` rather than
     /// silently treated as free.
     pub unpriced_requests: u64,
+    /// Web searches the model performed via the built-in `web_search`
+    /// server-side tool — see `web_search_request_count`. `#[serde(default)]`
+    /// so a state file persisted before this field existed still parses.
+    #[serde(default)]
+    pub web_search_requests: u64,
+    /// Portion of `estimated_cost_usd` attributable to `web_search_requests`
+    /// (`web_search_requests` × `WEB_SEARCH_PRICE_PER_REQUEST`), broken out
+    /// separately since it isn't a token cost. `#[serde(default)]` — see
+    /// `web_search_requests`.
+    #[serde(default)]
+    pub web_search_cost_usd: f64,
 }
 
 impl UsageTotals {
@@ -86,7 +95,12 @@ impl UsageTotals {
         self.input_tokens += u64::from(usage.input_tokens);
         self.output_tokens += u64::from(usage.output_tokens);
         self.request_count += 1;
-        let search_cost = web_search_cost_usd(usage);
+
+        let web_search_requests = web_search_request_count(usage);
+        let search_cost = f64::from(web_search_requests) * WEB_SEARCH_PRICE_PER_REQUEST;
+        self.web_search_requests += u64::from(web_search_requests);
+        self.web_search_cost_usd += search_cost;
+
         match estimate_cost_usd(model, usage) {
             Some(cost) => self.estimated_cost_usd += cost + search_cost,
             None => {
@@ -317,6 +331,10 @@ mod tests {
         let snapshot = tracker.snapshot();
         assert!((snapshot.overall.estimated_cost_usd - 1.83).abs() < 1e-9, "{}", snapshot.overall.estimated_cost_usd);
         assert_eq!(snapshot.overall.unpriced_requests, 0);
+        assert_eq!(snapshot.overall.web_search_requests, 3);
+        assert!((snapshot.overall.web_search_cost_usd - 0.03).abs() < 1e-9, "{}", snapshot.overall.web_search_cost_usd);
+        let chat = snapshot.by_label.iter().find(|l| l.label == "chat").expect("chat label");
+        assert_eq!(chat.totals.web_search_requests, 3);
     }
 
     #[test]
@@ -329,6 +347,33 @@ mod tests {
         // each are still a known cost and must not be dropped.
         assert!((snapshot.overall.estimated_cost_usd - 0.02).abs() < 1e-9, "{}", snapshot.overall.estimated_cost_usd);
         assert_eq!(snapshot.overall.unpriced_requests, 1);
+        assert_eq!(snapshot.overall.web_search_requests, 2);
+        assert!((snapshot.overall.web_search_cost_usd - 0.02).abs() < 1e-9, "{}", snapshot.overall.web_search_cost_usd);
+    }
+
+    #[test]
+    fn a_state_file_persisted_before_web_search_tracking_still_parses() {
+        let path = unique_state_path("web-search-backcompat");
+        std::fs::create_dir_all(path.parent().expect("parent dir")).expect("create parent dir");
+        let legacy_json = serde_json::json!({
+            "overall": {
+                "input_tokens": 100,
+                "output_tokens": 20,
+                "request_count": 1,
+                "estimated_cost_usd": 0.0006,
+                "unpriced_requests": 0
+            },
+            "by_label": {}
+        });
+        std::fs::write(&path, serde_json::to_string(&legacy_json).unwrap()).expect("write legacy state file");
+
+        let tracker = UsageTracker::open(&path, None).expect("open tracker despite pre-web-search state file");
+        let snapshot = tracker.snapshot();
+        assert_eq!(snapshot.overall.input_tokens, 100, "existing totals must survive the upgrade");
+        assert_eq!(snapshot.overall.web_search_requests, 0, "missing field defaults to zero");
+        assert_eq!(snapshot.overall.web_search_cost_usd, 0.0);
+
+        let _ = std::fs::remove_dir_all(path.parent().expect("parent dir"));
     }
 
     #[test]

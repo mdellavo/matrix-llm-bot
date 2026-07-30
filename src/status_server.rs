@@ -204,12 +204,14 @@ const INDEX_HTML: &str = r#"<!doctype html>
     <dt>Requests</dt><dd id="usage-requests">…</dd>
     <dt>Estimated cost</dt><dd id="usage-cost">…</dd>
     <dt>Cost limit</dt><dd id="usage-cost-limit">…</dd>
+    <dt>Web searches</dt><dd id="usage-web-searches">…</dd>
+    <dt>Web search cost</dt><dd id="usage-web-search-cost">…</dd>
   </dl>
   <p id="usage-unpriced-note" style="display: none;"></p>
   <p id="usage-cost-limit-note" style="display: none;"></p>
   <table>
     <thead>
-      <tr><th>Label</th><th>Input tokens</th><th>Output tokens</th><th>Total tokens</th><th>Requests</th><th>Est. cost</th></tr>
+      <tr><th>Label</th><th>Input tokens</th><th>Output tokens</th><th>Total tokens</th><th>Requests</th><th>Est. cost</th><th>Web searches</th><th>Web search cost</th></tr>
     </thead>
     <tbody id="usage-body"></tbody>
   </table>
@@ -381,7 +383,7 @@ async function loadUsage() {
   const tbody = document.getElementById('usage-body');
   tbody.innerHTML = '';
   if (!res.ok) {
-    tbody.innerHTML = `<tr><td colspan="6">Failed to load usage: ${escapeHtml(await res.text())}</td></tr>`;
+    tbody.innerHTML = `<tr><td colspan="8">Failed to load usage: ${escapeHtml(await res.text())}</td></tr>`;
     return;
   }
   const usage = await res.json();
@@ -391,6 +393,8 @@ async function loadUsage() {
   document.getElementById('usage-requests').textContent = usage.request_count;
   document.getElementById('usage-cost').textContent = formatCost(usage.estimated_cost_usd);
   document.getElementById('usage-cost-limit').textContent = usage.cost_limit_usd == null ? 'none' : formatCost(usage.cost_limit_usd);
+  document.getElementById('usage-web-searches').textContent = usage.web_search_requests;
+  document.getElementById('usage-web-search-cost').textContent = formatCost(usage.web_search_cost_usd);
 
   const unpricedNote = document.getElementById('usage-unpriced-note');
   if (usage.unpriced_requests > 0) {
@@ -409,7 +413,7 @@ async function loadUsage() {
   }
 
   if (usage.by_label.length === 0) {
-    tbody.innerHTML = '<tr><td colspan="6">(no Claude API calls recorded yet)</td></tr>';
+    tbody.innerHTML = '<tr><td colspan="8">(no Claude API calls recorded yet)</td></tr>';
     return;
   }
   for (const entry of usage.by_label) {
@@ -421,6 +425,8 @@ async function loadUsage() {
       <td>${entry.input_tokens + entry.output_tokens}</td>
       <td>${entry.request_count}</td>
       <td>${formatCost(entry.estimated_cost_usd)}${entry.unpriced_requests > 0 ? ' *' : ''}</td>
+      <td>${entry.web_search_requests}</td>
+      <td>${formatCost(entry.web_search_cost_usd)}</td>
     `;
     tbody.appendChild(row);
   }
@@ -648,10 +654,13 @@ mod tests {
         // 120 input tokens @ $1.00/M + 30 output tokens @ $5.00/M for claude-haiku-4-5.
         assert!((usage["estimated_cost_usd"].as_f64().expect("cost") - 0.00027).abs() < 1e-9);
         assert_eq!(usage["unpriced_requests"], 0);
+        assert_eq!(usage["web_search_requests"], 0, "classify never uses the web search tool");
+        assert_eq!(usage["web_search_cost_usd"], 0.0);
         let by_label = usage["by_label"].as_array().expect("by_label array");
         assert_eq!(by_label.len(), 1);
         assert_eq!(by_label[0]["label"], "classify");
         assert_eq!(by_label[0]["input_tokens"], 120);
+        assert_eq!(by_label[0]["web_search_requests"], 0);
 
         let _ = std::fs::remove_dir_all(&log_dir);
         let _ = std::fs::remove_dir_all(&skills_dir);
