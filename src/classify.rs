@@ -3,7 +3,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use threatflux_anthropic_sdk::Client as Anthropic;
 use threatflux_anthropic_sdk::builders::message_builder::MessageBuilder;
-use threatflux_anthropic_sdk::models::{ContentBlock, Tool, ToolChoice};
+use threatflux_anthropic_sdk::models::{ContentBlock, MessageResponse, Tool, ToolChoice};
+use threatflux_anthropic_sdk::types::HttpMethod;
 
 use crate::message_log::{LoggedMessage, PromptRecord, format_history_block, single_line};
 use crate::throttle::{Throttle, is_rate_limited};
@@ -154,7 +155,17 @@ pub async fn classify_message(
         })
         .build();
 
-    let message = match client.messages().create(params, None).await {
+    // threatflux-anthropic-sdk 0.2.0 declares `ToolChoice` `#[serde(untagged)]`,
+    // so `ToolChoice::Tool { name }` serializes to `{"name": ...}` with no
+    // `"type"` key at all — the API then 400s with "tool_choice.type: Field
+    // required". `MessagesApi::create` does that same broken serialization
+    // internally, so work around it by serializing the request ourselves,
+    // patching `tool_choice` into the shape the API actually expects, and
+    // sending it via the SDK's raw `Client::request` instead.
+    let mut body = serde_json::to_value(&params).context("failed to serialize classify_message request")?;
+    body["tool_choice"] = json!({"type": "tool", "name": TOOL_NAME});
+
+    let message: MessageResponse = match client.request(HttpMethod::Post, "/messages", Some(body), None).await {
         Ok(message) => message,
         Err(err) => {
             if is_rate_limited(&err) {
@@ -244,4 +255,44 @@ fn classify_tool() -> Result<Tool> {
         "Record a structured classification of the user's message.",
         schema_json,
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Regression test for the `ToolChoice::Tool` serialization workaround in
+    /// `classify_message`. If this starts failing, `threatflux-anthropic-sdk`
+    /// likely fixed `ToolChoice`'s `#[serde(untagged)]` bug upstream — remove
+    /// the manual `tool_choice` patch in `classify_message` (and this test)
+    /// rather than adjusting the assertion below.
+    #[test]
+    fn tool_choice_serializes_without_a_type_field_so_it_must_be_patched() {
+        let params = MessageBuilder::new()
+            .model(MODEL)
+            .max_tokens(1024)
+            .tool_choice(ToolChoice::Tool { name: TOOL_NAME.to_string() })
+            .build();
+
+        let body = serde_json::to_value(&params).expect("serialize request");
+        assert_eq!(
+            body["tool_choice"],
+            json!({ "name": TOOL_NAME }),
+            "ToolChoice's serialization changed — the manual patch in classify_message is likely no longer needed"
+        );
+    }
+
+    #[test]
+    fn patched_tool_choice_matches_the_shape_the_api_expects() {
+        let params = MessageBuilder::new()
+            .model(MODEL)
+            .max_tokens(1024)
+            .tool_choice(ToolChoice::Tool { name: TOOL_NAME.to_string() })
+            .build();
+
+        let mut body = serde_json::to_value(&params).expect("serialize request");
+        body["tool_choice"] = json!({"type": "tool", "name": TOOL_NAME});
+
+        assert_eq!(body["tool_choice"], json!({"type": "tool", "name": TOOL_NAME}));
+    }
 }
