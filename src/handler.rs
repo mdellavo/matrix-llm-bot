@@ -121,6 +121,10 @@ pub struct HandlerContext {
     pub greeting_cooldown: Arc<GreetingCooldown>,
     pub ignored_users: Arc<IgnoredUsers>,
     pub rate_limit: Arc<Throttle>,
+    /// The bot's own Matrix login username (`Config::username`), substituted
+    /// into `CHAT_SYSTEM_PROMPT`'s `{bot_name}` placeholder so it knows its
+    /// own identity — see `generate_grounded_reply`.
+    pub bot_name: String,
 }
 
 /// Registered as a sync event handler; fires for every `m.room.message` the bot
@@ -139,6 +143,7 @@ pub async fn on_room_message(event: OriginalSyncRoomMessageEvent, room: Room, cl
         greeting_cooldown,
         ignored_users,
         rate_limit,
+        bot_name,
     } = (*ctx).clone();
 
     if room.state() != RoomState::Joined {
@@ -233,6 +238,7 @@ pub async fn on_room_message(event: OriginalSyncRoomMessageEvent, room: Room, cl
             &tool_clients,
             &usage_tracker,
             &rate_limit,
+            &bot_name,
         )
         .await;
 
@@ -334,6 +340,7 @@ async fn generate_response(
     tool_clients: &ToolClients,
     usage_tracker: &UsageTracker,
     rate_limit: &Throttle,
+    bot_name: &str,
 ) -> Option<GeneratedReply> {
     if !will_generate_response(analysis, message_text, directed_at_bot, should_greet) {
         return None;
@@ -358,11 +365,12 @@ async fn generate_response(
 
     if analysis.intent == Intent::Greeting {
         return Some(
-            generate_greeting_reply(room, message_text, sender, anthropic, message_log, usage_tracker, rate_limit).await,
+            generate_greeting_reply(room, message_text, sender, anthropic, message_log, usage_tracker, rate_limit, bot_name)
+                .await,
         );
     }
 
-    Some(generate_chat_reply(room, message_text, sender, anthropic, message_log, usage_tracker, rate_limit).await)
+    Some(generate_chat_reply(room, message_text, sender, anthropic, message_log, usage_tracker, rate_limit, bot_name).await)
 }
 
 /// Number of recent room messages fed into `generate_chat_reply` as context, so
@@ -382,23 +390,27 @@ const CLASSIFY_HISTORY_LIMIT: usize = 10;
 /// helpful first, with a light, mildly snarky sense of humor woven in, rather
 /// than a formal-assistant tone or (an earlier, dialed-back version of this
 /// prompt) a mean/dark roasting personality.
-const CHAT_SYSTEM_PROMPT: &str = "You are a member of this Matrix chat room replying to a message that \
-was directly addressed to you (an @mention or a reply to one of your own messages). You are not a formal \
-assistant, but you're not the room's resident troll either — be genuinely informative and helpful first, \
-with a light, mildly snarky sense of humor woven in: a dry aside, a wry observation, occasional teasing. \
-Actually answer what was asked or respond to what was said; the humor is seasoning, not the whole reply. \
-You'll be given the room's recent chat history before the message you're replying to, one line per message \
-as `[sender] message` (oldest first) — each line is a distinct message from exactly the sender named in its \
-own brackets; never attribute a line's content to any other sender, and never confuse an earlier sender \
-with whoever sent the message you're actually replying to (named separately below the history). Use the \
-history to call back to what people said earlier, running jokes, a specific user's own history in the \
-room, rather than replying in a vacuum — but only what it actually shows, attributed correctly.\n\n\
+///
+/// `{bot_name}` is substituted with the bot's own Matrix username, and
+/// `{room_context}` with the room's name/topic and the current time (see
+/// `room_context_line`), both in `generate_grounded_reply` — telling it its
+/// own identity and where/when it is, rather than replying with no sense of
+/// either.
+const CHAT_SYSTEM_PROMPT: &str = "You are {bot_name}, a member of this Matrix chat room, replying to a \
+message addressed to you (an @mention or a reply to one of your own messages). {room_context}\n\n\
+Be genuinely informative and helpful first, with a light, mildly snarky sense of humor woven in — a dry \
+aside or wry observation, not the whole reply.\n\n\
+You'll get the room's recent history as one line per message, `[sender] message`, oldest first, then the \
+message you're actually replying to on its own, labeled with its own sender. Treat each `[sender]` tag as \
+the one and only source of truth for who said that line: never merge two lines together, move a line's \
+content to a different sender, or confuse the person you're replying to with anyone earlier in the \
+history. Call back to the history (a running joke, something a specific person said) only when it clearly \
+supports it — never invent or misattribute anything.\n\n\
 Keep it good-natured: no targeting protected traits, no genuinely cutting remarks meant to actually hurt \
-someone, no inventing personal details about someone that aren't in the history you were given.\n\n\
-You have a web search tool, but only use it when the message explicitly asks you to search or look \
-something up (e.g. \"search for...\", \"look up...\", \"google...\", \"check online/the web\") — never \
-invoke it on your own judgment just because a topic seems current or you're unsure; if you weren't asked \
-to search, answer from what you already know (or say you're not sure) instead.\n\n\
+someone, no inventing personal details not in the history.\n\n\
+You have a web search tool — only use it when explicitly asked to search or look something up (e.g. \
+\"search for...\", \"look up...\", \"google...\"); otherwise answer from what you know or say you're not \
+sure.\n\n\
 Keep it brief (a sentence or two) unless the message clearly calls for more.";
 
 /// Label Claude API calls from `generate_chat_reply` are recorded under in `UsageTracker`.
@@ -417,16 +429,22 @@ const CHAT_MODEL: &str = "claude-opus-4-8";
 /// actual generated reply instead of an echo, and distinctly warmer/more
 /// unreservedly fun than `CHAT_SYSTEM_PROMPT`'s "informative first, mild snark"
 /// tone — a greeting isn't the place for snark.
-const GREETING_SYSTEM_PROMPT: &str = "You are a member of this Matrix chat room and someone just greeted \
-the room (\"hi\", \"good morning\", etc.) — not necessarily addressed at you specifically. Reply with a \
-genuinely fun, warm, and friendly greeting of your own: upbeat, welcoming, maybe a little playful. Don't \
-just echo the same greeting back flatly. You'll be given the room's recent chat history before the \
-greeting you're replying to, one line per message as `[sender] message` (oldest first) — each line is a \
-distinct message from exactly the sender named in its own brackets; never attribute a line's content to \
-any other sender. Use it if there's something worth calling back to (greeting the specific person by the \
-sender actually named in the history, referencing what's been going on), but don't force a callback if \
-there's nothing there; a simple enthusiastic greeting is fine on its own. Keep it SHORT — anywhere from a \
-single word/exclamation (\"Heyyy!\") up to one short sentence at most. Never more than one sentence.";
+///
+/// `{bot_name}` and `{room_context}` are substituted the same way as in
+/// `CHAT_SYSTEM_PROMPT` — see its doc comment.
+const GREETING_SYSTEM_PROMPT: &str = "You are {bot_name}, a member of this Matrix chat room, and someone \
+just greeted the room (\"hi\", \"good morning\", etc.) — not necessarily addressed at you specifically. \
+{room_context}\n\n\
+Reply with a genuinely fun, warm, friendly greeting of your own: upbeat, welcoming, maybe a little \
+playful. Don't just echo the same greeting back flatly.\n\n\
+You'll get the room's recent history as one line per message, `[sender] message`, oldest first, then the \
+greeting you're actually replying to on its own, labeled with its own sender. Treat each `[sender]` tag \
+as the one and only source of truth for who said that line: never merge two lines together or move a \
+line's content to a different sender. Call back to the history (greeting someone by their actual name \
+from it, referencing what's going on) only when it clearly supports it — a simple enthusiastic greeting \
+is fine on its own if there's nothing to call back to.\n\n\
+Keep it SHORT — anywhere from a single word/exclamation (\"Heyyy!\") up to one short sentence at most. \
+Never more than one sentence.";
 
 /// Label Claude API calls from `generate_greeting_reply` are recorded under in `UsageTracker`.
 const GREETING_USAGE_LABEL: &str = "greeting";
@@ -434,6 +452,7 @@ const GREETING_USAGE_LABEL: &str = "greeting";
 /// Generates a free-form conversational reply to a message directed at the bot,
 /// grounded in the room's recent history (`MessageLogger::recent`) and who sent
 /// the message, using `CHAT_MODEL` — see `generate_response` and `CHAT_SYSTEM_PROMPT`.
+#[allow(clippy::too_many_arguments)]
 async fn generate_chat_reply(
     room: &Room,
     message_text: &str,
@@ -442,6 +461,7 @@ async fn generate_chat_reply(
     message_log: &MessageLogger,
     usage_tracker: &UsageTracker,
     rate_limit: &Throttle,
+    bot_name: &str,
 ) -> GeneratedReply {
     generate_grounded_reply(
         room,
@@ -451,6 +471,7 @@ async fn generate_chat_reply(
         CHAT_USAGE_LABEL,
         CHAT_MODEL,
         vec![Tool::web_search()],
+        bot_name,
         anthropic,
         message_log,
         usage_tracker,
@@ -462,6 +483,7 @@ async fn generate_chat_reply(
 /// Generates a fun, Claude-written greeting in reply to someone greeting the
 /// room, using `CHAT_MODEL` — see `generate_response` and `GREETING_SYSTEM_PROMPT`.
 /// No tools — a greeting never needs to look anything up.
+#[allow(clippy::too_many_arguments)]
 async fn generate_greeting_reply(
     room: &Room,
     message_text: &str,
@@ -470,6 +492,7 @@ async fn generate_greeting_reply(
     message_log: &MessageLogger,
     usage_tracker: &UsageTracker,
     rate_limit: &Throttle,
+    bot_name: &str,
 ) -> GeneratedReply {
     generate_grounded_reply(
         room,
@@ -479,6 +502,7 @@ async fn generate_greeting_reply(
         GREETING_USAGE_LABEL,
         CHAT_MODEL,
         Vec::new(),
+        bot_name,
         anthropic,
         message_log,
         usage_tracker,
@@ -501,6 +525,7 @@ async fn generate_grounded_reply(
     usage_label: &str,
     model: &str,
     tools: Vec<Tool>,
+    bot_name: &str,
     anthropic: &Anthropic,
     message_log: &MessageLogger,
     usage_tracker: &UsageTracker,
@@ -513,6 +538,9 @@ async fn generate_grounded_reply(
         return GeneratedReply::plain(RATE_LIMITED_REPLY, usage_label);
     }
 
+    let system_prompt =
+        system_prompt.replace("{bot_name}", bot_name).replace("{room_context}", &room_context_line(room));
+
     // `on_room_message` logs the current message only after this call returns,
     // so `recent` never includes it — no dedup needed here.
     let history = match message_log.recent(room.room_id().as_str(), CHAT_HISTORY_LIMIT) {
@@ -524,14 +552,15 @@ async fn generate_grounded_reply(
     };
 
     let user_turn = format_chat_turn(&history, sender, message_text);
-    let prompt = PromptRecord { system: system_prompt.to_string(), user: user_turn.clone() };
+    let prompt = PromptRecord { system: system_prompt.clone(), user: user_turn.clone() };
 
     // A tool-enabled reply's own generated tokens cover not just the answer
     // but a search query and (if the model searches more than once) further
     // follow-up text, so it gets more headroom than a plain completion.
     let max_tokens = if tools.is_empty() { 512 } else { 1024 };
 
-    let mut builder = MessageBuilder::new().model(model).max_tokens(max_tokens).system(system_prompt).user(user_turn.clone());
+    let mut builder =
+        MessageBuilder::new().model(model).max_tokens(max_tokens).system(system_prompt.clone()).user(user_turn.clone());
     if !tools.is_empty() {
         builder = builder.tools(tools);
     }
@@ -559,7 +588,7 @@ async fn generate_grounded_reply(
         debug!(
             usage_label,
             trigger_message = message_text,
-            system_prompt,
+            system_prompt = %system_prompt,
             user_turn = %user_turn,
             response = %text,
             "generated grounded reply"
@@ -581,6 +610,24 @@ fn format_chat_turn(history: &[LoggedMessage], sender: &str, message_text: &str)
     let mut turn = message_log::format_history_block(history);
     turn.push_str(&format!("Message to reply to, from [{sender}]:\n{}", message_log::single_line(message_text)));
     turn
+}
+
+/// A one-sentence orientation fact substituted into `CHAT_SYSTEM_PROMPT`'s and
+/// `GREETING_SYSTEM_PROMPT`'s `{room_context}` placeholder: the room's name
+/// and topic (if any set), plus the current time, so a reply can be grounded
+/// in more than just the raw message history — e.g. recognizing a
+/// time-sensitive question, or a room-specific topic/purpose. Mirrors the
+/// `room_info`/`current_time` skill tools (`skills::execute`), always on here
+/// rather than opt-in per skill.
+fn room_context_line(room: &Room) -> String {
+    let room_desc = match room.topic().filter(|topic| !topic.trim().is_empty()) {
+        Some(topic) => format!("\"{}\" (topic: {topic})", room.name().unwrap_or_else(|| "(unnamed room)".to_string())),
+        None => match room.name() {
+            Some(name) => format!("\"{name}\""),
+            None => "(unnamed room)".to_string(),
+        },
+    };
+    format!("This room is {room_desc}. The current time is {} UTC.", chrono::Utc::now().to_rfc3339())
 }
 
 /// Concatenates every `Text` block in `content`, in order, joined by blank
@@ -788,6 +835,28 @@ mod tests {
         assert!(history_pos < alice_pos, "{turn}");
         assert!(alice_pos < bob_pos, "{turn}");
         assert!(bob_pos < current_pos, "{turn}");
+    }
+
+    #[test]
+    fn chat_system_prompt_placeholders_are_substituted() {
+        // Locks in the contract between CHAT_SYSTEM_PROMPT's placeholder tokens
+        // and generate_grounded_reply's `.replace(...)` calls — catches a
+        // typo'd token on either side.
+        let prompt = CHAT_SYSTEM_PROMPT.replace("{bot_name}", "gordy").replace("{room_context}", "This room is \"general\".");
+        assert!(prompt.contains("You are gordy"), "{prompt}");
+        assert!(prompt.contains("This room is \"general\"."), "{prompt}");
+        assert!(!prompt.contains("{bot_name}"), "placeholder should be fully substituted: {prompt}");
+        assert!(!prompt.contains("{room_context}"), "placeholder should be fully substituted: {prompt}");
+    }
+
+    #[test]
+    fn greeting_system_prompt_placeholders_are_substituted() {
+        let prompt =
+            GREETING_SYSTEM_PROMPT.replace("{bot_name}", "gordy").replace("{room_context}", "This room is \"general\".");
+        assert!(prompt.contains("You are gordy"), "{prompt}");
+        assert!(prompt.contains("This room is \"general\"."), "{prompt}");
+        assert!(!prompt.contains("{bot_name}"), "placeholder should be fully substituted: {prompt}");
+        assert!(!prompt.contains("{room_context}"), "placeholder should be fully substituted: {prompt}");
     }
 
     #[test]
