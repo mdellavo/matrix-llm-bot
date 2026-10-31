@@ -62,3 +62,7 @@ rooms = ["#some-room:matrix.org"]
 
 # Optional: minimum seconds between unprompted comments in a room. Defaults to 1800.
 # interjection_cooldown_secs = 1800
+
+# Optional: fetch pages linked in chat, so the bot knows what was shared without
+# being asked. Only public addresses are fetched. Defaults to true.
+# fetch_links = true

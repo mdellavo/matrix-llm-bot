@@ -247,10 +247,15 @@ function escapeHtml(str) {
 }
 
 function formatUptime(seconds) {
-  const h = Math.floor(seconds / 3600);
+  const d = Math.floor(seconds / 86400);
+  const h = Math.floor((seconds % 86400) / 3600);
   const m = Math.floor((seconds % 3600) / 60);
   const s = Math.floor(seconds % 60);
-  return `${h}h ${m}m ${s}s`;
+  return d > 0 ? `${formatCount(d)}d ${h}h ${m}m` : `${h}h ${m}m ${s}s`;
+}
+
+function formatCount(value) {
+  return Number(value).toLocaleString('en-US');
 }
 
 // A prompt (system + user turn) actually sent to Claude, rendered as two
@@ -375,7 +380,7 @@ async function loadSkills() {
 }
 
 function formatCost(usd) {
-  return `$${usd.toFixed(4)}`;
+  return usd.toLocaleString('en-US', { style: 'currency', currency: 'USD' });
 }
 
 async function loadUsage() {
@@ -387,19 +392,19 @@ async function loadUsage() {
     return;
   }
   const usage = await res.json();
-  document.getElementById('usage-total-tokens').textContent = usage.input_tokens + usage.output_tokens;
-  document.getElementById('usage-input-tokens').textContent = usage.input_tokens;
-  document.getElementById('usage-output-tokens').textContent = usage.output_tokens;
-  document.getElementById('usage-requests').textContent = usage.request_count;
+  document.getElementById('usage-total-tokens').textContent = formatCount(usage.input_tokens + usage.output_tokens);
+  document.getElementById('usage-input-tokens').textContent = formatCount(usage.input_tokens);
+  document.getElementById('usage-output-tokens').textContent = formatCount(usage.output_tokens);
+  document.getElementById('usage-requests').textContent = formatCount(usage.request_count);
   document.getElementById('usage-cost').textContent = formatCost(usage.estimated_cost_usd);
   document.getElementById('usage-cost-limit').textContent = usage.cost_limit_usd == null ? 'none' : formatCost(usage.cost_limit_usd);
-  document.getElementById('usage-web-searches').textContent = usage.web_search_requests;
+  document.getElementById('usage-web-searches').textContent = formatCount(usage.web_search_requests);
   document.getElementById('usage-web-search-cost').textContent = formatCost(usage.web_search_cost_usd);
 
   const unpricedNote = document.getElementById('usage-unpriced-note');
   if (usage.unpriced_requests > 0) {
     unpricedNote.style.display = '';
-    unpricedNote.textContent = `Note: ${usage.unpriced_requests} request(s) used a model with no known price and are not included in the cost estimate above.`;
+    unpricedNote.textContent = `Note: ${formatCount(usage.unpriced_requests)} request(s) used a model with no known price and are not included in the cost estimate above.`;
   } else {
     unpricedNote.style.display = 'none';
   }
@@ -420,12 +425,12 @@ async function loadUsage() {
     const row = document.createElement('tr');
     row.innerHTML = `
       <td>${escapeHtml(entry.label)}</td>
-      <td>${entry.input_tokens}</td>
-      <td>${entry.output_tokens}</td>
-      <td>${entry.input_tokens + entry.output_tokens}</td>
-      <td>${entry.request_count}</td>
+      <td>${formatCount(entry.input_tokens)}</td>
+      <td>${formatCount(entry.output_tokens)}</td>
+      <td>${formatCount(entry.input_tokens + entry.output_tokens)}</td>
+      <td>${formatCount(entry.request_count)}</td>
       <td>${formatCost(entry.estimated_cost_usd)}${entry.unpriced_requests > 0 ? ' *' : ''}</td>
-      <td>${entry.web_search_requests}</td>
+      <td>${formatCount(entry.web_search_requests)}</td>
       <td>${formatCost(entry.web_search_cost_usd)}</td>
     `;
     tbody.appendChild(row);
@@ -547,6 +552,7 @@ mod tests {
                 origin_server_ts_ms: 1_000,
                 body: "hello there",
                 has_image: false,
+                links: &[],
                 analysis: &test_analysis("alice says hi"),
                 classify_prompt: Some(&classify_prompt),
                 classify_raw_json: Some(&classify_raw_json),
@@ -568,6 +574,7 @@ mod tests {
                 origin_server_ts_ms: 2_000,
                 body: "hi alice",
                 has_image: false,
+                links: &[],
                 analysis: &test_analysis("bob says hi"),
                 classify_prompt: Some(&classify_prompt),
                 classify_raw_json: Some(&classify_raw_json),

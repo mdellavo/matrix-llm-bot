@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 use tracing::warn;
 
 use crate::classify::MessageAnalysis;
+use crate::links::LinkPreview;
 
 /// The system/user turn sent to Claude for a single call — recorded alongside
 /// the message that triggered it (classification, a chat/greeting reply, or a
@@ -55,6 +56,8 @@ struct MessageLogEntry<'a> {
     origin_server_ts_ms: i64,
     body: &'a str,
     has_image: bool,
+    #[serde(skip_serializing_if = "<[LinkPreview]>::is_empty")]
+    links: &'a [LinkPreview],
     analysis: &'a MessageAnalysis,
     #[serde(skip_serializing_if = "Option::is_none")]
     classify_prompt: Option<&'a PromptRecord>,
@@ -98,6 +101,8 @@ pub struct MessageLogParams<'a> {
     pub origin_server_ts_ms: i64,
     pub body: &'a str,
     pub has_image: bool,
+    /// Previews of the pages the message links to.
+    pub links: &'a [LinkPreview],
     pub analysis: &'a MessageAnalysis,
     /// `None` when the classifier didn't run (`!` commands) or failed; the message
     /// is still logged so it stays in the room's history.
@@ -127,6 +132,8 @@ pub struct LoggedMessage {
     pub body: String,
     #[serde(default)]
     pub has_image: bool,
+    #[serde(default)]
+    pub links: Vec<LinkPreview>,
     pub analysis: MessageAnalysis,
     #[serde(default)]
     pub classify_prompt: Option<PromptRecord>,
@@ -193,6 +200,7 @@ impl MessageLogger {
             origin_server_ts_ms,
             body,
             has_image,
+            links,
             analysis,
             classify_prompt,
             classify_raw_json,
@@ -209,6 +217,7 @@ impl MessageLogger {
             origin_server_ts_ms,
             body,
             has_image,
+            links,
             analysis,
             classify_prompt,
             classify_raw_json,
@@ -388,7 +397,10 @@ fn search_terms(query: &str) -> Vec<String> {
 }
 
 fn match_score(entry: &LoggedMessage, terms: &[String]) -> usize {
-    let text = format!("{} {} {}", entry.display_name(), entry.body, entry.response.as_deref().unwrap_or_default());
+    let mut text = format!("{} {} {}", entry.display_name(), entry.body, entry.response.as_deref().unwrap_or_default());
+    for link in &entry.links {
+        text.push_str(&format!(" {} {}", link.title.as_deref().unwrap_or_default(), link.description.as_deref().unwrap_or_default()));
+    }
     let text = text.to_lowercase();
     terms.iter().filter(|term| text.contains(term.as_str())).count()
 }
@@ -402,7 +414,7 @@ pub fn format_history_block(history: &[LoggedMessage], bot_name: &str) -> String
     }
     format!(
         "Recent room history (oldest first, as `[UTC time] [sender] message`; ⏎ is a line break, and \
-         anything in `{{reactions: ...}}` at the end of a line is how people reacted to it):\n{}\n",
+         `{{link: ...}}` shows what a posted link is, and `{{reactions: ...}}` is how people reacted):\n{}\n",
         format_transcript(history, bot_name)
     )
 }
@@ -415,7 +427,8 @@ pub fn format_transcript(history: &[LoggedMessage], bot_name: &str) -> String {
     for entry in history {
         let time = format_timestamp(entry.origin_server_ts_ms);
         let reactions = format_reactions(&entry.reactions);
-        transcript.push_str(&format!("[{time}] [{}] {}{reactions}\n", entry.display_name(), single_line(&entry.body)));
+        let links = format_links(&entry.links);
+        transcript.push_str(&format!("[{time}] [{}] {}{links}{reactions}\n", entry.display_name(), single_line(&entry.body)));
 
         if let Some(reply) = conversational_reply(entry) {
             let reactions = format_reactions(&entry.response_reactions);
@@ -423,6 +436,18 @@ pub fn format_transcript(history: &[LoggedMessage], bot_name: &str) -> String {
         }
     }
     transcript
+}
+
+/// What a message's links turned out to be, for the end of its transcript line. The
+/// page text is left out: it's only sent for the links being talked about right now.
+pub fn format_links(links: &[LinkPreview]) -> String {
+    links
+        .iter()
+        .filter_map(|link| {
+            let about = [link.title.as_deref(), link.description.as_deref()].into_iter().flatten().collect::<Vec<_>>();
+            (!about.is_empty()).then(|| format!(" {{link: {}}}", single_line(&about.join(" — "))))
+        })
+        .collect()
 }
 
 fn format_reactions(reactions: &[LoggedReaction]) -> String {
@@ -497,6 +522,7 @@ mod tests {
             response_label: None,
             sender_name: None,
             has_image: false,
+            links: Vec::new(),
             response_event_id: None,
             reactions: Vec::new(),
             response_reactions: Vec::new(),
@@ -601,6 +627,7 @@ mod tests {
                 origin_server_ts_ms: ts,
                 body,
                 has_image: false,
+                links: &[],
                 analysis: &analysis,
                 classify_prompt: None,
                 classify_raw_json: None,
@@ -650,5 +677,28 @@ mod tests {
         let logger = test_logger("search-empty");
         log_line(&logger, "$1", "@alice:x", "what is the point", 1, None);
         assert!(logger.search("!r", "what is the", 5).unwrap().is_empty());
+    }
+
+    #[test]
+    fn transcript_says_what_a_link_is_without_the_page_text() {
+        let mut entry = logged_message("@alice:example.org", "read this https://example.com/a");
+        entry.links = vec![LinkPreview {
+            url: "https://example.com/a".to_string(),
+            title: Some("Big news".to_string()),
+            description: Some("Something happened".to_string()),
+            text: Some("The full article".to_string()),
+        }];
+
+        let transcript = format_transcript(&[entry], "gordy");
+        assert!(transcript.contains("https://example.com/a {link: Big news — Something happened}"), "{transcript}");
+        assert!(!transcript.contains("The full article"), "{transcript}");
+    }
+
+    #[test]
+    fn old_log_lines_without_links_still_parse() {
+        let entry = logged_message("@alice:x", "hi");
+        let mut value = serde_json::to_value(&entry).unwrap();
+        value.as_object_mut().unwrap().remove("links");
+        assert!(serde_json::from_value::<LoggedMessage>(value).unwrap().links.is_empty());
     }
 }

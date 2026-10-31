@@ -500,7 +500,8 @@ pub async fn execute(
                      tagged entities from classification are shown in brackets):\n",
                 );
                 for entry in &entries {
-                    user_turn.push_str(&format!("- {}{}: {}\n", entry.display_name(), format_entry_tags(entry), entry.body));
+                    let links = message_log::format_links(&entry.links);
+                    user_turn.push_str(&format!("- {}{}: {}{links}\n", entry.display_name(), format_entry_tags(entry), entry.body));
                     if let Some(reply) = message_log::conversational_reply(entry) {
                         user_turn.push_str(&format!("- {bot_name} (the bot): {reply}\n"));
                     }

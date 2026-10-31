@@ -4,6 +4,7 @@ mod config;
 mod greeting;
 mod handler;
 mod ignore;
+mod links;
 mod llm;
 mod message_log;
 mod room_memory;

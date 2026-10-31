@@ -15,6 +15,7 @@ use crate::config::Config;
 use crate::greeting::GreetingCooldown;
 use crate::handler::{HandlerContext, on_reaction, on_room_message};
 use crate::ignore::IgnoredUsers;
+use crate::links::LinkFetcher;
 use crate::message_log::{MessageLogger, short_name};
 use crate::room_memory::RoomMemory;
 use crate::room_queue::RoomQueues;
@@ -98,6 +99,7 @@ impl Bot {
             rate_limit: Arc::clone(&rate_limit),
             memory: Arc::new(RoomMemory::open(&config.memory_path).context("failed to load the bot's memory")?),
             room_queues: Arc::new(RoomQueues::default()),
+            links: Arc::new(LinkFetcher::new(config.fetch_links)?),
             interjection_chance: config.interjection_chance,
             interjection_cooldown: Arc::new(GreetingCooldown::new(std::time::Duration::from_secs(
                 config.interjection_cooldown_secs,

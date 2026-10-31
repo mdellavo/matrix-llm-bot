@@ -9,6 +9,7 @@ one day of commits, newest first.
 
 - Long-term memory: chat replies can save and delete facts, kept per room, and `!memories` lists them
 - Reading links from the conversation with web fetch
+- Link awareness: pages posted in chat are fetched and logged, limited to public addresses (`fetch_links`)
 - Image understanding for attached, replied-to, and just-posted images
 - Reactions: lone-emoji replies are posted as reactions, addressed thanks get a 👍, and people's reactions appear in history
 - `!search` over the room's whole log, and a `web_search` tool for skills, used by `!define`
@@ -27,6 +28,7 @@ one day of commits, newest first.
 - Replies are sent as real Matrix replies
 - Each room's messages are handled in order, and quick follow-ups from the same person are answered together
 - All Claude calls go through one layer (`src/llm.rs`)
+- Status page numbers use commas, costs round to cents, and uptime shows days
 
 ### Fixed
 

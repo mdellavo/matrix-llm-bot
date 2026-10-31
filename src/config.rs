@@ -91,6 +91,11 @@ pub struct Config {
     /// Minimum time between unprompted comments in a room. Defaults to 30 minutes.
     #[serde(default = "default_interjection_cooldown_secs")]
     pub interjection_cooldown_secs: u64,
+
+    /// Whether to fetch pages linked in chat so the bot knows what was shared. Only
+    /// public addresses are fetched. Defaults to true.
+    #[serde(default = "default_fetch_links")]
+    pub fetch_links: bool,
 }
 
 fn default_device_name() -> String {
@@ -123,6 +128,10 @@ fn default_rate_limit_backoff_secs() -> u64 {
 
 fn default_memory_path() -> PathBuf {
     PathBuf::from("./data/memory.json")
+}
+
+fn default_fetch_links() -> bool {
+    true
 }
 
 fn default_interjection_cooldown_secs() -> u64 {

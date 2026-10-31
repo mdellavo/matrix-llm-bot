@@ -24,6 +24,7 @@ To test Claude calls without the API, use the fake Messages server in `src/llm.r
 | `src/handler.rs` | Message flow: addressing, commands, replies, and the chat prompts |
 | `src/llm.rs` | Every plain completion, plus tool loops, pauses, and refusals |
 | `src/classify.rs` | Intent and sentiment classification |
+| `src/links.rs` | Fetching linked pages, limited to public addresses |
 | `src/message_log.rs` | Per-room JSONL logs, transcripts, and search |
 | `src/room_memory.rs` | Saved facts and room summaries |
 | `src/room_queue.rs` | Per-room ordering and message bursts |
@@ -64,6 +65,8 @@ To test Claude calls without the API, use the fake Messages server in `src/llm.r
   a new power without considering who can trigger it, since anyone in a room can talk
   to the bot.
 - Keep facts scoped to their room.
+- Never fetch a user-supplied URL outside `LinkFetcher`, or weaken its address checks.
+  Anyone in a room can post a URL, and the bot can reach the network it runs on.
 - Consider per-message cost. Classification runs on nearly every message, and anything
   added there is paid for constantly.
 
