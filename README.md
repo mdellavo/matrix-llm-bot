@@ -90,7 +90,8 @@ Eleven skills ship as worked examples under `skills/`:
 | `vibe` | — | `message_log` | reading each message's classified sentiment |
 | `topics` | — | `message_log` | reading each message's tagged entities |
 | `standup` | — | `message_log`, `current_time` | combining two tools in one skill |
-| `define` | — | *(none)* | a pure-prompt skill, no tools |
+| `define` | — | `web_search` | a skill that can look things up on the web |
+| `search` | — | `message_search` | answering from the room's whole log, not just recent messages |
 | `random` | — | `random_choice` | real randomness — Claude only phrases the pick |
 | `ud` | `urban` | `urban_dictionary` | an optional arg with no default, so omitting it falls through to Urban Dictionary's own random-word behavior |
 | `imdb` | — | `imdb_lookup` | a third-party API call requiring a configured key |
@@ -106,7 +107,12 @@ A skill file with bad frontmatter or an unrecognized `tools`/`args` entry is ski
 - Every message is logged per-room as JSONL (`src/message_log.rs`), whether or not the bot replies to it — this is what skills like `history`/`digest`/`vibe` read from, and what the status page's room browser shows. The exception is `ignored_users` (`config.toml`): messages from those senders are dropped in `on_room_message` before any of that — no classification, no logging, no reply — so an ignored user never shows up in message history either.
 - Addressing is decided first, in code: a message gets a Claude-generated reply when it @mentions the bot, replies to one of its messages, or starts with its name (`gordy: ...`, `gordy, ...`, `gordy what...`), whatever the classifier thought of it. A bare acknowledgement is the one exception. Unaddressed messages get nothing, except a greeting to the room, once per room per 5 minutes (`reply_kind` in `src/handler.rs`).
 - Classification (`classify_message` in `src/classify.rs`) records intent, sentiment, and entities, and spots room greetings. It doesn't run for `!commands`, and if it fails the message is still logged and still answered if addressed.
-- Chat replies (`claude-opus-5-5`) see the last 50 messages with timestamps, including the bot's own replies, the message being replied to, and notes on older chat (`src/room_memory.rs`, rebuilt after a restart). They can web search up to 3 times per reply when facts might be wrong or stale, at $0.01 per search.
+- Chat replies (`claude-opus-5-5`) see the last 50 messages with timestamps, display names and reactions, including the bot's own replies, the message being replied to, saved facts, and notes on older chat. They can web search up to 3 times per reply when facts might be wrong or stale, at $0.01 per search, and read up to 3 links from the conversation.
+- Memory (`src/room_memory.rs`, persisted to `memory_path`): chat replies have `remember` and `forget` tools. Facts stay in the room they were learned in, and `!memories` lists them. Room summaries are saved in the same file.
+- Images: when addressed, the bot can see an attached image, one it's replying to, or one posted in the last 5 minutes. Images are never stored, and unaddressed ones cost nothing.
+- Reactions: a lone-emoji reply is sent as a reaction, and an addressed "thanks" gets a 👍. Reactions from others are logged to `<room>.reactions.jsonl` and shown in history. Removed reactions aren't tracked.
+- Each room's messages are handled one at a time, in order (`src/room_queue.rs`). Quick follow-ups from the same person are answered together, after a 1.5 second wait on addressed messages.
+- Unprompted comments are off by default. Set `interjection_chance` to turn them on; the bot can still decide to pass, and `interjection_cooldown_secs` limits them per room.
 - Replies show a typing indicator while being generated and are sent as real Matrix replies to the message that triggered them.
 - Claude API token usage and an estimated USD cost are tracked in-memory per command/reply type and exposed on the status page (`src/usage.rs`) — cost estimates are based on a hardcoded pricing table, not fetched live.
 - The status/debugging server (`src/status_server.rs`) has **no authentication** and binds to `127.0.0.1` by default — only widen `http_listen_addr` deliberately, and put it behind your own auth/reverse proxy if you do.

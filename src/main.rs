@@ -7,6 +7,7 @@ mod ignore;
 mod llm;
 mod message_log;
 mod room_memory;
+mod room_queue;
 mod skills;
 mod status_server;
 mod throttle;

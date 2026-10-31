@@ -51,3 +51,14 @@ rooms = ["#some-room:matrix.org"]
 # stops making API calls entirely until the limit is raised or the persisted
 # usage state (usage_state_path) is reset. Unset (the default) means no limit.
 # cost_limit_usd = 5.00
+
+# Optional: where saved facts and room summaries are persisted.
+# Defaults to "./data/memory.json".
+# memory_path = "./data/memory.json"
+
+# Optional: chance (0 to 1) that the bot considers joining in on a message not
+# addressed to it. It can still decide to stay quiet. Defaults to 0, which is off.
+# interjection_chance = 0.05
+
+# Optional: minimum seconds between unprompted comments in a room. Defaults to 1800.
+# interjection_cooldown_secs = 1800

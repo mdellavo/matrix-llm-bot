@@ -13,10 +13,11 @@ use tracing::{info, warn};
 
 use crate::config::Config;
 use crate::greeting::GreetingCooldown;
-use crate::handler::{HandlerContext, on_room_message};
+use crate::handler::{HandlerContext, on_reaction, on_room_message};
 use crate::ignore::IgnoredUsers;
 use crate::message_log::{MessageLogger, short_name};
-use crate::room_memory::RoomSummaries;
+use crate::room_memory::RoomMemory;
+use crate::room_queue::RoomQueues;
 use crate::skills::SkillRegistry;
 use crate::throttle::Throttle;
 use crate::tools::ToolClients;
@@ -95,7 +96,12 @@ impl Bot {
             greeting_cooldown: Arc::clone(&greeting_cooldown),
             ignored_users: Arc::clone(&ignored_users),
             rate_limit: Arc::clone(&rate_limit),
-            room_summaries: Arc::new(RoomSummaries::default()),
+            memory: Arc::new(RoomMemory::open(&config.memory_path).context("failed to load the bot's memory")?),
+            room_queues: Arc::new(RoomQueues::default()),
+            interjection_chance: config.interjection_chance,
+            interjection_cooldown: Arc::new(GreetingCooldown::new(std::time::Duration::from_secs(
+                config.interjection_cooldown_secs,
+            ))),
             bot_name: short_name(&config.username).to_string(),
         }));
 
@@ -212,6 +218,7 @@ impl Bot {
             .context("initial sync failed")?;
 
         self.client.add_event_handler(on_room_message);
+        self.client.add_event_handler(on_reaction);
 
         info!("starting sync loop");
         let settings = SyncSettings::default().token(response.next_batch);

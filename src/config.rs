@@ -77,6 +77,20 @@ pub struct Config {
     /// (`usage_state_path`) is reset. `None` (the default) means no limit.
     #[serde(default)]
     pub cost_limit_usd: Option<f64>,
+
+    /// Where the bot's memory (saved facts and room summaries, see `RoomMemory`) is
+    /// persisted. Defaults to "./data/memory.json".
+    #[serde(default = "default_memory_path")]
+    pub memory_path: PathBuf,
+
+    /// Chance, from 0 to 1, that the bot considers joining in on a message that
+    /// isn't addressed to it. 0 (the default) turns this off entirely.
+    #[serde(default)]
+    pub interjection_chance: f64,
+
+    /// Minimum time between unprompted comments in a room. Defaults to 30 minutes.
+    #[serde(default = "default_interjection_cooldown_secs")]
+    pub interjection_cooldown_secs: u64,
 }
 
 fn default_device_name() -> String {
@@ -107,6 +121,14 @@ fn default_rate_limit_backoff_secs() -> u64 {
     60
 }
 
+fn default_memory_path() -> PathBuf {
+    PathBuf::from("./data/memory.json")
+}
+
+fn default_interjection_cooldown_secs() -> u64 {
+    30 * 60
+}
+
 impl Config {
     pub fn load(path: &Path) -> Result<Self> {
         let raw = std::fs::read_to_string(path)
@@ -125,6 +147,10 @@ impl Config {
         anyhow::ensure!(!self.username.is_empty(), "username must not be empty");
         anyhow::ensure!(!self.password.is_empty(), "password must not be empty");
         anyhow::ensure!(!self.rooms.is_empty(), "rooms must list at least one room to monitor");
+        anyhow::ensure!(
+            (0.0..=1.0).contains(&self.interjection_chance),
+            "interjection_chance must be between 0 and 1"
+        );
         Ok(())
     }
 }

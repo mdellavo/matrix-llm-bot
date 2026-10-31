@@ -9,7 +9,7 @@ use tracing::{debug, warn};
 
 use crate::classify;
 use crate::llm::{self, CompletionRequest};
-use crate::message_log::{GeneratedReply, LoggedMessage, MessageLogger, PromptRecord};
+use crate::message_log::{self, GeneratedReply, LoggedMessage, MessageLogger, PromptRecord};
 use crate::throttle::{RATE_LIMITED_REPLY, Throttle};
 use crate::tools::{self, ToolClients};
 use crate::usage::{COST_LIMIT_REPLY, UsageTracker};
@@ -17,10 +17,24 @@ use crate::usage::{COST_LIMIT_REPLY, UsageTracker};
 const SKILL_FILE_NAME: &str = "SKILL.md";
 const FRONTMATTER_DELIMITER: &str = "---";
 const KNOWN_TOOLS: &[&str] =
-    &["message_log", "room_info", "current_time", "random_choice", "urban_dictionary", "imdb_lookup", "leafly_strain"];
+    &[
+    "message_log",
+    "message_search",
+    "room_info",
+    "current_time",
+    "random_choice",
+    "urban_dictionary",
+    "imdb_lookup",
+    "leafly_strain",
+    "web_search",
+];
 const RESERVED_NAME: &str = "help";
 const DEFAULT_MESSAGE_LOG_COUNT: usize = 5;
 const MAX_MESSAGE_LOG_COUNT: usize = 20;
+/// Most matches a `message_search` skill gets to read.
+const MESSAGE_SEARCH_LIMIT: usize = 40;
+/// Searches per run for a skill with the `web_search` tool.
+const SKILL_MAX_SEARCHES: u32 = 2;
 /// Covers the reply plus thinking, which counts toward this on current models.
 const SKILL_MAX_TOKENS: u32 = 4000;
 
@@ -447,6 +461,7 @@ pub async fn execute(
     skill: &Skill,
     message_text: &str,
     arg_text: &str,
+    bot_name: &str,
 ) -> GeneratedReply {
     // Short-circuits before validating args or building any context — same
     // reasoning as the OMDb-key check below: there's nothing useful to say
@@ -485,12 +500,34 @@ pub async fn execute(
                      tagged entities from classification are shown in brackets):\n",
                 );
                 for entry in &entries {
-                    user_turn.push_str(&format!("- {}{}: {}\n", entry.sender, format_entry_tags(entry), entry.body));
+                    user_turn.push_str(&format!("- {}{}: {}\n", entry.display_name(), format_entry_tags(entry), entry.body));
+                    if let Some(reply) = message_log::conversational_reply(entry) {
+                        user_turn.push_str(&format!("- {bot_name} (the bot): {reply}\n"));
+                    }
                 }
                 user_turn.push('\n');
             }
             Err(err) => {
                 warn!(?err, room_id, skill = %skill.name, "failed to read message log for skill");
+            }
+        }
+    }
+
+    if skill.tools.iter().any(|tool| tool == "message_search") {
+        let query = resolved_args.get("query").and_then(|value| value.as_str()).unwrap_or_default();
+        match message_log.search(room_id, query, MESSAGE_SEARCH_LIMIT) {
+            Ok(matches) if matches.is_empty() => {
+                user_turn.push_str("No messages in this room's log matched.\n\n");
+            }
+            Ok(matches) => {
+                user_turn.push_str(&format!(
+                    "Best matches from this room's full log, oldest first, as `[UTC time] [sender] message`:\n{}\n",
+                    message_log::format_transcript(&matches, bot_name)
+                ));
+            }
+            Err(err) => {
+                warn!(?err, room_id, skill = %skill.name, "message search failed");
+                user_turn.push_str("(The search failed due to a technical error — apologize and don't guess.)\n\n");
             }
         }
     }
@@ -581,9 +618,9 @@ pub async fn execute(
         system: &skill.prompt,
         user: &user_turn,
         max_tokens: SKILL_MAX_TOKENS,
-        effort: None,
-        web_search_max_uses: None,
+        web_search_max_uses: skill.tools.iter().any(|tool| tool == "web_search").then_some(SKILL_MAX_SEARCHES),
         label: &skill.name,
+        ..Default::default()
     };
 
     match llm::complete(anthropic, &request, usage_tracker, rate_limit).await {
@@ -975,7 +1012,10 @@ Say a friendly hello to the user.\n";
         assert!(registry.get("standup").is_some(), "standup skill should be present");
 
         let define = registry.get("define").expect("define skill should be present");
-        assert!(define.tools.is_empty(), "define should be a pure-prompt skill with no tools");
+        assert_eq!(define.tools, vec!["web_search"]);
+
+        let search = registry.get("search").expect("search skill should be present");
+        assert_eq!(search.tools, vec!["message_search"]);
 
         let random = registry.get("random").expect("random skill should be present");
         assert!(random.tools.iter().any(|tool| tool == "random_choice"));
@@ -990,7 +1030,7 @@ Say a friendly hello to the user.\n";
         let strain = registry.get("strain").expect("strain skill should be present");
         assert!(strain.tools.iter().any(|tool| tool == "leafly_strain"));
 
-        assert_eq!(registry.list().len(), 11, "expected all eleven shipped skills to load");
+        assert_eq!(registry.list().len(), 12, "expected all twelve shipped skills to load");
     }
 
     fn spec(name: &str, kind: ArgType) -> ArgSpec {

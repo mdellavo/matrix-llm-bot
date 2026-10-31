@@ -4,7 +4,7 @@ use serde_json::json;
 use threatflux_anthropic_sdk::Client as Anthropic;
 
 use crate::llm;
-use crate::message_log::{LoggedMessage, PromptRecord, format_history_block, short_name, single_line};
+use crate::message_log::{LoggedMessage, PromptRecord, format_history_block, single_line};
 use crate::throttle::Throttle;
 use crate::usage::UsageTracker;
 
@@ -122,7 +122,7 @@ impl MessageAnalysis {
 pub async fn classify_message(
     client: &Anthropic,
     message_text: &str,
-    sender: &str,
+    sender_name: &str,
     history: &[LoggedMessage],
     bot_name: &str,
     usage_tracker: &UsageTracker,
@@ -136,7 +136,7 @@ pub async fn classify_message(
     }
 
     let mut user_turn = format_history_block(history, bot_name);
-    user_turn.push_str(&format!("Message to classify, from [{}]:\n{}", short_name(sender), single_line(message_text)));
+    user_turn.push_str(&format!("Message to classify, from [{sender_name}]:\n{}", single_line(message_text)));
 
     let body = request_body(&user_turn);
     let response = llm::send(client, body, None, USAGE_LABEL, usage_tracker, rate_limit)

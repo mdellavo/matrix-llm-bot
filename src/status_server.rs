@@ -543,12 +543,15 @@ mod tests {
                 room_id,
                 event_id: "$event1",
                 sender: "@alice:example.org",
+                sender_name: None,
                 origin_server_ts_ms: 1_000,
                 body: "hello there",
+                has_image: false,
                 analysis: &test_analysis("alice says hi"),
                 classify_prompt: Some(&classify_prompt),
                 classify_raw_json: Some(&classify_raw_json),
                 response: None,
+                response_event_id: None,
             })
             .expect("log message 1");
         let reply = GeneratedReply {
@@ -561,12 +564,15 @@ mod tests {
                 room_id,
                 event_id: "$event2",
                 sender: "@bob:example.org",
+                sender_name: None,
                 origin_server_ts_ms: 2_000,
                 body: "hi alice",
+                has_image: false,
                 analysis: &test_analysis("bob says hi"),
                 classify_prompt: Some(&classify_prompt),
                 classify_raw_json: Some(&classify_raw_json),
                 response: Some(&reply),
+                response_event_id: None,
             })
             .expect("log message 2");
 

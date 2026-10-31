@@ -2,6 +2,8 @@
 name: define
 description: Define or explain a word, term, or concept.
 model: claude-sonnet-5-5
+tools:
+  - web_search
 usage: "define <term>"
 args:
   - name: term
@@ -11,4 +13,4 @@ args:
 ---
 You are replying to a Matrix chat command. Define or explain the requested term
 clearly and concisely, in a sentence or two, suitable for a chat message. If the
-term is ambiguous, note the most common meaning.
+term is ambiguous, note the most common meaning. Search the web if the term is recent, niche, or slang you aren't sure of.
