@@ -1,14 +1,14 @@
-use std::collections::HashMap;
-use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
+use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use threatflux_anthropic_sdk::Client as Anthropic;
 use tracing::warn;
 
 use crate::classify;
+use crate::db::Database;
 use crate::llm::{self, CompletionRequest, LocalTools};
 use crate::message_log::{LoggedMessage, format_transcript};
 use crate::throttle::Throttle;
@@ -31,7 +31,6 @@ transcript, write short notes the bot can use later: ongoing topics, running jok
 has been up to, and anything people said they'd do. Attribute everything to the person who said it. \
 Record only what's in the transcript. At most 150 words, plain sentences.";
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
 struct CachedSummary {
     /// The newest message this summary covers.
     through_event_id: String,
@@ -42,7 +41,7 @@ struct CachedSummary {
 /// learned in, so what's said in one room doesn't surface in another.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Fact {
-    pub id: u64,
+    pub id: i64,
     pub room_id: String,
     /// Who it's about, if anyone in particular.
     pub about: Option<String>,
@@ -58,47 +57,54 @@ impl Fact {
     }
 }
 
-#[derive(Debug, Default, Serialize, Deserialize)]
-struct MemoryState {
-    #[serde(default)]
-    summaries: HashMap<String, CachedSummary>,
-    #[serde(default)]
-    facts: Vec<Fact>,
-    #[serde(default)]
-    next_fact_id: u64,
+/// Saves a room's summary, replacing any earlier one.
+pub fn save_summary(connection: &Connection, room_id: &str, through_event_id: &str, text: &str) -> Result<()> {
+    connection
+        .execute(
+            "INSERT INTO room_summaries (room_id, through_event_id, text) VALUES (?1, ?2, ?3) \
+             ON CONFLICT (room_id) DO UPDATE SET through_event_id = excluded.through_event_id, text = excluded.text",
+            params![room_id, through_event_id, text],
+        )
+        .context("failed to save room summary")?;
+    Ok(())
 }
 
-/// The bot's memory beyond the message log: rolling per-room summaries of older
-/// chat, and facts people asked it to keep. Persisted as one JSON file, rewritten
-/// whole on each change, which is fine at the rate this changes.
+/// Inserts a fact from the old memory file, keeping its number.
+pub fn import_fact(transaction: &Transaction<'_>, fact: &Fact) -> Result<()> {
+    transaction
+        .execute(
+            "INSERT OR IGNORE INTO facts (id, room_id, about, text, told_by, added_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![fact.id, fact.room_id, fact.about, fact.text, fact.told_by, fact.added_at],
+        )
+        .context("failed to import fact")?;
+    Ok(())
+}
+
+/// Makes new fact numbers start after `last_id`, so a forgotten number never returns.
+pub fn reserve_fact_ids(transaction: &Transaction<'_>, last_id: i64) -> Result<()> {
+    let updated = transaction
+        .execute("UPDATE sqlite_sequence SET seq = max(seq, ?1) WHERE name = 'facts'", [last_id])
+        .context("failed to reserve fact numbers")?;
+    if updated == 0 {
+        transaction
+            .execute("INSERT INTO sqlite_sequence (name, seq) VALUES ('facts', ?1)", [last_id])
+            .context("failed to reserve fact numbers")?;
+    }
+    Ok(())
+}
+
+/// The bot's memory beyond the message log, stored in its database: rolling per-room
+/// summaries of older chat, and facts people asked it to keep.
 pub struct RoomMemory {
-    path: PathBuf,
-    state: Mutex<MemoryState>,
+    database: Arc<Database>,
 }
 
 impl RoomMemory {
-    pub fn open(path: &Path) -> Result<Self> {
-        let state = match std::fs::read_to_string(path) {
-            Ok(raw) => serde_json::from_str(&raw).with_context(|| format!("failed to parse {}", path.display()))?,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => MemoryState::default(),
-            Err(err) => return Err(err).with_context(|| format!("failed to read {}", path.display())),
-        };
-        Ok(Self { path: path.to_path_buf(), state: Mutex::new(state) })
+    pub fn new(database: Arc<Database>) -> Self {
+        Self { database }
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, MemoryState> {
-        self.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
-    }
-
-    /// Writes to a temp file first, so a crash mid-write can't corrupt the memory.
-    fn save(&self, state: &MemoryState) -> Result<()> {
-        let raw = serde_json::to_string_pretty(state).context("failed to serialize memory")?;
-        let temp_path = self.path.with_extension("json.tmp");
-        std::fs::write(&temp_path, raw).with_context(|| format!("failed to write {}", temp_path.display()))?;
-        std::fs::rename(&temp_path, &self.path).with_context(|| format!("failed to replace {}", self.path.display()))
-    }
-
-    pub fn remember(&self, room_id: &str, about: Option<&str>, text: &str, told_by: &str) -> Result<u64, String> {
+    pub fn remember(&self, room_id: &str, about: Option<&str>, text: &str, told_by: &str) -> Result<i64, String> {
         let text = text.trim();
         if text.is_empty() {
             return Err("the fact is empty".to_string());
@@ -107,44 +113,86 @@ impl RoomMemory {
             return Err(format!("the fact is over {MAX_FACT_CHARS} characters; shorten it"));
         }
 
-        let mut state = self.lock();
-        if state.facts.iter().filter(|fact| fact.room_id == room_id).count() >= MAX_FACTS_PER_ROOM {
-            return Err(format!("memory is full ({MAX_FACTS_PER_ROOM} facts); forget something first"));
-        }
+        let about = about.map(str::trim).filter(|about| !about.is_empty());
+        let added_at = chrono::Utc::now().to_rfc3339();
 
-        state.next_fact_id += 1;
-        let id = state.next_fact_id;
-        state.facts.push(Fact {
-            id,
-            room_id: room_id.to_string(),
-            about: about.map(str::trim).filter(|about| !about.is_empty()).map(String::from),
-            text: text.to_string(),
-            told_by: told_by.to_string(),
-            added_at: chrono::Utc::now().to_rfc3339(),
+        // In one transaction so the count can't go stale before the insert.
+        let result = self.database.transaction(|transaction| {
+            let count: usize = transaction
+                .query_row("SELECT COUNT(*) FROM facts WHERE room_id = ?1", [room_id], |row| row.get(0))
+                .context("failed to count facts")?;
+            if count >= MAX_FACTS_PER_ROOM {
+                return Ok(None);
+            }
+            transaction
+                .execute(
+                    "INSERT INTO facts (room_id, about, text, told_by, added_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+                    params![room_id, about, text, told_by, added_at],
+                )
+                .context("failed to save fact")?;
+            Ok(Some(transaction.last_insert_rowid()))
         });
-        self.save(&state).map_err(|err| format!("couldn't save: {err}"))?;
-        Ok(id)
+
+        match result {
+            Ok(Some(id)) => Ok(id),
+            Ok(None) => Err(format!("memory is full ({MAX_FACTS_PER_ROOM} facts); forget something first")),
+            Err(err) => Err(format!("couldn't save: {err}")),
+        }
     }
 
-    pub fn forget(&self, room_id: &str, id: u64) -> Result<(), String> {
-        let mut state = self.lock();
-        let position = state
-            .facts
-            .iter()
-            .position(|fact| fact.id == id && fact.room_id == room_id)
-            .ok_or_else(|| format!("no fact #{id} in this room"))?;
-        state.facts.remove(position);
-        self.save(&state).map_err(|err| format!("couldn't save: {err}"))
+    pub fn forget(&self, room_id: &str, id: i64) -> Result<(), String> {
+        let deleted = self
+            .database
+            .with(|connection| connection.execute("DELETE FROM facts WHERE id = ?1 AND room_id = ?2", params![id, room_id]))
+            .map_err(|err| format!("couldn't save: {err}"))?;
+        if deleted == 0 {
+            return Err(format!("no fact #{id} in this room"));
+        }
+        Ok(())
     }
 
     pub fn facts(&self, room_id: &str) -> Vec<Fact> {
-        self.lock().facts.iter().filter(|fact| fact.room_id == room_id).cloned().collect()
+        let result = self.database.with(|connection| {
+            let mut statement = connection.prepare_cached(
+                "SELECT id, room_id, about, text, told_by, added_at FROM facts WHERE room_id = ?1 ORDER BY id",
+            )?;
+            statement
+                .query_map([room_id], |row| {
+                    Ok(Fact {
+                        id: row.get(0)?,
+                        room_id: row.get(1)?,
+                        about: row.get(2)?,
+                        text: row.get(3)?,
+                        told_by: row.get(4)?,
+                        added_at: row.get(5)?,
+                    })
+                })?
+                .collect()
+        });
+        result.unwrap_or_else(|err| {
+            warn!(?err, room_id, "failed to load facts");
+            Vec::new()
+        })
     }
 
     /// The room's facts as one line each, or `None` if there aren't any.
     pub fn describe_facts(&self, room_id: &str) -> Option<String> {
         let facts = self.facts(room_id);
         (!facts.is_empty()).then(|| facts.iter().map(Fact::describe).collect::<Vec<_>>().join("\n"))
+    }
+
+    fn cached_summary(&self, room_id: &str) -> Option<CachedSummary> {
+        let result = self.database.with(|connection| {
+            connection
+                .query_row("SELECT through_event_id, text FROM room_summaries WHERE room_id = ?1", [room_id], |row| {
+                    Ok(CachedSummary { through_event_id: row.get(0)?, text: row.get(1)? })
+                })
+                .optional()
+        });
+        result.unwrap_or_else(|err| {
+            warn!(?err, room_id, "failed to load room summary");
+            None
+        })
     }
 
     /// A summary of `older` (oldest first), refreshed only once enough new messages
@@ -159,7 +207,7 @@ impl RoomMemory {
         usage_tracker: &UsageTracker,
         rate_limit: &Throttle,
     ) -> Option<String> {
-        let cached = self.lock().summaries.get(room_id).cloned();
+        let cached = self.cached_summary(room_id);
         let Some(newest) = older.last() else {
             return cached.map(|summary| summary.text);
         };
@@ -184,12 +232,8 @@ impl RoomMemory {
 
         match llm::complete(client, &request, usage_tracker, rate_limit).await {
             Ok(text) => {
-                let mut state = self.lock();
-                state.summaries.insert(
-                    room_id.to_string(),
-                    CachedSummary { through_event_id: newest.event_id.clone(), text: text.clone() },
-                );
-                if let Err(err) = self.save(&state) {
+                let saved = self.database.transaction(|transaction| save_summary(transaction, room_id, &newest.event_id, &text));
+                if let Err(err) = saved {
                     warn!(?err, room_id, "failed to persist room summary");
                 }
                 Some(text)
@@ -250,7 +294,7 @@ impl LocalTools for MemoryTools<'_> {
                 Ok(format!("Saved as #{id}."))
             }
             "forget" => {
-                let id = input["id"].as_u64().ok_or("id is required")?;
+                let id = input["id"].as_i64().ok_or("id is required")?;
                 self.memory.forget(self.room_id, id)?;
                 Ok(format!("Forgot #{id}."))
             }
@@ -263,9 +307,8 @@ impl LocalTools for MemoryTools<'_> {
 mod tests {
     use super::*;
 
-    fn temp_path(label: &str) -> PathBuf {
-        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
-        std::env::temp_dir().join(format!("room-memory-{label}-{nanos}.json"))
+    fn memory() -> RoomMemory {
+        RoomMemory::new(Arc::new(Database::open_in_memory()))
     }
 
     #[test]
@@ -282,19 +325,22 @@ mod tests {
 
     #[test]
     fn facts_survive_a_restart() {
-        let path = temp_path("restart");
-        let memory = RoomMemory::open(&path).unwrap();
+        let path = std::env::temp_dir().join(format!("room-memory-{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let memory = RoomMemory::new(Arc::new(Database::open(&path).unwrap()));
         memory.remember("!a", Some("procyon"), "hates cilantro", "phizz").unwrap();
+        memory.forget("!a", memory.remember("!a", None, "gone", "phizz").unwrap()).unwrap();
+        drop(memory);
 
-        let reopened = RoomMemory::open(&path).unwrap();
+        let reopened = RoomMemory::new(Arc::new(Database::open(&path).unwrap()));
         assert_eq!(reopened.describe_facts("!a").unwrap(), "#1 about procyon (from phizz): hates cilantro");
         // Ids keep counting, so a forgotten number never comes back as a new fact.
-        assert_eq!(reopened.remember("!a", None, "second", "phizz").unwrap(), 2);
+        assert_eq!(reopened.remember("!a", None, "next", "phizz").unwrap(), 3);
     }
 
     #[test]
     fn facts_stay_in_their_own_room() {
-        let memory = RoomMemory::open(&temp_path("rooms")).unwrap();
+        let memory = memory();
         let id = memory.remember("!a", None, "a secret", "phizz").unwrap();
 
         assert!(memory.describe_facts("!b").is_none());
@@ -304,15 +350,26 @@ mod tests {
     }
 
     #[test]
+    fn a_full_room_refuses_new_facts_until_one_is_forgotten() {
+        let memory = memory();
+        for index in 0..MAX_FACTS_PER_ROOM {
+            memory.remember("!a", None, &format!("fact {index}"), "phizz").unwrap();
+        }
+        assert!(memory.remember("!a", None, "one more", "phizz").unwrap_err().contains("full"));
+        memory.forget("!a", 1).unwrap();
+        assert!(memory.remember("!a", None, "one more", "phizz").is_ok());
+    }
+
+    #[test]
     fn rejects_empty_and_oversized_facts() {
-        let memory = RoomMemory::open(&temp_path("limits")).unwrap();
+        let memory = memory();
         assert!(memory.remember("!a", None, "   ", "phizz").is_err());
         assert!(memory.remember("!a", None, &"x".repeat(MAX_FACT_CHARS + 1), "phizz").is_err());
     }
 
     #[test]
     fn tools_attribute_facts_to_the_person_being_answered() {
-        let memory = RoomMemory::open(&temp_path("tools")).unwrap();
+        let memory = memory();
         let tools = MemoryTools { memory: &memory, room_id: "!a", told_by: "oshuma" };
 
         assert_eq!(tools.run("remember", &json!({"fact": "likes tea"})).unwrap(), "Saved as #1.");

@@ -116,7 +116,7 @@ async fn api_room_messages(
 ) -> impl IntoResponse {
     let limit = query.limit.unwrap_or(DEFAULT_MESSAGES_LIMIT).clamp(1, MAX_MESSAGES_LIMIT);
 
-    match state.message_log.recent(&room_id, limit) {
+    match state.message_log.recent_with_prompts(&room_id, limit) {
         Ok(entries) => Json(entries).into_response(),
         Err(err) => (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response(),
     }
@@ -537,8 +537,8 @@ mod tests {
             .await
             .expect("client build performs no network I/O for a plain homeserver_url");
 
-        let log_dir = unique_temp_dir("status-server");
-        let message_log = Arc::new(MessageLogger::open(&log_dir).expect("open message log"));
+        let database = Arc::new(crate::db::Database::open_in_memory());
+        let message_log = Arc::new(MessageLogger::new(Arc::clone(&database)));
 
         let room_id = "!test:example.org";
         let classify_prompt = PromptRecord { system: "classify system".to_string(), user: "classify user".to_string() };
@@ -586,8 +586,7 @@ mod tests {
         let skills_dir = unique_temp_dir("status-server-skills");
         let skills = Arc::new(SkillRegistry::load(&skills_dir).expect("load skills"));
         let tool_clients = Arc::new(ToolClients::new(None));
-        let usage_state_path = unique_temp_dir("status-server-usage").join("usage.json");
-        let usage_tracker = Arc::new(UsageTracker::open(&usage_state_path, None).expect("open usage tracker"));
+        let usage_tracker = Arc::new(UsageTracker::open(database, None).expect("open usage tracker"));
         usage_tracker.record("classify", "claude-haiku-4-5", &test_usage(120, 30));
         let rate_limit = Arc::new(Throttle::new(std::time::Duration::from_secs(60)));
 
@@ -674,9 +673,6 @@ mod tests {
         assert_eq!(by_label[0]["label"], "classify");
         assert_eq!(by_label[0]["input_tokens"], 120);
         assert_eq!(by_label[0]["web_search_requests"], 0);
-
-        let _ = std::fs::remove_dir_all(&log_dir);
         let _ = std::fs::remove_dir_all(&skills_dir);
-        let _ = std::fs::remove_dir_all(usage_state_path.parent().expect("parent dir"));
     }
 }

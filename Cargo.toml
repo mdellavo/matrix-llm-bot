@@ -15,6 +15,8 @@ matrix-sdk = { version = "0.18.0", features = ["bundled-sqlite", "markdown"] }
 # Matches a version already resolved transitively (via matrix-sdk-crypto's `ulid`
 # dependency), so this adds no new distinct `rand` major version to the build.
 rand = "0.10"
+# Same version as matrix-sdk-sqlite: only one libsqlite3-sys can link into a binary.
+rusqlite = { version = "0.37", default-features = false, features = ["bundled"] }
 # rustls (not default-tls) so this reuses matrix-sdk's already-compiled TLS stack
 # instead of pulling in a second (openssl-based) one.
 reqwest = { version = "0.13.4", default-features = false, features = ["json", "query", "rustls"] }

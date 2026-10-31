@@ -25,9 +25,12 @@ pub struct Config {
     #[serde(default = "default_store_path")]
     pub store_path: PathBuf,
 
-    /// Directory holding one append-only JSONL log file per room (named after the
-    /// room ID) of every classified message the bot sees. Each line is metadata
-    /// (room, sender, event id, timestamp) plus the parsed `MessageAnalysis`.
+    /// The bot's SQLite database: messages, reactions, facts, summaries, and usage.
+    #[serde(default = "default_database_path")]
+    pub database_path: PathBuf,
+
+    /// Where per-room JSONL message logs were kept before SQLite. Read once, to
+    /// import them into the database.
     #[serde(default = "default_message_log_dir")]
     pub message_log_dir: PathBuf,
 
@@ -58,9 +61,7 @@ pub struct Config {
     #[serde(default)]
     pub ignored_users: Vec<String>,
 
-    /// Where accumulated Claude API token/request usage (see `UsageTracker`) is
-    /// persisted as a JSON snapshot, so it survives a restart instead of
-    /// resetting to zero. Defaults to "./data/usage.json".
+    /// Where usage totals were kept before SQLite. Read once, to import them.
     #[serde(default = "default_usage_state_path")]
     pub usage_state_path: PathBuf,
 
@@ -78,8 +79,7 @@ pub struct Config {
     #[serde(default)]
     pub cost_limit_usd: Option<f64>,
 
-    /// Where the bot's memory (saved facts and room summaries, see `RoomMemory`) is
-    /// persisted. Defaults to "./data/memory.json".
+    /// Where facts and room summaries were kept before SQLite. Read once, to import them.
     #[serde(default = "default_memory_path")]
     pub memory_path: PathBuf,
 
@@ -96,6 +96,10 @@ pub struct Config {
     /// public addresses are fetched. Defaults to true.
     #[serde(default = "default_fetch_links")]
     pub fetch_links: bool,
+}
+
+fn default_database_path() -> PathBuf {
+    PathBuf::from("./data/bot.db")
 }
 
 fn default_device_name() -> String {

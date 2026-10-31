@@ -13,9 +13,15 @@ rooms = ["#some-room:matrix.org"]
 # Optional: where the SQLite state/crypto store is persisted. Defaults to "./data/store".
 # store_path = "./data/store"
 
-# Optional: directory holding one JSONL log file per room of classified messages.
-# Defaults to "./data/messages".
+# Optional: the bot's SQLite database, holding messages, reactions, saved facts,
+# room summaries, and usage totals. Defaults to "./data/bot.db".
+# database_path = "./data/bot.db"
+
+# Optional: where older versions kept their data. These are read once at startup, to
+# import into the database, and then ignored. Only set them if you moved them.
 # message_log_dir = "./data/messages"
+# usage_state_path = "./data/usage.json"
+# memory_path = "./data/memory.json"
 
 # Optional: address the status/debugging HTTP server binds to. Defaults to
 # loopback-only ("127.0.0.1:8080") since the page and its API expose logged
@@ -37,11 +43,6 @@ rooms = ["#some-room:matrix.org"]
 # message history either. Defaults to empty (ignore nobody).
 # ignored_users = ["@spammer:example.org"]
 
-# Optional: where accumulated Claude API token/request usage is persisted as a
-# JSON snapshot, so it survives a restart instead of resetting to zero.
-# Defaults to "./data/usage.json".
-# usage_state_path = "./data/usage.json"
-
 # Optional: how long (in seconds) to pause outgoing Claude API calls after one
 # comes back rate-limited (HTTP 429), before trying again. Defaults to 60.
 # rate_limit_backoff_secs = 60
@@ -51,10 +52,6 @@ rooms = ["#some-room:matrix.org"]
 # stops making API calls entirely until the limit is raised or the persisted
 # usage state (usage_state_path) is reset. Unset (the default) means no limit.
 # cost_limit_usd = 5.00
-
-# Optional: where saved facts and room summaries are persisted.
-# Defaults to "./data/memory.json".
-# memory_path = "./data/memory.json"
 
 # Optional: chance (0 to 1) that the bot considers joining in on a message not
 # addressed to it. It can still decide to stay quiet. Defaults to 0, which is off.

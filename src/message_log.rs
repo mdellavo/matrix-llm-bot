@@ -1,15 +1,12 @@
-use std::collections::HashMap;
-use std::collections::hash_map::Entry;
-use std::fs::{File, OpenOptions};
-use std::io::Write;
-use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
+use rusqlite::{Connection, Row, Transaction, params};
 use serde::{Deserialize, Serialize};
 use tracing::warn;
 
 use crate::classify::MessageAnalysis;
+use crate::db::Database;
 use crate::links::LinkPreview;
 
 /// The system/user turn sent to Claude for a single call — recorded alongside
@@ -42,43 +39,12 @@ impl GeneratedReply {
     }
 }
 
-/// A single logged message: the metadata the bot already has from the Matrix
-/// event, the `MessageAnalysis` and prompt the classifier produced/used, and
-/// — if the bot replied — the reply's own prompt, text, and label.
-#[derive(Debug, Serialize)]
-struct MessageLogEntry<'a> {
-    logged_at: String,
-    room_id: &'a str,
-    event_id: &'a str,
-    sender: &'a str,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    sender_name: Option<&'a str>,
-    origin_server_ts_ms: i64,
-    body: &'a str,
-    has_image: bool,
-    #[serde(skip_serializing_if = "<[LinkPreview]>::is_empty")]
-    links: &'a [LinkPreview],
-    analysis: &'a MessageAnalysis,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    classify_prompt: Option<&'a PromptRecord>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    classify_raw_json: Option<&'a serde_json::Value>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    response_prompt: Option<&'a PromptRecord>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    response: Option<&'a str>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    response_label: Option<&'a str>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    response_event_id: Option<&'a str>,
-}
-
-/// One line of a room's reaction log.
+/// One line of an old reaction log file, and the shape of a reaction row.
 #[derive(Debug, Serialize, Deserialize)]
-struct ReactionLogEntry {
-    target_event_id: String,
-    sender_name: String,
-    key: String,
+pub struct ReactionRecord {
+    pub target_event_id: String,
+    pub sender_name: String,
+    pub key: String,
 }
 
 /// A reaction on a logged message or on the bot's reply to it.
@@ -116,10 +82,9 @@ pub struct MessageLogParams<'a> {
     pub response_event_id: Option<&'a str>,
 }
 
-/// Owned counterpart of `MessageLogEntry`, for reading log lines back — also
-/// serialized directly as the JSON response of the status server's message API
-/// (`src/status_server.rs`). The prompt/response fields default to `None` on
-/// deserialize so log lines written before they existed still parse.
+/// A logged message as read back. Also serialized directly as the JSON response of
+/// the status server's message API (`src/status_server.rs`), and deserialized from
+/// the JSONL logs older versions wrote, so newer fields must have `#[serde(default)]`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LoggedMessage {
     pub logged_at: String,
@@ -162,33 +127,179 @@ impl LoggedMessage {
     }
 }
 
-/// Appends one JSON object per line to a per-room log file — a durable record of
-/// every classified message the bot has seen, independent of whether it replied.
-/// One file per room under `dir`, e.g. `!abcDEFghi_matrix.org.jsonl`, opened lazily
-/// on the room's first logged message and kept open thereafter.
-///
-/// Writes are synchronous (a single small `write()` under a `std::sync::Mutex`),
-/// which is fine at chat-message volume; if logging ever becomes a bottleneck,
-/// move the write onto `tokio::task::spawn_blocking`.
-///
-/// Queries (`recent`) are disk-only: they re-read and re-parse the room's log file
-/// on every call, with no in-memory cache. Simpler and always consistent with what's
-/// persisted; revisit with an in-memory ring buffer if command latency or file size
-/// becomes a problem.
+/// Every message the bot has seen, whether or not it replied, stored in the bot's
+/// database.
 pub struct MessageLogger {
-    dir: PathBuf,
-    files: Mutex<HashMap<String, File>>,
+    database: Arc<Database>,
+}
+
+/// The columns `read_message` expects. Prompts are left out unless asked for, since
+/// they're most of a row's size and only the status page shows them.
+const MESSAGE_COLUMNS: &str = "room_id, event_id, sender, sender_name, origin_server_ts_ms, logged_at, body, \
+    has_image, analysis_json, links_json, response, response_label, response_event_id";
+const PROMPT_COLUMNS: &str = "classify_prompt_json, classify_raw_json, response_prompt_json";
+
+/// Most terms from one search that are matched in SQL.
+const MAX_SEARCH_TERMS: usize = 20;
+
+fn parse_column<T: serde::de::DeserializeOwned>(raw: Option<String>, event_id: &str) -> Option<T> {
+    let raw = raw?;
+    match serde_json::from_str(&raw) {
+        Ok(value) => Some(value),
+        Err(err) => {
+            warn!(?err, event_id, "skipping malformed JSON column");
+            None
+        }
+    }
+}
+
+fn read_message(row: &Row<'_>, with_prompts: bool) -> rusqlite::Result<Option<LoggedMessage>> {
+    let event_id: String = row.get(1)?;
+    let Some(analysis) = parse_column(row.get(8)?, &event_id) else {
+        return Ok(None);
+    };
+
+    Ok(Some(LoggedMessage {
+        room_id: row.get(0)?,
+        sender: row.get(2)?,
+        sender_name: row.get(3)?,
+        origin_server_ts_ms: row.get(4)?,
+        logged_at: row.get(5)?,
+        body: row.get(6)?,
+        has_image: row.get(7)?,
+        analysis,
+        links: parse_column(row.get(9)?, &event_id).unwrap_or_default(),
+        response: row.get(10)?,
+        response_label: row.get(11)?,
+        response_event_id: row.get(12)?,
+        classify_prompt: if with_prompts { parse_column(row.get(13)?, &event_id) } else { None },
+        classify_raw_json: if with_prompts { parse_column(row.get(14)?, &event_id) } else { None },
+        response_prompt: if with_prompts { parse_column(row.get(15)?, &event_id) } else { None },
+        event_id,
+        reactions: Vec::new(),
+        response_reactions: Vec::new(),
+    }))
+}
+
+fn reactions_on(connection: &Connection, room_id: &str, event_id: &str) -> rusqlite::Result<Vec<LoggedReaction>> {
+    let mut statement = connection.prepare_cached(
+        "SELECT sender_name, key FROM reactions WHERE room_id = ?1 AND target_event_id = ?2 ORDER BY id",
+    )?;
+    statement
+        .query_map([room_id, event_id], |row| Ok(LoggedReaction { sender_name: row.get(0)?, key: row.get(1)? }))?
+        .collect()
+}
+
+fn attach_reactions(connection: &Connection, entry: &mut LoggedMessage) -> rusqlite::Result<()> {
+    entry.reactions = reactions_on(connection, &entry.room_id, &entry.event_id)?;
+    if let Some(reply_id) = &entry.response_event_id {
+        entry.response_reactions = reactions_on(connection, &entry.room_id, reply_id)?;
+    }
+    Ok(())
+}
+
+/// Bound parameters for one `messages` row.
+struct NewMessage<'a> {
+    room_id: &'a str,
+    event_id: &'a str,
+    sender: &'a str,
+    sender_name: Option<&'a str>,
+    origin_server_ts_ms: i64,
+    logged_at: &'a str,
+    body: &'a str,
+    has_image: bool,
+    analysis_json: String,
+    links_json: Option<String>,
+    classify_prompt_json: Option<String>,
+    classify_raw_json: Option<String>,
+    response_prompt_json: Option<String>,
+    response: Option<&'a str>,
+    response_label: Option<&'a str>,
+    response_event_id: Option<&'a str>,
+}
+
+/// A repeated event ID is ignored, so a message can never be logged twice.
+fn insert_message(connection: &Connection, message: &NewMessage<'_>) -> rusqlite::Result<usize> {
+    connection.prepare_cached(
+        "INSERT OR IGNORE INTO messages (room_id, event_id, sender, sender_name, origin_server_ts_ms, logged_at, body, \
+         has_image, analysis_json, links_json, classify_prompt_json, classify_raw_json, response_prompt_json, response, \
+         response_label, response_event_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+    )?
+    .execute(params![
+        message.room_id,
+        message.event_id,
+        message.sender,
+        message.sender_name,
+        message.origin_server_ts_ms,
+        message.logged_at,
+        message.body,
+        message.has_image,
+        message.analysis_json,
+        message.links_json,
+        message.classify_prompt_json,
+        message.classify_raw_json,
+        message.response_prompt_json,
+        message.response,
+        message.response_label,
+        message.response_event_id,
+    ])
+}
+
+fn to_json<T: Serialize + ?Sized>(value: &T) -> Result<String> {
+    serde_json::to_string(value).context("failed to serialize message column")
+}
+
+fn optional_json<T: Serialize>(value: Option<&T>) -> Result<Option<String>> {
+    value.map(to_json).transpose()
+}
+
+fn links_json(links: &[LinkPreview]) -> Result<Option<String>> {
+    if links.is_empty() { Ok(None) } else { to_json(links).map(Some) }
+}
+
+fn insert_reaction(connection: &Connection, room_id: &str, reaction: &ReactionRecord) -> rusqlite::Result<usize> {
+    connection.execute(
+        "INSERT OR IGNORE INTO reactions (room_id, target_event_id, sender_name, key) VALUES (?1, ?2, ?3, ?4)",
+        params![room_id, reaction.target_event_id, reaction.sender_name, reaction.key],
+    )
+}
+
+/// Inserts a message from an old log file.
+pub fn import_entry(transaction: &Transaction<'_>, entry: &LoggedMessage) -> Result<()> {
+    insert_message(
+        transaction,
+        &NewMessage {
+            room_id: &entry.room_id,
+            event_id: &entry.event_id,
+            sender: &entry.sender,
+            sender_name: entry.sender_name.as_deref(),
+            origin_server_ts_ms: entry.origin_server_ts_ms,
+            logged_at: &entry.logged_at,
+            body: &entry.body,
+            has_image: entry.has_image,
+            analysis_json: to_json(&entry.analysis)?,
+            links_json: links_json(&entry.links)?,
+            classify_prompt_json: optional_json(entry.classify_prompt.as_ref())?,
+            classify_raw_json: optional_json(entry.classify_raw_json.as_ref())?,
+            response_prompt_json: optional_json(entry.response_prompt.as_ref())?,
+            response: entry.response.as_deref(),
+            response_label: entry.response_label.as_deref(),
+            response_event_id: entry.response_event_id.as_deref(),
+        },
+    )
+    .context("failed to import message")?;
+    Ok(())
+}
+
+/// Inserts a reaction from an old log file.
+pub fn import_reaction(transaction: &Transaction<'_>, room_id: &str, reaction: &ReactionRecord) -> Result<()> {
+    insert_reaction(transaction, room_id, reaction).context("failed to import reaction")?;
+    Ok(())
 }
 
 impl MessageLogger {
-    pub fn open(dir: &Path) -> Result<Self> {
-        std::fs::create_dir_all(dir)
-            .with_context(|| format!("failed to create message log dir at {}", dir.display()))?;
-
-        Ok(Self {
-            dir: dir.to_path_buf(),
-            files: Mutex::new(HashMap::new()),
-        })
+    pub fn new(database: Arc<Database>) -> Self {
+        Self { database }
     }
 
     pub fn log(&self, params: MessageLogParams) -> Result<()> {
@@ -208,84 +319,102 @@ impl MessageLogger {
             response_event_id,
         } = params;
 
-        let entry = MessageLogEntry {
-            logged_at: chrono::Utc::now().to_rfc3339(),
+        let logged_at = chrono::Utc::now().to_rfc3339();
+        let message = NewMessage {
             room_id,
             event_id,
             sender,
             sender_name,
             origin_server_ts_ms,
+            logged_at: &logged_at,
             body,
             has_image,
-            links,
-            analysis,
-            classify_prompt,
-            classify_raw_json,
-            response_prompt: response.and_then(|response| response.prompt.as_ref()),
+            analysis_json: to_json(analysis)?,
+            links_json: links_json(links)?,
+            classify_prompt_json: optional_json(classify_prompt)?,
+            classify_raw_json: optional_json(classify_raw_json)?,
+            response_prompt_json: optional_json(response.and_then(|response| response.prompt.as_ref()))?,
             response: response.map(|response| response.text.as_str()),
             response_label: response.map(|response| response.label.as_str()),
             response_event_id,
         };
-        let line = serde_json::to_string(&entry).context("failed to serialize message log entry")?;
-
-        let mut files = self.files.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        let file = match files.entry(room_id.to_string()) {
-            Entry::Occupied(entry) => entry.into_mut(),
-            Entry::Vacant(entry) => {
-                let path = self.room_log_path(room_id);
-                let file = OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(&path)
-                    .with_context(|| format!("failed to open room log at {}", path.display()))?;
-                entry.insert(file)
-            }
-        };
-
-        writeln!(file, "{line}").context("failed to write message log entry")?;
+        self.database.with(|connection| insert_message(connection, &message))?;
         Ok(())
     }
 
-    /// Records a reaction. Kept in its own file because it's about an existing
-    /// message, and message lines are never rewritten.
+    /// Records a reaction. It's its own row because it can arrive long after the
+    /// message it's on, and can also be on the bot's reply rather than the message.
     pub fn log_reaction(&self, room_id: &str, target_event_id: &str, sender_name: &str, key: &str) -> Result<()> {
-        let entry = ReactionLogEntry {
+        let reaction = ReactionRecord {
             target_event_id: target_event_id.to_string(),
             sender_name: sender_name.to_string(),
             key: key.to_string(),
         };
-        let line = serde_json::to_string(&entry).context("failed to serialize reaction log entry")?;
-
-        let path = self.reaction_log_path(room_id);
-        let _guard = self.files.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        let mut file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)
-            .with_context(|| format!("failed to open reaction log at {}", path.display()))?;
-        writeln!(file, "{line}").context("failed to write reaction log entry")
+        self.database.with(|connection| insert_reaction(connection, room_id, &reaction))?;
+        Ok(())
     }
 
-    /// Returns up to `limit` most recent logged messages for `room_id`, oldest first.
-    /// Reads and parses the room's log file from disk on every call — there is no
-    /// in-memory cache (see the "disk-only" note in the module docs above).
+    /// Up to `limit` most recent messages for `room_id`, oldest first, without their
+    /// prompts.
     pub fn recent(&self, room_id: &str, limit: usize) -> Result<Vec<LoggedMessage>> {
-        let mut entries = self.read_all(room_id)?;
-        let start = entries.len().saturating_sub(limit);
-        Ok(entries.split_off(start))
+        self.read_recent(room_id, limit, false)
     }
 
-    /// The messages in the room's whole log that best match `query`, oldest first.
-    /// Ranked by how many of the query's words appear in the sender's name, the
-    /// message, or the bot's reply to it, with newer messages winning ties.
+    /// `recent`, with the prompts behind each classification and reply.
+    pub fn recent_with_prompts(&self, room_id: &str, limit: usize) -> Result<Vec<LoggedMessage>> {
+        self.read_recent(room_id, limit, true)
+    }
+
+    fn read_recent(&self, room_id: &str, limit: usize, with_prompts: bool) -> Result<Vec<LoggedMessage>> {
+        let columns = if with_prompts { format!("{MESSAGE_COLUMNS}, {PROMPT_COLUMNS}") } else { MESSAGE_COLUMNS.to_string() };
+        let sql = format!("SELECT {columns} FROM messages WHERE room_id = ?1 ORDER BY id DESC LIMIT ?2");
+
+        self.database.with(|connection| {
+            let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+            let mut statement = connection.prepare_cached(&sql)?;
+            let mut entries = statement
+                .query_map(params![room_id, limit], |row| read_message(row, with_prompts))?
+                .filter_map(Result::transpose)
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            entries.reverse();
+            for entry in &mut entries {
+                attach_reactions(connection, entry)?;
+            }
+            Ok(entries)
+        })
+    }
+
+    /// The messages in the room's whole history that best match `query`, oldest
+    /// first. Ranked by how many of the query's words appear in the sender's name,
+    /// the message, the bot's reply, or a linked page's title and description, with
+    /// newer messages winning ties.
     pub fn search(&self, room_id: &str, query: &str, limit: usize) -> Result<Vec<LoggedMessage>> {
-        let terms = search_terms(query);
+        let mut terms = search_terms(query);
+        terms.truncate(MAX_SEARCH_TERMS);
         if terms.is_empty() {
             return Ok(Vec::new());
         }
 
-        let mut scored: Vec<(usize, LoggedMessage)> = self
-            .read_all(room_id)?
+        let searchable = "lower(body || ' ' || sender || ' ' || coalesce(sender_name, '') || ' ' || \
+            coalesce(response, '') || ' ' || coalesce(links_json, ''))";
+        let conditions = (0..terms.len())
+            .map(|index| format!("instr({searchable}, ?{}) > 0", index + 2))
+            .collect::<Vec<_>>()
+            .join(" OR ");
+        let sql = format!("SELECT {MESSAGE_COLUMNS} FROM messages WHERE room_id = ?1 AND ({conditions})");
+
+        let candidates = self.database.with(|connection| {
+            let mut bound: Vec<&dyn rusqlite::ToSql> = vec![&room_id];
+            bound.extend(terms.iter().map(|term| term as &dyn rusqlite::ToSql));
+
+            let mut statement = connection.prepare(&sql)?;
+            statement
+                .query_map(bound.as_slice(), |row| read_message(row, false))?
+                .filter_map(Result::transpose)
+                .collect::<rusqlite::Result<Vec<_>>>()
+        })?;
+
+        let mut scored: Vec<(usize, LoggedMessage)> = candidates
             .into_iter()
             .filter(|entry| !entry.body.trim_start().starts_with("!search"))
             .filter_map(|entry| {
@@ -299,76 +428,15 @@ impl MessageLogger {
 
         let mut matches: Vec<LoggedMessage> = scored.into_iter().map(|(_, entry)| entry).collect();
         matches.sort_by_key(|entry| entry.origin_server_ts_ms);
+
+        self.database.with(|connection| {
+            for entry in &mut matches {
+                attach_reactions(connection, entry)?;
+            }
+            Ok(())
+        })?;
         Ok(matches)
     }
-
-    fn read_all(&self, room_id: &str) -> Result<Vec<LoggedMessage>> {
-        let path = self.room_log_path(room_id);
-
-        let contents = match std::fs::read_to_string(&path) {
-            Ok(contents) => contents,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-            Err(err) => {
-                return Err(err).with_context(|| format!("failed to read room log at {}", path.display()));
-            }
-        };
-
-        let mut entries = Vec::new();
-        for (line_no, line) in contents.lines().enumerate() {
-            if line.trim().is_empty() {
-                continue;
-            }
-            match serde_json::from_str::<LoggedMessage>(line) {
-                Ok(entry) => entries.push(entry),
-                Err(err) => warn!(?err, room_id, line_no, "skipping malformed message log line"),
-            }
-        }
-
-        self.attach_reactions(room_id, &mut entries);
-        Ok(entries)
-    }
-
-    fn attach_reactions(&self, room_id: &str, entries: &mut [LoggedMessage]) {
-        let Ok(contents) = std::fs::read_to_string(self.reaction_log_path(room_id)) else {
-            return;
-        };
-
-        let mut by_target: HashMap<String, Vec<LoggedReaction>> = HashMap::new();
-        for line in contents.lines() {
-            match serde_json::from_str::<ReactionLogEntry>(line) {
-                Ok(entry) => by_target
-                    .entry(entry.target_event_id)
-                    .or_default()
-                    .push(LoggedReaction { sender_name: entry.sender_name, key: entry.key }),
-                Err(err) => warn!(?err, room_id, "skipping malformed reaction log line"),
-            }
-        }
-
-        for entry in entries {
-            if let Some(reactions) = by_target.remove(&entry.event_id) {
-                entry.reactions = reactions;
-            }
-            if let Some(reactions) = entry.response_event_id.as_ref().and_then(|id| by_target.remove(id)) {
-                entry.response_reactions = reactions;
-            }
-        }
-    }
-
-    fn reaction_log_path(&self, room_id: &str) -> PathBuf {
-        self.dir.join(format!("{}.reactions.jsonl", sanitize_filename(room_id)))
-    }
-
-    fn room_log_path(&self, room_id: &str) -> PathBuf {
-        self.dir.join(format!("{}.jsonl", sanitize_filename(room_id)))
-    }
-}
-
-/// Replaces characters that are unsafe or reserved in filenames (notably `:`, used
-/// in every Matrix room ID) with `_`, so each room maps to a stable, portable filename.
-fn sanitize_filename(raw: &str) -> String {
-    raw.chars()
-        .map(|c| if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') { c } else { '_' })
-        .collect()
 }
 
 /// Bot replies longer than this are clipped in transcripts: enough to know what it
@@ -610,9 +678,8 @@ mod tests {
         assert!(format_transcript(&[entry], "gordy").contains("[Proc] hi"));
     }
 
-    fn test_logger(label: &str) -> MessageLogger {
-        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
-        MessageLogger::open(&std::env::temp_dir().join(format!("message-log-{label}-{nanos}"))).unwrap()
+    fn test_logger(_label: &str) -> MessageLogger {
+        MessageLogger::new(Arc::new(Database::open_in_memory()))
     }
 
     fn log_line(logger: &MessageLogger, event_id: &str, sender: &str, body: &str, ts: i64, response: Option<(&str, &str)>) {
@@ -670,6 +737,68 @@ mod tests {
         let logger = test_logger("search-replies");
         log_line(&logger, "$1", "@alice:x", "pick one", 1, Some(("the blue one", "$r")));
         assert_eq!(logger.search("!r", "blue", 5).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn logging_the_same_event_twice_keeps_one_row() {
+        let logger = test_logger("duplicates");
+        log_line(&logger, "$1", "@alice:x", "hello", 1, None);
+        log_line(&logger, "$1", "@alice:x", "hello", 1, None);
+        assert_eq!(logger.recent("!r", 10).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn recent_returns_the_newest_messages_oldest_first() {
+        let logger = test_logger("recent");
+        for (index, event_id) in ["$1", "$2", "$3"].iter().enumerate() {
+            log_line(&logger, event_id, "@alice:x", "hi", index as i64, None);
+        }
+        let ids: Vec<String> = logger.recent("!r", 2).unwrap().into_iter().map(|entry| entry.event_id).collect();
+        assert_eq!(ids, vec!["$2", "$3"]);
+    }
+
+    #[test]
+    fn prompts_are_only_read_when_asked_for() {
+        let logger = test_logger("prompts");
+        let analysis = logged_message("@alice:x", "hi").analysis;
+        let prompt = PromptRecord { system: "s".to_string(), user: "u".to_string() };
+        logger
+            .log(MessageLogParams {
+                room_id: "!r",
+                event_id: "$1",
+                sender: "@alice:x",
+                sender_name: None,
+                origin_server_ts_ms: 1,
+                body: "hi",
+                has_image: false,
+                links: &[],
+                analysis: &analysis,
+                classify_prompt: Some(&prompt),
+                classify_raw_json: None,
+                response: None,
+                response_event_id: None,
+            })
+            .unwrap();
+
+        assert!(logger.recent("!r", 1).unwrap()[0].classify_prompt.is_none());
+        assert!(logger.recent_with_prompts("!r", 1).unwrap()[0].classify_prompt.is_some());
+    }
+
+    #[test]
+    fn rooms_are_kept_apart() {
+        let logger = test_logger("rooms");
+        log_line(&logger, "$1", "@alice:x", "secret", 1, None);
+        assert!(logger.recent("!other", 10).unwrap().is_empty());
+        assert!(logger.search("!other", "secret", 10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn repeated_reactions_count_once() {
+        let logger = test_logger("reaction-dupes");
+        log_line(&logger, "$1", "@alice:x", "hi", 1, None);
+        logger.log_reaction("!r", "$1", "bob", "👍").unwrap();
+        logger.log_reaction("!r", "$1", "bob", "👍").unwrap();
+        assert_eq!(logger.recent("!r", 1).unwrap()[0].reactions.len(), 1);
     }
 
     #[test]

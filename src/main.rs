@@ -1,9 +1,11 @@
 mod bot;
 mod classify;
 mod config;
+mod db;
 mod greeting;
 mod handler;
 mod ignore;
+mod legacy_import;
 mod links;
 mod llm;
 mod message_log;

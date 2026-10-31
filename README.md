@@ -2,7 +2,7 @@
 
 A Rust Matrix chat bot built on [`matrix-sdk`](https://github.com/matrix-org/matrix-rust-sdk), with TLS and E2E encryption support out of the box.
 
-It joins a configured set of rooms, logs what's said, and uses Claude to classify intent and sentiment. `!commands` dispatch to **skills**: prompt files modeled on Claude Code's Skills. Other messages get a Claude-generated reply when the bot is addressed (an `@mention`, a reply, or a message starting with its name), and greetings to the room get one on a cooldown. Replies can draw on room history, saved memories, web search, links, and images. A small built-in HTTP server exposes a status/debugging page alongside the sync loop.
+It joins a configured set of rooms, records what's said in SQLite, and uses Claude to classify intent and sentiment. `!commands` dispatch to **skills**: prompt files modeled on Claude Code's Skills. Other messages get a Claude-generated reply when the bot is addressed (an `@mention`, a reply, or a message starting with its name), and greetings to the room get one on a cooldown. Replies can draw on room history, saved memories, web search, links, and images. A small built-in HTTP server exposes a status/debugging page alongside the sync loop.
 
 ## Setup
 
@@ -66,9 +66,11 @@ Before the first start:
   host, which matters because the page shows message content with no login.
 - Set `cost_limit_usd`. Without it, nothing caps Claude API spend.
 
-**Keep the `data` directory.** It holds the bot's Matrix device, encryption keys, message
-logs, memory, and usage totals, so back it up. If it's lost, the bot logs in as a new
-device and loses access to encrypted history.
+**Keep the `data` directory.** It holds the bot's database (`bot.db`) and its Matrix
+device and encryption keys (`store/`), so back it up. If `store/` is lost, the bot logs in
+as a new device and loses access to encrypted history. Back up `bot.db` with
+`sqlite3 bot.db ".backup backup.db"` rather than copying the file while the bot runs, since
+recent writes can be in its `-wal` file.
 
 ### Updating
 
@@ -161,19 +163,20 @@ A skill file with bad frontmatter or an unrecognized `tools`/`args` entry is ski
 
 ## Notes
 
-- Session and E2E crypto state persist to `./data/store` (SQLite); `config.toml` and `data/` are git-ignored. New options are documented in `config.toml.example`. Device verification/cross-signing isn't implemented — the bot implicitly trusts devices it encounters (see `Bot::new` in `src/bot.rs` before relying on this for rooms you care about).
-- Every message is logged per-room as JSONL (`src/message_log.rs`), whether or not the bot replies to it — this is what skills like `history`/`digest`/`vibe` read from, and what the status page's room browser shows. The exception is `ignored_users` (`config.toml`): messages from those senders are dropped in `on_room_message` before any of that — no classification, no logging, no reply — so an ignored user never shows up in message history either.
+- The bot's own data lives in one SQLite database at `database_path` (`src/db.rs`): messages, reactions, facts, room summaries, and usage totals. On startup, data from older versions (`data/messages/*.jsonl`, `memory.json`, `usage.json`) is imported once and those files are left in place, ignored from then on, so they can be deleted once you're happy with the import. A version from before this can't read the database, and rolling back to one would miss anything logged since.
+- Matrix session and E2E crypto state stays separate, in `./data/store`, which matrix-sdk manages. `config.toml` and `data/` are git-ignored. New options are documented in `config.toml.example`. Device verification/cross-signing isn't implemented — the bot implicitly trusts devices it encounters (see `Bot::new` in `src/bot.rs` before relying on this for rooms you care about).
+- Every message is recorded per room (`src/message_log.rs`), whether or not the bot replies to it — this is what skills like `history`/`digest`/`vibe` read from, and what the status page's room browser shows. The exception is `ignored_users` (`config.toml`): messages from those senders are dropped in `on_room_message` before any of that — no classification, no logging, no reply — so an ignored user never shows up in message history either.
 - Addressing is decided first, in code: a message gets a Claude-generated reply when it @mentions the bot, replies to one of its messages, or starts with its name (`gordy: ...`, `gordy, ...`, `gordy what...`), whatever the classifier thought of it. A bare acknowledgement is the one exception. It gets a 👍 reaction instead. Unaddressed messages get nothing, except a greeting to the room, once per room per 5 minutes (`reply_kind` in `src/handler.rs`), and unprompted comments if those are turned on.
 - Classification (`classify_message` in `src/classify.rs`) records intent, sentiment, and entities, and spots room greetings. It doesn't run for `!commands`, and if it fails the message is still logged and still answered if addressed.
 - Chat replies (`claude-opus-5-5`) see the last 50 messages with timestamps, display names and reactions, including the bot's own replies, the message being replied to, saved facts, and notes on older chat. They can web search up to 3 times per reply when facts might be wrong or stale, at $0.01 per search, and read up to 3 links from the conversation.
-- Memory (`src/room_memory.rs`, persisted to `memory_path`): chat replies have `remember` and `forget` tools. Facts stay in the room they were learned in, and `!memories` lists them. Room summaries are saved in the same file.
+- Memory (`src/room_memory.rs`): chat replies have `remember` and `forget` tools. Facts stay in the room they were learned in, and `!memories` lists them. Room summaries are saved alongside them.
 - Images: when addressed, the bot can see an attached image, one it's replying to, or one posted in the last 5 minutes. Images are sent to Claude but not kept by the bot, and unaddressed ones cost nothing.
-- Links: pages linked in chat are fetched when posted, with no Claude cost, and the title, description, and start of the text are saved to the message log, so the bot knows what was shared without being asked. Replies get the page text for links in the message, in the message it replies to, or posted in the last 5 minutes. Set `fetch_links = false` to turn this off. Only public addresses on ports 80 and 443 are fetched: private addresses are refused in the resolver and on redirects, since anyone in a room can post a URL. Fetching does reveal the bot's IP to the linked site, and links posted in encrypted rooms are fetched and logged too. Direct links to images aren't viewed, only noted as images.
-- Reactions: a lone-emoji reply is sent as a reaction. Reactions from others are logged to `<room>.reactions.jsonl` and shown in history. Removed reactions aren't tracked.
+- Links: pages linked in chat are fetched when posted, with no Claude cost, and the title, description, and start of the text are saved with the message, so the bot knows what was shared without being asked. Replies get the page text for links in the message, in the message it replies to, or posted in the last 5 minutes. Set `fetch_links = false` to turn this off. Only public addresses on ports 80 and 443 are fetched: private addresses are refused in the resolver and on redirects, since anyone in a room can post a URL. Fetching does reveal the bot's IP to the linked site, and links posted in encrypted rooms are fetched and saved too. Direct links to images aren't viewed, only noted as images.
+- Reactions: a lone-emoji reply is sent as a reaction. Reactions from others are saved and shown in history. Removed reactions aren't tracked.
 - Each room's messages are handled one at a time, in order (`src/room_queue.rs`). Quick follow-ups from the same person are answered together, after a 1.5 second wait on addressed messages.
 - Unprompted comments are off by default. Set `interjection_chance` to turn them on; the bot can still decide to pass, and `interjection_cooldown_secs` limits them per room.
 - Replies show a typing indicator while being generated and are sent as real Matrix replies to the message that triggered them.
-- Claude API token usage and an estimated USD cost are tracked per command/reply type, persisted to `usage_state_path` so they survive restarts, and shown on the status page (`src/usage.rs`). Estimates come from a hardcoded pricing table, not fetched live, and leave out cache tokens. Set `cost_limit_usd` to stop Claude calls at a spending cap.
+- Claude API token usage and an estimated USD cost are tracked per command/reply type, saved so they survive restarts, and shown on the status page (`src/usage.rs`). Estimates come from a hardcoded pricing table, not fetched live, and leave out cache tokens. Set `cost_limit_usd` to stop Claude calls at a spending cap.
 - The status/debugging server (`src/status_server.rs`) has **no authentication** and binds to `127.0.0.1` by default — only widen `http_listen_addr` deliberately, and put it behind your own auth/reverse proxy if you do.
 - `threatflux-anthropic-sdk` is a third-party community crate, not an Anthropic-maintained SDK — pin/review it accordingly. Claude calls use its raw request method (`src/llm.rs`), since its typed builders don't cover the newer API fields.
 
@@ -196,7 +199,7 @@ Ideas for later, not commitments. See [CHANGELOG.md](CHANGELOG.md) for what's sh
 ### Reliability
 
 - Handle edited messages, which currently keep their original text in the log
-- Back up the `data` directory, which holds the bot's logs and memory
+- Automatic backups of the `data` directory
 - Track removed reactions
 
 ### Cost and performance
@@ -204,8 +207,8 @@ Ideas for later, not commitments. See [CHANGELOG.md](CHANGELOG.md) for what's sh
 - Per-user rate limits
 - Prompt caching, which means moving the timestamp out of the system prompt
 - Cheaper classification, by skipping messages that clearly don't need it or running it after the reply
-- Faster log reads, using SQLite or an in-memory buffer instead of re-reading the file
-- Log rotation
+- Pruning old prompts from the database, which are most of its size
+- Full-text search with SQLite FTS5, as history grows
 - Fuller cost tracking: price cache tokens, and show spend per day and per person
 
 ### Security and admin

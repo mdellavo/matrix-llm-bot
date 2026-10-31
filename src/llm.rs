@@ -400,10 +400,8 @@ mod tests {
             })
         }
 
-        fn tracker(label: &str) -> UsageTracker {
-            let path = std::env::temp_dir().join(format!("llm-test-{label}-{}.json", std::process::id()));
-            let _ = std::fs::remove_file(&path);
-            UsageTracker::open(&path, None).unwrap()
+        fn tracker(_label: &str) -> UsageTracker {
+            UsageTracker::open(Arc::new(crate::db::Database::open_in_memory()), None).unwrap()
         }
 
         fn request() -> CompletionRequest<'static> {

@@ -12,9 +12,11 @@ use threatflux_anthropic_sdk::Client as Anthropic;
 use tracing::{info, warn};
 
 use crate::config::Config;
+use crate::db::Database;
 use crate::greeting::GreetingCooldown;
 use crate::handler::{HandlerContext, on_reaction, on_room_message};
 use crate::ignore::IgnoredUsers;
+use crate::legacy_import::import_legacy_data;
 use crate::links::LinkFetcher;
 use crate::message_log::{MessageLogger, short_name};
 use crate::room_memory::RoomMemory;
@@ -73,11 +75,14 @@ impl Bot {
         let anthropic = Arc::new(
             Anthropic::from_env().context("failed to create Anthropic client (is ANTHROPIC_API_KEY set?)")?,
         );
-        let message_log = Arc::new(MessageLogger::open(&config.message_log_dir)?);
+        let database = Arc::new(Database::open(&config.database_path).context("failed to open the bot's database")?);
+        import_legacy_data(&database, config).context("failed to import older data files")?;
+
+        let message_log = Arc::new(MessageLogger::new(Arc::clone(&database)));
         let skills = Arc::new(SkillRegistry::load(&config.skills_dir)?);
         let tool_clients = Arc::new(ToolClients::new(config.omdb_api_key.clone()));
         let usage_tracker = Arc::new(
-            UsageTracker::open(&config.usage_state_path, config.cost_limit_usd)
+            UsageTracker::open(Arc::clone(&database), config.cost_limit_usd)
                 .context("failed to load persisted Claude API usage stats")?,
         );
         let greeting_cooldown = Arc::new(GreetingCooldown::new(crate::greeting::DEFAULT_COOLDOWN));
@@ -97,7 +102,7 @@ impl Bot {
             greeting_cooldown: Arc::clone(&greeting_cooldown),
             ignored_users: Arc::clone(&ignored_users),
             rate_limit: Arc::clone(&rate_limit),
-            memory: Arc::new(RoomMemory::open(&config.memory_path).context("failed to load the bot's memory")?),
+            memory: Arc::new(RoomMemory::new(database)),
             room_queues: Arc::new(RoomQueues::default()),
             links: Arc::new(LinkFetcher::new(config.fetch_links)?),
             interjection_chance: config.interjection_chance,

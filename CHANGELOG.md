@@ -28,6 +28,7 @@ one day of commits, newest first.
 - Replies are sent as real Matrix replies
 - Each room's messages are handled in order, and quick follow-ups from the same person are answered together
 - All Claude calls go through one layer (`src/llm.rs`)
+- Messages, reactions, facts, room summaries, and usage now live in one SQLite database (`database_path`), with older files imported automatically on startup
 - Status page numbers use commas, costs round to cents, and uptime shows days
 
 ### Fixed

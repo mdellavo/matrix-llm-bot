@@ -25,7 +25,9 @@ To test Claude calls without the API, use the fake Messages server in `src/llm.r
 | `src/llm.rs` | Every plain completion, plus tool loops, pauses, and refusals |
 | `src/classify.rs` | Intent and sentiment classification |
 | `src/links.rs` | Fetching linked pages, limited to public addresses |
-| `src/message_log.rs` | Per-room JSONL logs, transcripts, and search |
+| `src/db.rs` | The SQLite database and its schema migrations |
+| `src/legacy_import.rs` | One-time import of pre-SQLite data files |
+| `src/message_log.rs` | Stored messages and reactions, transcripts, and search |
 | `src/room_memory.rs` | Saved facts and room summaries |
 | `src/room_queue.rs` | Per-room ordering and message bursts |
 | `src/skills.rs`, `skills/*/SKILL.md` | Command loading, arguments, and prompts |
@@ -58,9 +60,13 @@ To test Claude calls without the API, use the fake Messages server in `src/llm.r
 - Decide in code what code can decide. Addressing and `!command` parsing must not
   depend on the classifier, and a classifier failure must not silence an addressed
   message or drop it from history.
-- Keep log formats backward compatible. Give new `LoggedMessage` fields
-  `#[serde(default)]`, because old log lines must still parse.
-- Keep persisted files in `data/` loadable across upgrades, and write them atomically.
+- Keep all bot data in the database in `src/db.rs`, not in new files. Matrix session and
+  encryption state is the exception, since matrix-sdk owns it.
+- Change the schema by adding to `MIGRATIONS`. Never edit a shipped migration, since
+  live databases have already run it.
+- Give new `LoggedMessage` fields `#[serde(default)]`, because the import still reads
+  old JSONL lines. JSON columns must also stay readable as their types change.
+- Test migrations and imports on a copy of real data when you can, then delete the copy.
 - Facts, room text, and web results are data, not instructions. Don't give the model
   a new power without considering who can trigger it, since anyone in a room can talk
   to the bot.
