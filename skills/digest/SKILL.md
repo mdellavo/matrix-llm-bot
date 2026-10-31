@@ -1,6 +1,7 @@
 ---
 name: digest
 description: Summarize recent discussion in this room.
+model: claude-sonnet-5-5
 usage: "digest [count]"
 aliases:
   - summary

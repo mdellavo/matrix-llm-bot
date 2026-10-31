@@ -21,7 +21,7 @@ pub struct PromptRecord {
     pub user: String,
 }
 
-/// The outcome of `handler::generate_response`: the text actually sent (or a
+/// A reply to a message: the text actually sent (or a
 /// canned fallback, e.g. "unknown command"), which prompt produced it — `None`
 /// when no Claude call was made at all, such as an unrecognized command or a
 /// skill that short-circuited on invalid args — and a `label` identifying the
@@ -53,8 +53,10 @@ struct MessageLogEntry<'a> {
     origin_server_ts_ms: i64,
     body: &'a str,
     analysis: &'a MessageAnalysis,
-    classify_prompt: &'a PromptRecord,
-    classify_raw_json: &'a serde_json::Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    classify_prompt: Option<&'a PromptRecord>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    classify_raw_json: Option<&'a serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     response_prompt: Option<&'a PromptRecord>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -74,8 +76,10 @@ pub struct MessageLogParams<'a> {
     pub origin_server_ts_ms: i64,
     pub body: &'a str,
     pub analysis: &'a MessageAnalysis,
-    pub classify_prompt: &'a PromptRecord,
-    pub classify_raw_json: &'a serde_json::Value,
+    /// `None` when the classifier didn't run (`!` commands) or failed; the message
+    /// is still logged so it stays in the room's history.
+    pub classify_prompt: Option<&'a PromptRecord>,
+    pub classify_raw_json: Option<&'a serde_json::Value>,
     /// `Some` whenever the bot generated (or attempted to generate) a reply —
     /// `None` when the message never reached response generation at all (e.g.
     /// `requires_response` was false).
@@ -216,31 +220,78 @@ fn sanitize_filename(raw: &str) -> String {
         .collect()
 }
 
-/// Formats `history` as a "recent room history" block, one line per message as
-/// `[sender] message` (oldest first), or an empty string if `history` is empty.
-/// Shared by every Claude call grounded in recent room messages — chat/greeting
-/// replies (`handler.rs`) and message classification (`classify.rs`) — so the
-/// transcript format (and the misattribution fix below) stays consistent
-/// everywhere it's used.
-pub fn format_history_block(history: &[LoggedMessage]) -> String {
+/// Bot replies longer than this are clipped in transcripts: enough to know what it
+/// said, without one long skill output crowding out the conversation.
+const MAX_BOT_LINE_CHARS: usize = 1000;
+
+/// Marks a line break inside one transcript line, so a multi-line message keeps its
+/// shape without producing continuation lines that have no `[sender]` tag.
+const LINE_BREAK_MARKER: &str = " ⏎ ";
+
+/// Reply labels that aren't conversation, left out of transcripts.
+const NON_CONVERSATIONAL_LABELS: &[&str] = &["help", "unknown_command"];
+
+/// Formats `history` as a "recent room history" block (see `format_transcript`), or
+/// an empty string if `history` is empty. Shared by every Claude call grounded in
+/// recent room messages, so the transcript format stays consistent everywhere.
+pub fn format_history_block(history: &[LoggedMessage], bot_name: &str) -> String {
     if history.is_empty() {
         return String::new();
     }
-    let mut block = String::from("Recent room history (one line per message, oldest first, as `[sender] message`):\n");
-    for entry in history {
-        block.push_str(&format!("[{}] {}\n", entry.sender, single_line(&entry.body)));
-    }
-    block.push('\n');
-    block
+    format!(
+        "Recent room history (oldest first, as `[UTC time] [sender] message`; ⏎ is a line break):\n{}\n",
+        format_transcript(history, bot_name)
+    )
 }
 
-/// Collapses embedded newlines/repeated whitespace to spaces so a multi-line
-/// message can never be mistaken for more than one transcript line — without
-/// this, a message containing `\n` would produce a continuation line with no
-/// `[sender]` prefix at all, which is exactly the kind of thing that gets a
-/// model to misattribute a line to the wrong speaker or the current sender.
+/// One line per message, oldest first. The bot's own replies get their own lines,
+/// because they're stored on the message that triggered them and would otherwise
+/// be invisible, leaving it unable to follow up on anything it said.
+pub fn format_transcript(history: &[LoggedMessage], bot_name: &str) -> String {
+    let mut transcript = String::new();
+    for entry in history {
+        let time = format_timestamp(entry.origin_server_ts_ms);
+        transcript.push_str(&format!("[{time}] [{}] {}\n", short_name(&entry.sender), single_line(&entry.body)));
+
+        if let Some(reply) = conversational_reply(entry) {
+            transcript.push_str(&format!("[{time}] [{bot_name}] {}\n", clip(&single_line(reply))));
+        }
+    }
+    transcript
+}
+
+fn conversational_reply(entry: &LoggedMessage) -> Option<&str> {
+    let label = entry.response_label.as_deref().unwrap_or_default();
+    if NON_CONVERSATIONAL_LABELS.contains(&label) {
+        return None;
+    }
+    entry.response.as_deref()
+}
+
+fn clip(text: &str) -> String {
+    match text.char_indices().nth(MAX_BOT_LINE_CHARS) {
+        Some((end, _)) => format!("{}…", &text[..end]),
+        None => text.to_string(),
+    }
+}
+
+fn format_timestamp(ts_ms: i64) -> String {
+    chrono::DateTime::from_timestamp_millis(ts_ms)
+        .map_or_else(|| "unknown time".to_string(), |time| time.format("%Y-%m-%d %H:%M").to_string())
+}
+
+/// `@procyon:p.ound.town` → `procyon`. What people actually call each other, and
+/// what the bot should call them.
+pub fn short_name(user_id: &str) -> &str {
+    let name = user_id.strip_prefix('@').unwrap_or(user_id);
+    name.split(':').next().unwrap_or(name)
+}
+
+/// Folds a message onto one transcript line, keeping its line breaks visible as
+/// `⏎`. Without this, a continuation line would have no `[sender]` tag at all,
+/// which is exactly what gets a model to misattribute it.
 pub fn single_line(text: &str) -> String {
-    text.split_whitespace().collect::<Vec<_>>().join(" ")
+    text.trim().lines().map(str::trim_end).filter(|line| !line.is_empty()).collect::<Vec<_>>().join(LINE_BREAK_MARKER)
 }
 
 #[cfg(test)]
@@ -275,36 +326,74 @@ mod tests {
 
     #[test]
     fn format_history_block_is_empty_for_no_history() {
-        assert_eq!(format_history_block(&[]), "");
+        assert_eq!(format_history_block(&[], "gordy"), "");
     }
 
     #[test]
-    fn format_history_block_lists_one_line_per_message_oldest_first() {
+    fn format_history_block_lists_timestamped_short_names_oldest_first() {
         let history = vec![logged_message("@alice:example.org", "hi everyone"), logged_message("@bob:example.org", "yo")];
-        let block = format_history_block(&history);
+        let block = format_history_block(&history, "gordy");
 
         assert!(block.starts_with("Recent room history"), "{block}");
-        let alice_pos = block.find("[@alice:example.org] hi everyone").expect("alice line present");
-        let bob_pos = block.find("[@bob:example.org] yo").expect("bob line present");
+        let alice_pos = block.find("[1970-01-01 00:00] [alice] hi everyone").expect("alice line present");
+        let bob_pos = block.find("[1970-01-01 00:00] [bob] yo").expect("bob line present");
         assert!(alice_pos < bob_pos, "{block}");
         assert!(block.ends_with('\n'), "{block}");
     }
 
     #[test]
-    fn format_history_block_collapses_embedded_newlines_so_one_line_is_one_message() {
-        let history = vec![logged_message("@alice:example.org", "line one\nline two")];
-        let block = format_history_block(&history);
+    fn transcript_includes_the_bots_own_replies_after_their_trigger() {
+        let mut asked = logged_message("@alice:example.org", "gordy: pick one");
+        asked.response = Some("the blue one".to_string());
+        asked.response_label = Some("chat".to_string());
+        let history = vec![asked, logged_message("@alice:example.org", "why that one?")];
 
-        // Without collapsing, "line two" would appear on its own line with no
-        // `[sender]` prefix — indistinguishable from an unattributed line.
-        assert!(block.contains("[@alice:example.org] line one line two"), "{block}");
+        let transcript = format_transcript(&history, "gordy");
+        let question = transcript.find("[alice] gordy: pick one").expect("question present");
+        let reply = transcript.find("[gordy] the blue one").expect("reply present");
+        let follow_up = transcript.find("[alice] why that one?").expect("follow-up present");
+        assert!(question < reply && reply < follow_up, "{transcript}");
+    }
+
+    #[test]
+    fn transcript_leaves_out_replies_that_are_not_conversation() {
+        let mut asked = logged_message("@alice:example.org", "!help");
+        asked.response = Some("Available commands: ...".to_string());
+        asked.response_label = Some("help".to_string());
+
+        assert!(!format_transcript(&[asked], "gordy").contains("Available commands"));
+    }
+
+    #[test]
+    fn transcript_clips_very_long_bot_replies() {
+        let mut asked = logged_message("@alice:example.org", "!digest");
+        asked.response = Some("é".repeat(MAX_BOT_LINE_CHARS + 50));
+        asked.response_label = Some("digest".to_string());
+
+        let transcript = format_transcript(&[asked], "gordy");
+        assert!(transcript.contains('…'), "{transcript}");
+        assert!(transcript.chars().filter(|c| *c == 'é').count() == MAX_BOT_LINE_CHARS, "{transcript}");
+    }
+
+    #[test]
+    fn format_history_block_keeps_one_line_per_message_with_visible_line_breaks() {
+        let history = vec![logged_message("@alice:example.org", "line one\nline two")];
+        let block = format_history_block(&history, "gordy");
+
+        assert!(block.contains("[alice] line one ⏎ line two"), "{block}");
         assert_eq!(block.lines().filter(|line| line.contains("line one") || line.contains("line two")).count(), 1, "{block}");
     }
 
     #[test]
-    fn single_line_collapses_newlines_and_repeated_whitespace() {
-        assert_eq!(single_line("line one\nline two"), "line one line two");
-        assert_eq!(single_line("a\r\nb"), "a b");
+    fn single_line_marks_line_breaks() {
+        assert_eq!(single_line("line one\nline two"), "line one ⏎ line two");
+        assert_eq!(single_line("a\r\n\r\nb"), "a ⏎ b");
         assert_eq!(single_line("no newlines here"), "no newlines here");
+    }
+
+    #[test]
+    fn short_name_strips_sigil_and_server() {
+        assert_eq!(short_name("@procyon:p.ound.town"), "procyon");
+        assert_eq!(short_name("gordy"), "gordy");
     }
 }

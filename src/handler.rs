@@ -6,54 +6,129 @@ use matrix_sdk::{
     event_handler::Ctx,
     room::Room,
     ruma::{
-        UserId,
-        events::Mentions,
+        EventId, UserId,
         events::room::message::{
-            MessageType, OriginalSyncRoomMessageEvent, Relation, RoomMessageEventContent,
+            AddMentions, ForwardThread, MessageType, OriginalSyncRoomMessageEvent, Relation, ReplyMetadata,
+            RoomMessageEventContent,
         },
     },
 };
 use threatflux_anthropic_sdk::Client as Anthropic;
-use threatflux_anthropic_sdk::builders::message_builder::MessageBuilder;
-use threatflux_anthropic_sdk::models::{ContentBlock, Tool};
 use tracing::{debug, info, warn};
 
 use crate::classify::{ClassifyOutcome, Intent, MessageAnalysis, classify_message};
 use crate::greeting::GreetingCooldown;
 use crate::ignore::IgnoredUsers;
-use crate::message_log::{self, GeneratedReply, LoggedMessage, MessageLogParams, MessageLogger, PromptRecord};
+use crate::llm::{self, CompletionRequest};
+use crate::message_log::{
+    self, GeneratedReply, LoggedMessage, MessageLogParams, MessageLogger, PromptRecord, short_name,
+};
+use crate::room_memory::RoomSummaries;
 use crate::skills::{self, SkillRegistry};
-use crate::throttle::{RATE_LIMITED_REPLY, Throttle, is_rate_limited};
+use crate::throttle::{RATE_LIMITED_REPLY, Throttle};
 use crate::tools::ToolClients;
 use crate::usage::{COST_LIMIT_REPLY, UsageTracker};
 
-const UNKNOWN_COMMAND_REPLY: &str = "Unknown command. Try \"help\" to see available commands.";
+const UNKNOWN_COMMAND_REPLY: &str = "Unknown command. Try \"!help\" to see available commands.";
 
-/// Whether `generate_response` will actually produce a reply for this message,
-/// without doing any of the work of producing one. The single source of truth
-/// for both `generate_response`'s own dispatch and `on_room_message`'s decision
-/// to show a typing indicator — the indicator should only appear for messages
-/// the bot is actually about to answer, not every message that reaches
-/// classification, so it can't just be inlined separately in both places.
-///
-/// A `Command` whose `message_text` starts with `!` always gets a reply (see
-/// `generate_response`'s doc comment for why the prefix is required).
-/// `Intent::Greeting` bypasses `directed_at_bot` entirely — ported from gordy,
-/// which replied to any greeting from anyone in the room, not just ones
-/// addressed to the bot — gated instead by `should_greet` (the room's
-/// `GreetingCooldown`, checked exactly once by the caller; see
-/// `GreetingCooldown::try_greet`). Every other case — including a would-be
-/// command *without* its `!`, which falls back to plain chat handling — gets a
-/// reply only when `directed_at_bot` is true; `Acknowledgement` never gets one
-/// either way.
-fn will_generate_response(analysis: &MessageAnalysis, message_text: &str, directed_at_bot: bool, should_greet: bool) -> bool {
-    if analysis.intent == Intent::Command && message_text.trim_start().starts_with('!') {
-        return true;
+const GENERATION_FAILED_REPLY: &str = "Sorry, I couldn't come up with a reply to that.";
+
+/// A `!command` split into its name and the text after it. Commands are parsed here
+/// rather than by the classifier, so they work the same every time and still work
+/// when the classifier is down.
+#[derive(Debug, PartialEq, Eq)]
+struct ParsedCommand<'a> {
+    name: &'a str,
+    args: &'a str,
+}
+
+fn parse_command(message_text: &str) -> Option<ParsedCommand<'_>> {
+    let rest = message_text.trim_start().strip_prefix('!')?;
+    if !rest.starts_with(|c: char| c.is_alphanumeric()) {
+        return None;
     }
-    if analysis.intent == Intent::Greeting {
-        return should_greet;
+    let (name, args) = rest.split_once(char::is_whitespace).unwrap_or((rest, ""));
+    Some(ParsedCommand { name, args: args.trim() })
+}
+
+/// How the bot should answer a non-command message, if at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReplyKind {
+    Chat,
+    Greeting,
+}
+
+/// Addressing comes first: a message aimed at the bot gets answered whatever the
+/// classifier made of it, because the classifier can't tell it was addressed. The
+/// one exception is a bare acknowledgement ("thanks", "lol"), which ends a
+/// conversation rather than continuing it. Greetings to the room are the only thing
+/// answered unprompted, limited by the room's `GreetingCooldown`.
+fn reply_kind(analysis: &MessageAnalysis, directed_at_bot: bool, greeting_allowed: bool) -> Option<ReplyKind> {
+    if directed_at_bot {
+        return (analysis.intent != Intent::Acknowledgement).then_some(ReplyKind::Chat);
     }
-    analysis.intent != Intent::Acknowledgement && directed_at_bot
+    (analysis.intent == Intent::Greeting && analysis.requires_response && greeting_allowed).then_some(ReplyKind::Greeting)
+}
+
+/// Whether plain text addresses the bot by name: `gordy: hi`, `gordy, hi`,
+/// `@gordy hi`, `gordy what time is it`. A bare `gordy:` with nothing after it isn't
+/// a message, and `gordys` or `gordy's` is a different word.
+fn addresses_bot_by_name(message_text: &str, bot_name: &str) -> bool {
+    let text = message_text.trim_start();
+    let text = text.strip_prefix('@').unwrap_or(text);
+
+    let Some(prefix) = text.get(..bot_name.len()) else {
+        return false;
+    };
+    if !prefix.eq_ignore_ascii_case(bot_name) {
+        return false;
+    }
+
+    let rest = &text[bot_name.len()..];
+    let Some(next) = rest.chars().next() else {
+        return false;
+    };
+    let separated = next.is_whitespace() || next == ':' || next == ',';
+    separated && rest.chars().any(|c| c.is_alphanumeric())
+}
+
+/// Drops the `> <@user> quoted text` block older clients put at the top of a reply's
+/// body. The quote is passed separately as `RepliedTo`, and leaving it in would make
+/// the message look like it says something it doesn't.
+fn strip_reply_fallback(body: &str) -> &str {
+    if !body.starts_with("> ") {
+        return body;
+    }
+    match body.split_once("\n\n") {
+        Some((quote, rest)) if quote.lines().all(|line| line.starts_with('>')) => rest,
+        _ => body,
+    }
+}
+
+/// The message a reply points at.
+struct RepliedTo {
+    sender: String,
+    body: Option<String>,
+}
+
+/// Fetches the message `event` replies to, if it is a reply.
+async fn replied_to(event: &OriginalSyncRoomMessageEvent, room: &Room) -> Option<RepliedTo> {
+    let Some(Relation::Reply(reply)) = &event.content.relates_to else {
+        return None;
+    };
+
+    match room.event(&reply.in_reply_to.event_id, None).await {
+        Ok(target) => {
+            let sender = target.kind.sender()?.to_string();
+            let content = target.kind.raw().get_field::<serde_json::Value>("content").ok().flatten();
+            let body = content.and_then(|content| content["body"].as_str().map(String::from));
+            Some(RepliedTo { sender, body })
+        }
+        Err(err) => {
+            warn!(?err, room = %room.room_id(), "failed to fetch replied-to event");
+            None
+        }
+    }
 }
 
 /// How often to refresh the room's typing indicator while a response is being
@@ -64,9 +139,8 @@ const TYPING_REFRESH_INTERVAL: Duration = Duration::from_secs(3);
 
 /// Keeps a room's typing indicator active for as long as it's alive, by looping
 /// `Room::typing_notice(true)` in the background. `on_room_message` only starts
-/// one once `will_generate_response` confirms a reply is actually coming — not
-/// for every message that reaches classification — then `stop`s it explicitly
-/// once the response is ready (clearing the indicator immediately). If a
+/// one once a reply is actually coming — not for every message it sees — then
+/// `stop`s it explicitly once the response is ready (clearing the indicator immediately). If a
 /// `TypingIndicator` is ever dropped without `stop` being called, that still
 /// aborts the refresh loop and lets the indicator expire on its own within
 /// `TYPING_REFRESH_INTERVAL`, rather than looping forever.
@@ -121,9 +195,9 @@ pub struct HandlerContext {
     pub greeting_cooldown: Arc<GreetingCooldown>,
     pub ignored_users: Arc<IgnoredUsers>,
     pub rate_limit: Arc<Throttle>,
-    /// The bot's own Matrix login username (`Config::username`), substituted
-    /// into `CHAT_SYSTEM_PROMPT`'s `{bot_name}` placeholder so it knows its
-    /// own identity — see `generate_grounded_reply`.
+    pub room_summaries: Arc<RoomSummaries>,
+    /// The bot's short name (`gordy`): what it's called in prompts and transcripts,
+    /// and what people type to address it.
     pub bot_name: String,
 }
 
@@ -131,21 +205,6 @@ pub struct HandlerContext {
 /// receives in a room it has joined. `Ctx<Arc<HandlerContext>>` is injected via
 /// `Client::add_event_handler_context` in `bot.rs`.
 pub async fn on_room_message(event: OriginalSyncRoomMessageEvent, room: Room, client: Client, Ctx(ctx): Ctx<Arc<HandlerContext>>) {
-    // Cloning out into identically-typed locals (cheap — just Arc refcount
-    // bumps) rather than writing `ctx.foo` everywhere below keeps this
-    // function's body unchanged from before the bundling.
-    let HandlerContext {
-        anthropic,
-        message_log,
-        skills,
-        tool_clients,
-        usage_tracker,
-        greeting_cooldown,
-        ignored_users,
-        rate_limit,
-        bot_name,
-    } = (*ctx).clone();
-
     if room.state() != RoomState::Joined {
         return;
     }
@@ -157,7 +216,7 @@ pub async fn on_room_message(event: OriginalSyncRoomMessageEvent, room: Room, cl
 
     // Ignored users are dropped before anything else — no classification, no
     // logging, no reply — so they never show up in message history either.
-    if ignored_users.contains(event.sender.as_str()) {
+    if ctx.ignored_users.contains(event.sender.as_str()) {
         debug!(room = %room.room_id(), sender = %event.sender, "ignoring message from ignored user");
         return;
     }
@@ -169,33 +228,30 @@ pub async fn on_room_message(event: OriginalSyncRoomMessageEvent, room: Room, cl
 
     info!(room = %room.room_id(), sender = %event.sender, "received message");
 
-    // Fetched before this message is itself logged (which now happens once,
-    // at the end of this function, after any response is generated), so it
-    // never appears in its own classification context.
-    let classify_history = match message_log.recent(room.room_id().as_str(), CLASSIFY_HISTORY_LIMIT) {
-        Ok(history) => history,
-        Err(err) => {
-            warn!(?err, room = %room.room_id(), "failed to load room history for classification; classifying without it");
-            Vec::new()
-        }
-    };
+    let reply_target = replied_to(&event, &room).await;
+    let body = if reply_target.is_some() { strip_reply_fallback(&text_content.body) } else { text_content.body.as_str() };
 
-    let ClassifyOutcome { analysis, prompt: classify_prompt, raw_json: classify_raw_json } = match classify_message(
-        &anthropic,
-        &text_content.body,
-        event.sender.as_str(),
-        &classify_history,
-        &skills.command_reference(),
-        &usage_tracker,
-        &rate_limit,
-    )
-    .await
-    {
-        Ok(outcome) => outcome,
-        Err(err) => {
-            warn!(?err, room = %room.room_id(), "failed to classify message");
-            return;
-        }
+    let command = parse_command(body);
+    let mentioned = client.user_id().is_some_and(|own_id| {
+        event.content.mentions.as_ref().is_some_and(|mentions| mentions.user_ids.contains(own_id))
+    });
+    let replied_to_bot = reply_target
+        .as_ref()
+        .is_some_and(|target| client.user_id().is_some_and(|own_id| own_id.as_str() == target.sender));
+    let directed_at_bot = mentioned || replied_to_bot || addresses_bot_by_name(body, &ctx.bot_name);
+
+    // Started before classification when a reply is already certain, so the wait for
+    // the classifier shows as typing too.
+    let mut typing = (command.is_some() || directed_at_bot).then(|| TypingIndicator::start(room.clone()));
+
+    let classification = match command {
+        Some(_) => None,
+        None => classify(&ctx, &room, body, event.sender.as_str()).await,
+    };
+    let analysis = match &classification {
+        Some(outcome) => outcome.analysis.clone(),
+        None if command.is_some() => MessageAnalysis::unclassified(Intent::Command, "A bot command."),
+        None => MessageAnalysis::unclassified(Intent::Other, "Not classified."),
     };
 
     debug!(
@@ -206,58 +262,39 @@ pub async fn on_room_message(event: OriginalSyncRoomMessageEvent, room: Room, cl
         "classified message"
     );
 
-    // `None` unless a response is actually attempted below — kept as a single
-    // `Option<GeneratedReply>` so there's exactly one `message_log.log` call
-    // (further down) covering every case: no response needed, not directed at
-    // the bot, or a real generated reply.
-    let response = if !analysis.requires_response {
-        None
-    } else {
-        let directed_at_bot = is_directed_at_bot(&event, &room, &client).await;
+    // The greeting cooldown is only consulted for a greeting that isn't addressed to
+    // the bot: `try_greet` consumes the cooldown, and a direct message shouldn't.
+    let greeting_allowed = !directed_at_bot
+        && analysis.intent == Intent::Greeting
+        && analysis.requires_response
+        && ctx.greeting_cooldown.try_greet(room.room_id().as_str());
+    let kind = reply_kind(&analysis, directed_at_bot, greeting_allowed);
 
-        // Checked (and, if true, consumed) exactly once per message here — see
-        // `GreetingCooldown::try_greet`'s doc comment on why calling it twice
-        // would be wrong — then threaded into both the typing-indicator gate
-        // below and `generate_response`, rather than each re-deriving it
-        // separately.
-        let should_greet = analysis.intent == Intent::Greeting && greeting_cooldown.try_greet(room.room_id().as_str());
+    if kind.is_some() && typing.is_none() {
+        typing = Some(TypingIndicator::start(room.clone()));
+    }
 
-        let typing = will_generate_response(&analysis, &text_content.body, directed_at_bot, should_greet)
-            .then(|| TypingIndicator::start(room.clone()));
-
-        let response = generate_response(
-            &room,
-            &analysis,
-            &text_content.body,
-            event.sender.as_str(),
-            directed_at_bot,
-            should_greet,
-            &anthropic,
-            &message_log,
-            &skills,
-            &tool_clients,
-            &usage_tracker,
-            &rate_limit,
-            &bot_name,
-        )
-        .await;
-
-        if let Some(typing) = typing {
-            typing.stop(&room).await;
+    let response = match (&command, kind) {
+        (Some(command), _) => Some(handle_command(&ctx, &room, command, body).await),
+        (None, Some(kind)) => {
+            Some(generate_grounded_reply(&ctx, &room, kind, body, event.sender.as_str(), reply_target.as_ref()).await)
         }
-
-        response
+        (None, None) => None,
     };
 
-    if let Err(err) = message_log.log(MessageLogParams {
+    if let Some(typing) = typing {
+        typing.stop(&room).await;
+    }
+
+    if let Err(err) = ctx.message_log.log(MessageLogParams {
         room_id: room.room_id().as_str(),
         event_id: event.event_id.as_str(),
         sender: event.sender.as_str(),
         origin_server_ts_ms: event.origin_server_ts.get().into(),
-        body: &text_content.body,
+        body,
         analysis: &analysis,
-        classify_prompt: &classify_prompt,
-        classify_raw_json: &classify_raw_json,
+        classify_prompt: classification.as_ref().map(|outcome| &outcome.prompt),
+        classify_raw_json: classification.as_ref().map(|outcome| &outcome.raw_json),
         response: response.as_ref(),
     }) {
         warn!(?err, room = %room.room_id(), "failed to write message log entry");
@@ -265,7 +302,7 @@ pub async fn on_room_message(event: OriginalSyncRoomMessageEvent, room: Room, cl
 
     match response {
         Some(response) => {
-            if let Err(err) = send_message(&room, &event.sender, &response.text).await {
+            if let Err(err) = send_message(&room, &event.event_id, &event.sender, &response.text).await {
                 warn!(?err, room = %room.room_id(), "failed to send response");
             }
         }
@@ -273,352 +310,229 @@ pub async fn on_room_message(event: OriginalSyncRoomMessageEvent, room: Room, cl
     }
 }
 
-/// Whether `event` explicitly addresses the bot: either a Matrix `m.mentions`
-/// pingback naming its user ID, or a reply to one of the bot's own prior
-/// messages. This is Matrix-native addressing data the classifier never sees
-/// (`classify_message` only gets the message body) — used to keep the bot from
-/// jumping into ambient conversation between humans that merely sounds like it
-/// wants a reply. Cheap in the common case: the mention check is free, and the
-/// reply check only does a network fetch when the message is actually a reply.
-async fn is_directed_at_bot(event: &OriginalSyncRoomMessageEvent, room: &Room, client: &Client) -> bool {
-    let Some(own_user_id) = client.user_id() else {
-        return false;
-    };
-
-    if let Some(mentions) = &event.content.mentions
-        && mentions.user_ids.contains(own_user_id)
-    {
-        return true;
-    }
-
-    let Some(Relation::Reply(reply)) = &event.content.relates_to else {
-        return false;
-    };
-
-    match room.event(&reply.in_reply_to.event_id, None).await {
-        Ok(replied_to) => replied_to.kind.sender().as_deref() == Some(own_user_id),
-        Err(err) => {
-            warn!(?err, room = %room.room_id(), "failed to fetch replied-to event while checking bot addressing");
-            false
-        }
-    }
-}
-
-/// Produces a response to a classified message.
-///
-/// `Intent::Command` is only dispatched to a loaded skill (or the built-in `help`,
-/// or an "unknown command" reply — see `handle_command`) when `message_text` itself
-/// starts with `!`: the classifier can recognize command *intent* from natural
-/// language alone ("strain gsc" as much as "!strain gsc"), but running a skill off
-/// of that guess is too easy to trigger by accident in ordinary chat, so the literal
-/// prefix is required as a deterministic, LLM-independent gate on top of it. A
-/// message classified as a command but missing the prefix falls through to the
-/// same handling as any other intent, below.
-///
-/// `Intent::Greeting` (ported from gordy — see `GreetingCooldown`) gets a fun,
-/// Claude-generated greeting (see `generate_greeting_reply`) whenever
-/// `should_greet` is true, regardless of `directed_at_bot` — gordy replied to
-/// any greeting from anyone in the room, not just ones addressed to the bot.
-///
-/// Every other intent (and a would-be command without its `!`) gets a real
-/// Claude-generated conversational reply (see `generate_chat_reply`), but only
-/// when `directed_at_bot` is true (an explicit `@mention` or a reply to one of the
-/// bot's own messages — see `is_directed_at_bot`); otherwise the bot stays quiet
-/// rather than jumping into ambient conversation between humans. `Acknowledgement`
-/// never gets a reply either way — "ok"/"thanks"/"lol" doesn't need one.
-#[allow(clippy::too_many_arguments)]
-async fn generate_response(
-    room: &Room,
-    analysis: &MessageAnalysis,
-    message_text: &str,
-    sender: &str,
-    directed_at_bot: bool,
-    should_greet: bool,
-    anthropic: &Anthropic,
-    message_log: &MessageLogger,
-    skills: &SkillRegistry,
-    tool_clients: &ToolClients,
-    usage_tracker: &UsageTracker,
-    rate_limit: &Throttle,
-    bot_name: &str,
-) -> Option<GeneratedReply> {
-    if !will_generate_response(analysis, message_text, directed_at_bot, should_greet) {
-        return None;
-    }
-
-    if analysis.intent == Intent::Command && message_text.trim_start().starts_with('!') {
-        return Some(
-            handle_command(
-                room,
-                analysis,
-                message_text,
-                anthropic,
-                message_log,
-                skills,
-                tool_clients,
-                usage_tracker,
-                rate_limit,
-            )
-            .await,
-        );
-    }
-
-    if analysis.intent == Intent::Greeting {
-        return Some(
-            generate_greeting_reply(room, message_text, sender, anthropic, message_log, usage_tracker, rate_limit, bot_name)
-                .await,
-        );
-    }
-
-    Some(generate_chat_reply(room, message_text, sender, anthropic, message_log, usage_tracker, rate_limit, bot_name).await)
-}
-
-/// Number of recent room messages fed into `generate_chat_reply` as context, so
-/// its replies can call back to what people actually said — running jokes, a
-/// specific user's own history in the room — instead of replying in a vacuum.
-const CHAT_HISTORY_LIMIT: usize = 20;
-
-/// Number of recent room messages fed into `classify_message` as context.
-/// Smaller than `CHAT_HISTORY_LIMIT` since classification runs on every
-/// message the bot sees (not just ones it replies to), so its per-call token
-/// cost matters more at volume — just enough for the classifier to make sense
-/// of short replies like "yeah" or "gsc" without ballooning the common case.
-const CLASSIFY_HISTORY_LIMIT: usize = 10;
-
-/// System prompt for the bot's free-form conversational replies (as opposed to a
-/// skill's prompt or the classifier's structured tool call) — informative and
-/// helpful first, with a light, mildly snarky sense of humor woven in, rather
-/// than a formal-assistant tone or (an earlier, dialed-back version of this
-/// prompt) a mean/dark roasting personality.
-///
-/// `{bot_name}` is substituted with the bot's own Matrix username, and
-/// `{room_context}` with the room's name/topic and the current time (see
-/// `room_context_line`), both in `generate_grounded_reply` — telling it its
-/// own identity and where/when it is, rather than replying with no sense of
-/// either.
-const CHAT_SYSTEM_PROMPT: &str = "You are {bot_name}, a member of this Matrix chat room, replying to a \
-message addressed to you (an @mention or a reply to one of your own messages). {room_context}\n\n\
-Be genuinely informative and helpful first, with a light, mildly snarky sense of humor woven in — a dry \
-aside or wry observation, not the whole reply.\n\n\
-You'll get the room's recent history as one line per message, `[sender] message`, oldest first, then the \
-message you're actually replying to on its own, labeled with its own sender. Treat each `[sender]` tag as \
-the one and only source of truth for who said that line: never merge two lines together, move a line's \
-content to a different sender, or confuse the person you're replying to with anyone earlier in the \
-history. Call back to the history (a running joke, something a specific person said) only when it clearly \
-supports it — never invent or misattribute anything.\n\n\
-Keep it good-natured: no targeting protected traits, no genuinely cutting remarks meant to actually hurt \
-someone, no inventing personal details not in the history.\n\n\
-You have a web search tool — only use it when explicitly asked to search or look something up (e.g. \
-\"search for...\", \"look up...\", \"google...\"); otherwise answer from what you know or say you're not \
-sure.\n\n\
-Keep it brief (a sentence or two) unless the message clearly calls for more.";
-
-/// Label Claude API calls from `generate_chat_reply` are recorded under in `UsageTracker`.
-const CHAT_USAGE_LABEL: &str = "chat";
-
-/// Model used for `generate_chat_reply`'s and `generate_greeting_reply`'s
-/// Claude-generated replies — its own constant (rather than reusing
-/// `classify::MODEL` directly) so both can be tuned independently of the
-/// classifier without touching every other caller that defaults to
-/// `classify::MODEL`.
-const CHAT_MODEL: &str = "claude-opus-4-8";
-
-/// System prompt for greeting replies (`generate_greeting_reply`) — ported from
-/// gordy's greeting behavior (any greeting from anyone in the room got a random
-/// word echoed back from a fixed list; see `GreetingCooldown`), but with an
-/// actual generated reply instead of an echo, and distinctly warmer/more
-/// unreservedly fun than `CHAT_SYSTEM_PROMPT`'s "informative first, mild snark"
-/// tone — a greeting isn't the place for snark.
-///
-/// `{bot_name}` and `{room_context}` are substituted the same way as in
-/// `CHAT_SYSTEM_PROMPT` — see its doc comment.
-const GREETING_SYSTEM_PROMPT: &str = "You are {bot_name}, a member of this Matrix chat room, and someone \
-just greeted the room (\"hi\", \"good morning\", etc.) — not necessarily addressed at you specifically. \
-{room_context}\n\n\
-Reply with a genuinely fun, warm, friendly greeting of your own: upbeat, welcoming, maybe a little \
-playful. Don't just echo the same greeting back flatly.\n\n\
-You'll get the room's recent history as one line per message, `[sender] message`, oldest first, then the \
-greeting you're actually replying to on its own, labeled with its own sender. Treat each `[sender]` tag \
-as the one and only source of truth for who said that line: never merge two lines together or move a \
-line's content to a different sender. Call back to the history (greeting someone by their actual name \
-from it, referencing what's going on) only when it clearly supports it — a simple enthusiastic greeting \
-is fine on its own if there's nothing to call back to.\n\n\
-Keep it SHORT — anywhere from a single word/exclamation (\"Heyyy!\") up to one short sentence at most. \
-Never more than one sentence.";
-
-/// Label Claude API calls from `generate_greeting_reply` are recorded under in `UsageTracker`.
-const GREETING_USAGE_LABEL: &str = "greeting";
-
-/// Generates a free-form conversational reply to a message directed at the bot,
-/// grounded in the room's recent history (`MessageLogger::recent`) and who sent
-/// the message, using `CHAT_MODEL` — see `generate_response` and `CHAT_SYSTEM_PROMPT`.
-#[allow(clippy::too_many_arguments)]
-async fn generate_chat_reply(
-    room: &Room,
-    message_text: &str,
-    sender: &str,
-    anthropic: &Anthropic,
-    message_log: &MessageLogger,
-    usage_tracker: &UsageTracker,
-    rate_limit: &Throttle,
-    bot_name: &str,
-) -> GeneratedReply {
-    generate_grounded_reply(
-        room,
-        message_text,
-        sender,
-        CHAT_SYSTEM_PROMPT,
-        CHAT_USAGE_LABEL,
-        CHAT_MODEL,
-        vec![Tool::web_search()],
-        bot_name,
-        anthropic,
-        message_log,
-        usage_tracker,
-        rate_limit,
-    )
-    .await
-}
-
-/// Generates a fun, Claude-written greeting in reply to someone greeting the
-/// room, using `CHAT_MODEL` — see `generate_response` and `GREETING_SYSTEM_PROMPT`.
-/// No tools — a greeting never needs to look anything up.
-#[allow(clippy::too_many_arguments)]
-async fn generate_greeting_reply(
-    room: &Room,
-    message_text: &str,
-    sender: &str,
-    anthropic: &Anthropic,
-    message_log: &MessageLogger,
-    usage_tracker: &UsageTracker,
-    rate_limit: &Throttle,
-    bot_name: &str,
-) -> GeneratedReply {
-    generate_grounded_reply(
-        room,
-        message_text,
-        sender,
-        GREETING_SYSTEM_PROMPT,
-        GREETING_USAGE_LABEL,
-        CHAT_MODEL,
-        Vec::new(),
-        bot_name,
-        anthropic,
-        message_log,
-        usage_tracker,
-        rate_limit,
-    )
-    .await
-}
-
-/// Shared implementation behind `generate_chat_reply` and `generate_greeting_reply`:
-/// sends `message_text` (plus the room's recent history, via `format_chat_turn`) to
-/// Claude under `system_prompt`, recording usage under `usage_label`. The only
-/// difference between the two callers is which persona/prompt, label, model, and
-/// server-side `tools` (e.g. web search for chat, none for greetings) they pass.
-#[allow(clippy::too_many_arguments)]
-async fn generate_grounded_reply(
-    room: &Room,
-    message_text: &str,
-    sender: &str,
-    system_prompt: &str,
-    usage_label: &str,
-    model: &str,
-    tools: Vec<Tool>,
-    bot_name: &str,
-    anthropic: &Anthropic,
-    message_log: &MessageLogger,
-    usage_tracker: &UsageTracker,
-    rate_limit: &Throttle,
-) -> GeneratedReply {
-    if usage_tracker.over_cost_limit() {
-        return GeneratedReply::plain(COST_LIMIT_REPLY, usage_label);
-    }
-    if rate_limit.remaining().is_some() {
-        return GeneratedReply::plain(RATE_LIMITED_REPLY, usage_label);
-    }
-
-    let system_prompt =
-        system_prompt.replace("{bot_name}", bot_name).replace("{room_context}", &room_context_line(room));
-
-    // `on_room_message` logs the current message only after this call returns,
-    // so `recent` never includes it — no dedup needed here.
-    let history = match message_log.recent(room.room_id().as_str(), CHAT_HISTORY_LIMIT) {
+/// Classifies a message, returning `None` on failure. A failed classification costs
+/// only the analysis: the message is still logged, and still answered if addressed.
+async fn classify(ctx: &HandlerContext, room: &Room, body: &str, sender: &str) -> Option<ClassifyOutcome> {
+    // Fetched before this message is logged, so it's never in its own context.
+    let history = match ctx.message_log.recent(room.room_id().as_str(), CLASSIFY_HISTORY_LIMIT) {
         Ok(history) => history,
         Err(err) => {
-            warn!(?err, room = %room.room_id(), "failed to load chat history for reply; replying without it");
+            warn!(?err, room = %room.room_id(), "failed to load room history for classification; classifying without it");
             Vec::new()
         }
     };
 
-    let user_turn = format_chat_turn(&history, sender, message_text);
+    match classify_message(&ctx.anthropic, body, sender, &history, &ctx.bot_name, &ctx.usage_tracker, &ctx.rate_limit).await {
+        Ok(outcome) => Some(outcome),
+        Err(err) => {
+            warn!(?err, room = %room.room_id(), "failed to classify message");
+            None
+        }
+    }
+}
+
+/// Number of recent room messages sent verbatim with a chat reply.
+const CHAT_HISTORY_LIMIT: usize = 50;
+
+/// Number of messages read from the log for a chat reply. Those beyond
+/// `CHAT_HISTORY_LIMIT` are only seen through `RoomSummaries`.
+const CHAT_LOG_WINDOW: usize = 250;
+
+/// Number of recent room messages fed into `classify_message` as context. Smaller
+/// than `CHAT_HISTORY_LIMIT` since classification runs on every message.
+const CLASSIFY_HISTORY_LIMIT: usize = 10;
+
+/// Model for chat and greeting replies.
+const CHAT_MODEL: &str = "claude-opus-5-5";
+
+/// Covers the reply plus thinking, which counts toward this on current models and
+/// can't be turned off on `CHAT_MODEL`.
+const CHAT_MAX_TOKENS: u32 = 8000;
+const GREETING_MAX_TOKENS: u32 = 2000;
+
+/// Enough to check a fact and follow up once or twice, at $0.01 per search.
+const CHAT_MAX_SEARCHES: u32 = 3;
+
+/// Label Claude API calls for chat replies are recorded under in `UsageTracker`.
+const CHAT_USAGE_LABEL: &str = "chat";
+
+/// Label Claude API calls for greetings are recorded under in `UsageTracker`.
+const GREETING_USAGE_LABEL: &str = "greeting";
+
+/// System prompt for conversational replies. `{bot_name}` and `{room_context}` are
+/// substituted in `generate_grounded_reply`.
+const CHAT_SYSTEM_PROMPT: &str = "You are {bot_name}, a long-time regular in this Matrix chat room. You're \
+one of the group, not an assistant, and people talk to you the way they talk to each other. {room_context}
+
+Lead with the answer. Your first sentence should be the thing they wanted, with no greeting, no restating the \
+question, and no praising it. Match the length to the message: a line or two for banter, as much as it takes \
+for a real question. Say something specific enough that it could be wrong.
+
+When asked for an opinion or a pick, pick one and say why. Don't survey both sides unless they asked for that. \
+If you don't know, say so plainly. Never invent facts, and never claim to remember something that isn't in the \
+history below.
+
+You're funny the way a sharp friend is: dry, specific to what was just said, and only when something's actually \
+there. A joke that could be pasted under any message isn't worth making, and most replies don't need one. The \
+room is crude and likes to give you a hard time, so swearing and trash talk are fine and you can give it back. \
+Keep it among friends: nothing about protected traits, nothing meant to really hurt, no made-up personal details.
+
+The conversation is in the user turn: recent history with timestamps, possibly notes on older chat, then the \
+message to answer. Each `[name]` tag says exactly who wrote that line, and lines tagged [{bot_name}] are things \
+you said, so stand by them, build on them, or admit a mistake. Timestamps show what's live and what's stale, so \
+don't treat an old conversation as if it's still going. Use the history when it's relevant and ignore it when \
+it isn't.
+
+Use web search when the answer depends on facts you could have wrong or that may have changed: news, sports, \
+prices, product specs, release dates, anything recent or checkable. Skip it for banter, opinions, and things \
+that are settled. Give the result in your own voice without narrating that you searched.
+
+Write like a chat message: plain text, no headers, a list only if the content really is a list. Examples of \
+the tone:
+
+[someone] pineapple on pizza?
+Yes. Sweet and salty is a solved problem and the objections are tribal.
+
+[someone] you good?
+Running, which is the bar.
+
+[someone] fuck you
+Bold talk from someone who needs a bot to win arguments.
+
+[someone] should i use tcp or udp for a game server
+UDP for movement, TCP or a reliable layer on top for anything that can't be lost. A dropped position update is \
+stale in 50ms anyway, and retransmitting it just adds lag.";
+
+/// System prompt for answering a greeting aimed at the whole room. `{bot_name}` and
+/// `{room_context}` are substituted the same way as in `CHAT_SYSTEM_PROMPT`.
+const GREETING_SYSTEM_PROMPT: &str = "You are {bot_name}, a long-time regular in this Matrix chat room, and \
+someone just greeted the room. {room_context}
+
+Say hi back the way a friend who's glad to see them would. One short sentence at most, and a word or two is \
+often better. Use their name if it reads naturally, and mention what's going on in the room only if something \
+in the recent history is worth mentioning. Don't echo their greeting back flatly, and don't use exclamation \
+points like a greeter at a store.
+
+The user turn has recent history as `[UTC time] [name] message` lines, then the greeting. Each tag says exactly \
+who wrote that line, and lines tagged [{bot_name}] are things you said.";
+
+/// Generates a reply grounded in the room's recent history and the message it's
+/// answering. Chat replies also get notes on older chat and web search; greetings
+/// get neither, since a hello doesn't need them.
+async fn generate_grounded_reply(
+    ctx: &HandlerContext,
+    room: &Room,
+    kind: ReplyKind,
+    message_text: &str,
+    sender: &str,
+    reply_target: Option<&RepliedTo>,
+) -> GeneratedReply {
+    let (template, label) = match kind {
+        ReplyKind::Chat => (CHAT_SYSTEM_PROMPT, CHAT_USAGE_LABEL),
+        ReplyKind::Greeting => (GREETING_SYSTEM_PROMPT, GREETING_USAGE_LABEL),
+    };
+
+    if ctx.usage_tracker.over_cost_limit() {
+        return GeneratedReply::plain(COST_LIMIT_REPLY, label);
+    }
+    if ctx.rate_limit.remaining().is_some() {
+        return GeneratedReply::plain(RATE_LIMITED_REPLY, label);
+    }
+
+    let system_prompt = template.replace("{bot_name}", &ctx.bot_name).replace("{room_context}", &room_context_line(room));
+
+    // `on_room_message` logs the current message only after this call returns, so
+    // the log never includes it.
+    let room_id = room.room_id().as_str();
+    let log = match ctx.message_log.recent(room_id, CHAT_LOG_WINDOW) {
+        Ok(log) => log,
+        Err(err) => {
+            warn!(?err, room = %room_id, "failed to load chat history for reply; replying without it");
+            Vec::new()
+        }
+    };
+    let (older, history) = log.split_at(log.len().saturating_sub(CHAT_HISTORY_LIMIT));
+
+    let notes = match kind {
+        ReplyKind::Chat => {
+            ctx.room_summaries
+                .summary_of(room_id, older, &ctx.bot_name, &ctx.anthropic, &ctx.usage_tracker, &ctx.rate_limit)
+                .await
+        }
+        ReplyKind::Greeting => None,
+    };
+
+    let user_turn = format_chat_turn(history, notes.as_deref(), reply_target, sender, message_text, &ctx.bot_name);
     let prompt = PromptRecord { system: system_prompt.clone(), user: user_turn.clone() };
 
-    // A tool-enabled reply's own generated tokens cover not just the answer
-    // but a search query and (if the model searches more than once) further
-    // follow-up text, so it gets more headroom than a plain completion.
-    let max_tokens = if tools.is_empty() { 512 } else { 1024 };
+    let request = match kind {
+        ReplyKind::Chat => CompletionRequest {
+            model: CHAT_MODEL,
+            system: &system_prompt,
+            user: &user_turn,
+            max_tokens: CHAT_MAX_TOKENS,
+            effort: Some("medium"),
+            web_search_max_uses: Some(CHAT_MAX_SEARCHES),
+            label,
+        },
+        ReplyKind::Greeting => CompletionRequest {
+            model: CHAT_MODEL,
+            system: &system_prompt,
+            user: &user_turn,
+            max_tokens: GREETING_MAX_TOKENS,
+            effort: Some("low"),
+            web_search_max_uses: None,
+            label,
+        },
+    };
 
-    let mut builder =
-        MessageBuilder::new().model(model).max_tokens(max_tokens).system(system_prompt.clone()).user(user_turn.clone());
-    if !tools.is_empty() {
-        builder = builder.tools(tools);
-    }
-    let params = builder.build();
-
-    let message = match anthropic.messages().create(params, None).await {
-        Ok(message) => message,
+    let text = match llm::complete(&ctx.anthropic, &request, &ctx.usage_tracker, &ctx.rate_limit).await {
+        Ok(text) => text,
         Err(err) => {
-            if is_rate_limited(&err) {
-                rate_limit.note_rate_limited();
-            }
             warn!(?err, "reply generation request to Claude failed");
-            return GeneratedReply {
-                text: "Sorry, I couldn't come up with a reply to that.".to_string(),
-                prompt: Some(prompt),
-                label: usage_label.to_string(),
-            };
+            GENERATION_FAILED_REPLY.to_string()
         }
     };
 
-    usage_tracker.record(usage_label, model, &message.usage);
-
-    let text = collect_text_blocks(message.content);
-    if !text.is_empty() {
-        debug!(
-            usage_label,
-            trigger_message = message_text,
-            system_prompt = %system_prompt,
-            user_turn = %user_turn,
-            response = %text,
-            "generated grounded reply"
-        );
-        return GeneratedReply { text, prompt: Some(prompt), label: usage_label.to_string() };
-    }
-
-    GeneratedReply {
-        text: "Sorry, I couldn't come up with a reply to that.".to_string(),
-        prompt: Some(prompt),
-        label: usage_label.to_string(),
-    }
+    debug!(label, trigger_message = message_text, response = %text, "generated grounded reply");
+    GeneratedReply { text, prompt: Some(prompt), label: label.to_string() }
 }
 
-/// Renders recent room history plus the message being replied to into the single
-/// user-turn string sent to Claude: `format_history_block`'s transcript, then the
-/// current message and who sent it.
-fn format_chat_turn(history: &[LoggedMessage], sender: &str, message_text: &str) -> String {
-    let mut turn = message_log::format_history_block(history);
-    turn.push_str(&format!("Message to reply to, from [{sender}]:\n{}", message_log::single_line(message_text)));
+/// Renders everything the model reads as the single user turn: notes on older chat,
+/// the recent transcript, what the message replies to, then the message itself. The
+/// message keeps its real line breaks since it can't be confused with a transcript
+/// line down here on its own.
+fn format_chat_turn(
+    history: &[LoggedMessage],
+    notes: Option<&str>,
+    reply_target: Option<&RepliedTo>,
+    sender: &str,
+    message_text: &str,
+    bot_name: &str,
+) -> String {
+    let mut turn = String::new();
+
+    if let Some(notes) = notes {
+        turn.push_str(&format!("Notes on older chat in this room:\n{notes}\n\n"));
+    }
+
+    turn.push_str(&message_log::format_history_block(history, bot_name));
+
+    if let Some(target) = reply_target {
+        let author = short_name(&target.sender);
+        let quoted = target.body.as_deref().map(message_log::single_line);
+        turn.push_str(&format!(
+            "This message is a reply to [{author}], who wrote: {}\n\n",
+            quoted.as_deref().unwrap_or("(text unavailable)")
+        ));
+    }
+
+    turn.push_str(&format!("Message to reply to, from [{}]:\n{}", short_name(sender), message_text.trim()));
     turn
 }
 
-/// A one-sentence orientation fact substituted into `CHAT_SYSTEM_PROMPT`'s and
-/// `GREETING_SYSTEM_PROMPT`'s `{room_context}` placeholder: the room's name
-/// and topic (if any set), plus the current time, so a reply can be grounded
-/// in more than just the raw message history — e.g. recognizing a
-/// time-sensitive question, or a room-specific topic/purpose. Mirrors the
-/// `room_info`/`current_time` skill tools (`skills::execute`), always on here
-/// rather than opt-in per skill.
+/// One orientation sentence for the system prompts: the room's name and topic, if
+/// set, and the current time, so replies can recognize a time-sensitive question.
 fn room_context_line(room: &Room) -> String {
     let room_desc = match room.topic().filter(|topic| !topic.trim().is_empty()) {
         Some(topic) => format!("\"{}\" (topic: {topic})", room.name().unwrap_or_else(|| "(unnamed room)".to_string())),
@@ -627,64 +541,28 @@ fn room_context_line(room: &Room) -> String {
             None => "(unnamed room)".to_string(),
         },
     };
-    format!("This room is {room_desc}. The current time is {} UTC.", chrono::Utc::now().to_rfc3339())
+    format!("This room is {room_desc}. The current time is {} UTC.", chrono::Utc::now().format("%Y-%m-%d %H:%M"))
 }
 
-/// Concatenates every `Text` block in `content`, in order, joined by blank
-/// lines. A tool-enabled response (e.g. `generate_chat_reply`'s web search)
-/// routinely interleaves text with a server-side tool call/result — "let me
-/// check that" before the search, the actual answer after — so returning only
-/// the first `Text` block would silently drop everything the model said once
-/// it started searching.
-fn collect_text_blocks(content: Vec<ContentBlock>) -> String {
-    content
-        .into_iter()
-        .filter_map(|block| match block {
-            ContentBlock::Text { text, .. } => Some(text),
-            _ => None,
-        })
-        .collect::<Vec<_>>()
-        .join("\n\n")
-}
-
-/// Dispatches a `Command`-intent message to the built-in `help` listing, a loaded
-/// skill (`skills::execute` — sends the skill's prompt to Claude), or a friendly
-/// "unknown command" reply if `command.name` is missing or unrecognized.
-#[allow(clippy::too_many_arguments)]
-async fn handle_command(
-    room: &Room,
-    analysis: &MessageAnalysis,
-    message_text: &str,
-    anthropic: &Anthropic,
-    message_log: &MessageLogger,
-    skills: &SkillRegistry,
-    tool_clients: &ToolClients,
-    usage_tracker: &UsageTracker,
-    rate_limit: &Throttle,
-) -> GeneratedReply {
-    let Some(command) = &analysis.command else {
-        return GeneratedReply::plain(UNKNOWN_COMMAND_REPLY, "unknown_command");
-    };
-    let Some(name) = command.name.as_deref() else {
-        return GeneratedReply::plain(UNKNOWN_COMMAND_REPLY, "unknown_command");
-    };
-
-    if name.eq_ignore_ascii_case("help") {
-        return GeneratedReply::plain(help_reply(skills), "help");
+/// Dispatches a `!command` to the built-in `help` listing or a loaded skill, or
+/// replies that it doesn't exist.
+async fn handle_command(ctx: &HandlerContext, room: &Room, command: &ParsedCommand<'_>, message_text: &str) -> GeneratedReply {
+    if command.name.eq_ignore_ascii_case("help") {
+        return GeneratedReply::plain(help_reply(&ctx.skills), "help");
     }
 
-    match skills.get(name) {
+    match ctx.skills.get(command.name) {
         Some(skill) => {
             skills::execute(
-                anthropic,
-                message_log,
-                tool_clients,
-                usage_tracker,
-                rate_limit,
+                &ctx.anthropic,
+                &ctx.message_log,
+                &ctx.tool_clients,
+                &ctx.usage_tracker,
+                &ctx.rate_limit,
                 room,
                 skill,
                 message_text,
-                command,
+                command.args,
             )
             .await
         }
@@ -715,19 +593,15 @@ fn help_reply(skills: &SkillRegistry) -> String {
     reply
 }
 
-/// Sends a message into `room`, rendering Markdown (skill prompts routinely ask
-/// Claude for `**bold**`/`# headings`/`![images](url)`) into a proper HTML
-/// `formatted_body` — plain `text_plain` would send that literal markdown syntax
-/// as unrendered text, which is exactly what most Matrix clients show it as.
-/// Sends `body` into `room` as a reply directed at `sender` — the user whose
-/// message triggered this response. Prepends an `@`-mention (a Markdown link to
-/// the user's `matrix.to` URI, which clients render as a highlighted "pill") and
-/// sets the Matrix intentional-mention field (`m.mentions`) so it actually
-/// notifies them, not just names them in the text.
-pub async fn send_message(room: &Room, sender: &UserId, body: &str) -> matrix_sdk::Result<()> {
-    let body_with_mention = format!("[{sender}](https://matrix.to/#/{sender}): {body}");
-    let content =
-        RoomMessageEventContent::text_markdown(body_with_mention).add_mentions(Mentions::with_user_ids([sender.to_owned()]));
+/// Posts `body` as a real Matrix reply to the message that prompted it, rendering
+/// Markdown into a `formatted_body` since skill prompts routinely produce it. Being a
+/// reply is what links the two in clients and notifies `sender`.
+pub async fn send_message(room: &Room, event_id: &EventId, sender: &UserId, body: &str) -> matrix_sdk::Result<()> {
+    let content = RoomMessageEventContent::text_markdown(body).make_reply_to(
+        ReplyMetadata::new(event_id, sender, None),
+        ForwardThread::No,
+        AddMentions::Yes,
+    );
     room.send(content).await?;
     Ok(())
 }
@@ -745,15 +619,7 @@ mod tests {
             sender: sender.to_string(),
             origin_server_ts_ms: 0,
             body: body.to_string(),
-            analysis: MessageAnalysis {
-                intent: Intent::Chitchat,
-                confidence: 0.9,
-                requires_response: false,
-                summary: "test".to_string(),
-                sentiment: Sentiment::Neutral,
-                entities: vec![],
-                command: None,
-            },
+            analysis: analysis(Intent::Chitchat, false),
             classify_prompt: None,
             classify_raw_json: None,
             response_prompt: None,
@@ -762,11 +628,11 @@ mod tests {
         }
     }
 
-    fn analysis_with_intent(intent: Intent) -> MessageAnalysis {
+    fn analysis(intent: Intent, requires_response: bool) -> MessageAnalysis {
         MessageAnalysis {
             intent,
             confidence: 0.9,
-            requires_response: true,
+            requires_response,
             summary: "test".to_string(),
             sentiment: Sentiment::Neutral,
             entities: vec![],
@@ -775,142 +641,104 @@ mod tests {
     }
 
     #[test]
-    fn will_generate_response_requires_bang_prefix_for_commands() {
-        let analysis = analysis_with_intent(Intent::Command);
-        assert!(will_generate_response(&analysis, "!strain gsc", false, false));
-        assert!(
-            will_generate_response(&analysis, "  !strain gsc", false, false),
-            "leading whitespace before ! is still a command"
-        );
-        assert!(!will_generate_response(&analysis, "strain gsc", false, false), "no ! and not directed at bot");
+    fn parse_command_splits_name_and_args() {
+        assert_eq!(parse_command("!strain blue dream "), Some(ParsedCommand { name: "strain", args: "blue dream" }));
+        assert_eq!(parse_command("  !vibe"), Some(ParsedCommand { name: "vibe", args: "" }));
     }
 
     #[test]
-    fn will_generate_response_falls_back_to_directed_at_bot_for_bangless_commands() {
-        let analysis = analysis_with_intent(Intent::Command);
-        assert!(
-            will_generate_response(&analysis, "strain gsc", true, false),
-            "no ! but directed at bot still gets a chat reply"
-        );
+    fn parse_command_ignores_text_that_is_not_a_command() {
+        assert_eq!(parse_command("strain gsc"), None);
+        assert_eq!(parse_command("!!! wow"), None);
+        assert_eq!(parse_command("!"), None);
+        assert_eq!(parse_command("wait! what"), None);
     }
 
     #[test]
-    fn will_generate_response_requires_directed_at_bot_for_non_commands() {
-        let analysis = analysis_with_intent(Intent::Chitchat);
-        assert!(will_generate_response(&analysis, "hey what's up", true, false));
-        assert!(!will_generate_response(&analysis, "hey what's up", false, false));
+    fn directed_messages_are_answered_even_if_the_classifier_says_not_to() {
+        // "gordy: why you so sassy" really was classified this way and dropped.
+        assert_eq!(reply_kind(&analysis(Intent::Chitchat, false), true, false), Some(ReplyKind::Chat));
     }
 
     #[test]
-    fn will_generate_response_never_replies_to_acknowledgements() {
-        let analysis = analysis_with_intent(Intent::Acknowledgement);
-        assert!(!will_generate_response(&analysis, "thanks", true, true));
-        assert!(!will_generate_response(&analysis, "thanks", false, true));
+    fn a_failed_classification_does_not_silence_a_directed_message() {
+        let kind = reply_kind(&MessageAnalysis::unclassified(Intent::Other, "Not classified."), true, false);
+        assert_eq!(kind, Some(ReplyKind::Chat));
     }
 
     #[test]
-    fn will_generate_response_greetings_bypass_directed_at_bot_but_require_should_greet() {
-        let analysis = analysis_with_intent(Intent::Greeting);
-        assert!(
-            will_generate_response(&analysis, "hi everyone", false, true),
-            "a greeting not addressed at the bot still gets a reply if should_greet is true"
-        );
-        assert!(
-            !will_generate_response(&analysis, "hi everyone", true, false),
-            "should_greet false (e.g. cooldown not elapsed) refuses even if directed at the bot"
-        );
+    fn directed_greetings_ignore_the_cooldown_and_get_a_real_reply() {
+        assert_eq!(reply_kind(&analysis(Intent::Greeting, true), true, false), Some(ReplyKind::Chat));
     }
 
     #[test]
-    fn format_chat_turn_includes_history_before_the_current_message() {
-        let history = vec![logged_message("@alice:example.org", "hi everyone"), logged_message("@bob:example.org", "yo")];
-        let turn = format_chat_turn(&history, "@carol:example.org", "what's up");
-
-        let history_pos = turn.find("Recent room history").expect("history header present");
-        let alice_pos = turn.find("[@alice:example.org] hi everyone").expect("alice line present");
-        let bob_pos = turn.find("[@bob:example.org] yo").expect("bob line present");
-        let current_pos =
-            turn.find("Message to reply to, from [@carol:example.org]:\nwhat's up").expect("current message present");
-
-        assert!(history_pos < alice_pos, "{turn}");
-        assert!(alice_pos < bob_pos, "{turn}");
-        assert!(bob_pos < current_pos, "{turn}");
+    fn acknowledgements_never_get_a_reply() {
+        assert_eq!(reply_kind(&analysis(Intent::Acknowledgement, true), true, false), None);
+        assert_eq!(reply_kind(&analysis(Intent::Acknowledgement, true), false, false), None);
     }
 
     #[test]
-    fn chat_system_prompt_placeholders_are_substituted() {
-        // Locks in the contract between CHAT_SYSTEM_PROMPT's placeholder tokens
-        // and generate_grounded_reply's `.replace(...)` calls — catches a
-        // typo'd token on either side.
-        let prompt = CHAT_SYSTEM_PROMPT.replace("{bot_name}", "gordy").replace("{room_context}", "This room is \"general\".");
-        assert!(prompt.contains("You are gordy"), "{prompt}");
-        assert!(prompt.contains("This room is \"general\"."), "{prompt}");
-        assert!(!prompt.contains("{bot_name}"), "placeholder should be fully substituted: {prompt}");
-        assert!(!prompt.contains("{room_context}"), "placeholder should be fully substituted: {prompt}");
+    fn undirected_messages_stay_quiet_except_greetings_off_cooldown() {
+        assert_eq!(reply_kind(&analysis(Intent::Question, true), false, false), None);
+        assert_eq!(reply_kind(&analysis(Intent::Greeting, true), false, true), Some(ReplyKind::Greeting));
+        assert_eq!(reply_kind(&analysis(Intent::Greeting, true), false, false), None);
+        assert_eq!(reply_kind(&analysis(Intent::Greeting, false), false, true), None);
     }
 
     #[test]
-    fn greeting_system_prompt_placeholders_are_substituted() {
-        let prompt =
-            GREETING_SYSTEM_PROMPT.replace("{bot_name}", "gordy").replace("{room_context}", "This room is \"general\".");
-        assert!(prompt.contains("You are gordy"), "{prompt}");
-        assert!(prompt.contains("This room is \"general\"."), "{prompt}");
-        assert!(!prompt.contains("{bot_name}"), "placeholder should be fully substituted: {prompt}");
-        assert!(!prompt.contains("{room_context}"), "placeholder should be fully substituted: {prompt}");
+    fn name_addressing_covers_the_ways_people_type_it() {
+        for text in ["gordy: hi", "Gordy, hi", "@gordy hi", "gordy what time is it", "  gordy: you good?"] {
+            assert!(addresses_bot_by_name(text, "gordy"), "{text}");
+        }
     }
 
     #[test]
-    fn format_chat_turn_omits_history_header_when_empty() {
-        let turn = format_chat_turn(&[], "@carol:example.org", "hello");
-        assert!(!turn.contains("Recent room history"), "{turn}");
-        assert_eq!(turn, "Message to reply to, from [@carol:example.org]:\nhello");
+    fn name_addressing_rejects_other_mentions_and_empty_messages() {
+        for text in ["gordy:", "gordy", "gordy's broken", "gordys", "oh, you working on gordy", "é"] {
+            assert!(!addresses_bot_by_name(text, "gordy"), "{text}");
+        }
     }
 
     #[test]
-    fn format_chat_turn_collapses_embedded_newlines_so_one_line_is_one_message() {
-        let history = vec![logged_message("@alice:example.org", "line one\nline two"), logged_message("@bob:example.org", "yo")];
-        let turn = format_chat_turn(&history, "@carol:example.org", "what's up");
-
-        // Without collapsing, "line two" would appear on its own line with no
-        // `[sender]` prefix — indistinguishable from an unattributed turn.
-        assert!(turn.contains("[@alice:example.org] line one line two"), "{turn}");
-        assert_eq!(turn.lines().filter(|line| line.contains("line one") || line.contains("line two")).count(), 1, "{turn}");
-    }
-
-    fn text_block(text: &str) -> ContentBlock {
-        ContentBlock::Text { text: text.to_string(), citations: None, cache_control: None }
+    fn strip_reply_fallback_removes_only_a_leading_quote() {
+        assert_eq!(strip_reply_fallback("> <@a:b> hello\n> there\n\nmy reply"), "my reply");
+        assert_eq!(strip_reply_fallback("my reply"), "my reply");
+        assert_eq!(strip_reply_fallback("> just a quote"), "> just a quote");
     }
 
     #[test]
-    fn collect_text_blocks_joins_multiple_text_blocks_in_order() {
-        let content = vec![text_block("let me check that"), text_block("here's the answer")];
-        assert_eq!(collect_text_blocks(content), "let me check that\n\nhere's the answer");
+    fn format_chat_turn_orders_notes_history_reply_target_then_message() {
+        let history = vec![logged_message("@alice:example.org", "hi everyone")];
+        let target = RepliedTo { sender: "@gordy:example.org".to_string(), body: Some("the blue one".to_string()) };
+        let turn = format_chat_turn(&history, Some("alice likes blue"), Some(&target), "@carol:example.org", "why?", "gordy");
+
+        let notes = turn.find("Notes on older chat").expect("notes present");
+        let alice = turn.find("[alice] hi everyone").expect("history present");
+        let replied = turn.find("reply to [gordy], who wrote: the blue one").expect("reply target present");
+        let current = turn.find("Message to reply to, from [carol]:\nwhy?").expect("message present");
+        assert!(notes < alice && alice < replied && replied < current, "{turn}");
     }
 
     #[test]
-    fn collect_text_blocks_skips_non_text_blocks_between_text() {
-        // A web-search reply routinely interleaves text with the server-side
-        // tool call/result — those must not end up in the returned text, and
-        // must not stop collection of the text blocks that follow them.
-        let content = vec![
-            text_block("let me search for that"),
-            ContentBlock::ServerToolUse {
-                id: "srvtoolu_1".to_string(),
-                name: "web_search".to_string(),
-                input: Some(serde_json::json!({"query": "test"})),
-            },
-            text_block("here's what I found"),
-        ];
-        assert_eq!(collect_text_blocks(content), "let me search for that\n\nhere's what I found");
+    fn format_chat_turn_is_just_the_message_with_no_context() {
+        let turn = format_chat_turn(&[], None, None, "@carol:example.org", "hello", "gordy");
+        assert_eq!(turn, "Message to reply to, from [carol]:\nhello");
     }
 
     #[test]
-    fn collect_text_blocks_is_empty_for_no_text_blocks() {
-        let content = vec![ContentBlock::ServerToolUse {
-            id: "srvtoolu_1".to_string(),
-            name: "web_search".to_string(),
-            input: None,
-        }];
-        assert_eq!(collect_text_blocks(content), "");
+    fn format_chat_turn_keeps_the_messages_own_line_breaks() {
+        let turn = format_chat_turn(&[], None, None, "@carol:example.org", "fn main() {\n}", "gordy");
+        assert!(turn.ends_with("fn main() {\n}"), "{turn}");
+    }
+
+    #[test]
+    fn system_prompt_placeholders_are_substituted() {
+        for template in [CHAT_SYSTEM_PROMPT, GREETING_SYSTEM_PROMPT] {
+            let prompt = template.replace("{bot_name}", "gordy").replace("{room_context}", "This room is \"general\".");
+            assert!(prompt.contains("You are gordy"), "{prompt}");
+            assert!(prompt.contains("This room is \"general\"."), "{prompt}");
+            assert!(!prompt.contains("{bot_name}"), "{prompt}");
+            assert!(!prompt.contains("{room_context}"), "{prompt}");
+        }
     }
 }

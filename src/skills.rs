@@ -5,13 +5,12 @@ use anyhow::{Context, Result};
 use matrix_sdk::room::Room;
 use serde::Deserialize;
 use threatflux_anthropic_sdk::Client as Anthropic;
-use threatflux_anthropic_sdk::builders::message_builder::MessageBuilder;
-use threatflux_anthropic_sdk::models::ContentBlock;
 use tracing::{debug, warn};
 
-use crate::classify::{self, CommandInfo};
+use crate::classify;
+use crate::llm::{self, CompletionRequest};
 use crate::message_log::{GeneratedReply, LoggedMessage, MessageLogger, PromptRecord};
-use crate::throttle::{RATE_LIMITED_REPLY, Throttle, is_rate_limited};
+use crate::throttle::{RATE_LIMITED_REPLY, Throttle};
 use crate::tools::{self, ToolClients};
 use crate::usage::{COST_LIMIT_REPLY, UsageTracker};
 
@@ -22,6 +21,8 @@ const KNOWN_TOOLS: &[&str] =
 const RESERVED_NAME: &str = "help";
 const DEFAULT_MESSAGE_LOG_COUNT: usize = 5;
 const MAX_MESSAGE_LOG_COUNT: usize = 20;
+/// Covers the reply plus thinking, which counts toward this on current models.
+const SKILL_MAX_TOKENS: u32 = 4000;
 
 #[derive(Debug, Deserialize)]
 struct SkillFrontmatter {
@@ -108,6 +109,13 @@ pub struct Skill {
     pub model: Option<String>,
     args: Vec<ArgSpec>,
     pub prompt: String,
+}
+
+impl Skill {
+    /// The arguments in `text`, the part of a `!command` after its name.
+    pub fn parse_args(&self, text: &str) -> serde_json::Value {
+        parse_args(&self.args, text)
+    }
 }
 
 /// Commands loaded from `skills/<name>/SKILL.md` files, keyed by lowercased name.
@@ -210,38 +218,55 @@ impl SkillRegistry {
         skills.sort_by(|a, b| a.name.cmp(&b.name));
         skills
     }
+}
 
-    /// Formats every loaded skill's name, aliases, and expected `args` keys/types
-    /// into a text block for the classifier's system prompt. Without this, the
-    /// classifier has no way to know that (say) `strain` expects an arg named
-    /// `name` rather than `strain`/`query`/whatever else it might guess — it would
-    /// have to invent a key name from nothing, which `resolve_args` then rejects as
-    /// missing. Giving it the exact declared key names up front is what lets
-    /// `command.args` actually line up with each skill's schema.
-    pub fn command_reference(&self) -> String {
-        let mut lines = vec!["- help: no arguments".to_string()];
-        for skill in self.list() {
-            let mut line = format!("- {}", skill.name);
-            if !skill.aliases.is_empty() {
-                line.push_str(&format!(" (aliases: {})", skill.aliases.join(", ")));
-            }
-            if skill.args.is_empty() {
-                line.push_str(": no arguments");
-            } else {
-                let args_desc: Vec<String> = skill
-                    .args
-                    .iter()
-                    .map(|arg| {
-                        let requiredness = if arg.required { "required" } else { "optional" };
-                        format!("{} ({}, {requiredness})", arg.name, arg.kind.label())
-                    })
-                    .collect();
-                line.push_str(&format!(": args {{ {} }}", args_desc.join(", ")));
-            }
-            lines.push(line);
+/// Turns the text after a `!command` into the arguments a skill declares, without
+/// involving a model. Arguments fill in declaration order, and the last one takes
+/// whatever's left, so `!strain blue dream` gives `name` the whole phrase. Text that
+/// doesn't fit a declared type is passed through as a string, so `resolve_args`
+/// reports it the same way as any other invalid argument.
+fn parse_args(specs: &[ArgSpec], text: &str) -> serde_json::Value {
+    let mut args = serde_json::Map::new();
+    let mut remaining = text.trim();
+
+    for (index, spec) in specs.iter().enumerate() {
+        if remaining.is_empty() {
+            break;
         }
-        lines.join("\n")
+        let raw = if index + 1 == specs.len() {
+            std::mem::take(&mut remaining)
+        } else {
+            let (first, rest) = remaining.split_once(char::is_whitespace).unwrap_or((remaining, ""));
+            remaining = rest.trim_start();
+            first
+        };
+        args.insert(spec.name.clone(), parse_arg(spec.kind, raw));
     }
+
+    serde_json::Value::Object(args)
+}
+
+fn parse_arg(kind: ArgType, raw: &str) -> serde_json::Value {
+    let as_string = || serde_json::Value::String(raw.to_string());
+    match kind {
+        ArgType::String => as_string(),
+        ArgType::Integer => raw.parse::<i64>().map_or_else(|_| as_string(), serde_json::Value::from),
+        ArgType::Number => raw.parse::<f64>().map_or_else(|_| as_string(), serde_json::Value::from),
+        ArgType::Boolean => raw.parse::<bool>().map_or_else(|_| as_string(), serde_json::Value::from),
+        ArgType::Array => serde_json::Value::from(split_list(raw)),
+    }
+}
+
+/// Splits a list on commas or " or " when it has them, so multi-word options survive
+/// (`pizza, thai food or tacos`), and on whitespace otherwise.
+fn split_list(raw: &str) -> Vec<String> {
+    let separated = raw.replace(" or ", ",");
+    let items: Vec<&str> = if separated.contains(',') {
+        separated.split(',').collect()
+    } else {
+        separated.split_whitespace().collect()
+    };
+    items.iter().map(|item| item.trim()).filter(|item| !item.is_empty()).map(String::from).collect()
 }
 
 fn load_skill_file(path: &Path) -> Result<Skill> {
@@ -346,9 +371,7 @@ fn parse_skill(raw: &str) -> Result<Skill> {
 
 /// Validates and defaults `provided` against `specs`, returning a resolved args map on
 /// success or a user-facing error message (missing required argument, wrong type, or
-/// out-of-range value) on failure. Called only when a skill declares `args` at all —
-/// skills that don't are passed the classifier's raw extracted args unvalidated,
-/// preserving the original free-form behavior.
+/// out-of-range value) on failure.
 fn resolve_args(
     specs: &[ArgSpec],
     provided: &serde_json::Value,
@@ -423,7 +446,7 @@ pub async fn execute(
     room: &Room,
     skill: &Skill,
     message_text: &str,
-    command: &CommandInfo,
+    arg_text: &str,
 ) -> GeneratedReply {
     // Short-circuits before validating args or building any context — same
     // reasoning as the OMDb-key check below: there's nothing useful to say
@@ -436,13 +459,9 @@ pub async fn execute(
         return GeneratedReply::plain(RATE_LIMITED_REPLY, &skill.name);
     }
 
-    let resolved_args = if skill.args.is_empty() {
-        command.args.as_object().cloned().unwrap_or_default()
-    } else {
-        match resolve_args(&skill.args, &command.args) {
-            Ok(resolved) => resolved,
-            Err(message) => return GeneratedReply::plain(format!("Invalid arguments: {message}"), &skill.name),
-        }
+    let resolved_args = match resolve_args(&skill.args, &skill.parse_args(arg_text)) {
+        Ok(resolved) => resolved,
+        Err(message) => return GeneratedReply::plain(format!("Invalid arguments: {message}"), &skill.name),
     };
 
     let room_id = room.room_id().as_str();
@@ -557,7 +576,17 @@ pub async fn execute(
 
     let model = skill.model.as_deref().unwrap_or(classify::MODEL);
 
-    match run_prompt(anthropic, model, &skill.prompt, &user_turn, usage_tracker, &skill.name, rate_limit).await {
+    let request = CompletionRequest {
+        model,
+        system: &skill.prompt,
+        user: &user_turn,
+        max_tokens: SKILL_MAX_TOKENS,
+        effort: None,
+        web_search_max_uses: None,
+        label: &skill.name,
+    };
+
+    match llm::complete(anthropic, &request, usage_tracker, rate_limit).await {
         Ok(reply) => {
             debug!(
                 skill = %skill.name,
@@ -600,47 +629,6 @@ fn format_entry_tags(entry: &LoggedMessage) -> String {
         tags.push_str(&format!(", entities: {}", entities.join(", ")));
     }
     format!(" [{tags}]")
-}
-
-/// A plain (non-tool-forced) completion call: `system` becomes the skill's prompt,
-/// `user_message` the constructed user turn, and the first text block of the
-/// response is returned. Unlike `classify_message`, this omits `.tools()`/
-/// `.tool_choice()` entirely — there's no schema to fill in, just a generated reply.
-async fn run_prompt(
-    client: &Anthropic,
-    model: &str,
-    system: &str,
-    user_message: &str,
-    usage_tracker: &UsageTracker,
-    label: &str,
-    rate_limit: &Throttle,
-) -> Result<String> {
-    let params = MessageBuilder::new()
-        .model(model)
-        .max_tokens(1024)
-        .system(system)
-        .user(user_message)
-        .build();
-
-    let message = match client.messages().create(params, None).await {
-        Ok(message) => message,
-        Err(err) => {
-            if is_rate_limited(&err) {
-                rate_limit.note_rate_limited();
-            }
-            return Err(anyhow::Error::new(err).context("skill prompt request to Claude failed"));
-        }
-    };
-
-    usage_tracker.record(label, model, &message.usage);
-
-    for block in message.content {
-        if let ContentBlock::Text { text, .. } = block {
-            return Ok(text);
-        }
-    }
-
-    anyhow::bail!("model response did not include a text block")
 }
 
 #[cfg(test)]
@@ -1005,27 +993,40 @@ Say a friendly hello to the user.\n";
         assert_eq!(registry.list().len(), 11, "expected all eleven shipped skills to load");
     }
 
-    /// Regression test for a real bug: the classifier was given no way to learn a
-    /// skill's expected `args` key names, so it would guess a plausible-sounding
-    /// key (e.g. `strain` or `query` instead of `strain`'s declared `name`) that
-    /// `resolve_args` then rejected as missing. `command_reference`'s output is
-    /// embedded directly in the classifier's system prompt — this test locks in
-    /// that every declared arg name actually appears in it.
+    fn spec(name: &str, kind: ArgType) -> ArgSpec {
+        ArgSpec { name: name.to_string(), kind, description: None, required: false, default: None, min: None, max: None }
+    }
+
     #[test]
-    fn command_reference_lists_every_skill_and_its_declared_arg_names() {
-        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("skills");
-        let registry = SkillRegistry::load(&dir).expect("shipped skills dir should load");
+    fn parse_args_gives_a_string_argument_the_whole_phrase() {
+        let args = parse_args(&[spec("name", ArgType::String)], "  blue dream ");
+        assert_eq!(args, serde_json::json!({"name": "blue dream"}));
+    }
 
-        let reference = registry.command_reference();
+    #[test]
+    fn parse_args_reads_integers_and_leaves_bad_ones_for_resolve_args_to_reject() {
+        let specs = [spec("count", ArgType::Integer)];
+        assert_eq!(parse_args(&specs, "15"), serde_json::json!({"count": 15}));
 
-        assert!(reference.contains("- help: no arguments"));
-        assert!(reference.contains("- strain"), "{reference}");
-        assert!(reference.contains("name (string, required)"), "{reference}");
-        assert!(reference.contains("- imdb"), "{reference}");
-        assert!(reference.contains("title (string, required)"), "{reference}");
-        assert!(reference.contains("- ud (aliases: urban)"), "{reference}");
-        assert!(reference.contains("term (string, optional)"), "{reference}");
-        assert!(reference.contains("- random"), "{reference}");
-        assert!(reference.contains("choices (array of strings, required)"), "{reference}");
+        let error = resolve_args(&specs, &parse_args(&specs, "lots")).unwrap_err();
+        assert!(error.contains("must be a integer"), "{error}");
+    }
+
+    #[test]
+    fn parse_args_is_empty_when_no_text_was_given() {
+        assert_eq!(parse_args(&[spec("term", ArgType::String)], "   "), serde_json::json!({}));
+    }
+
+    #[test]
+    fn parse_args_splits_lists_on_commas_and_or_keeping_multi_word_options() {
+        let specs = [spec("choices", ArgType::Array)];
+        assert_eq!(parse_args(&specs, "thai food, pizza or tacos"), serde_json::json!({"choices": ["thai food", "pizza", "tacos"]}));
+        assert_eq!(parse_args(&specs, "red green blue"), serde_json::json!({"choices": ["red", "green", "blue"]}));
+    }
+
+    #[test]
+    fn parse_args_gives_the_last_argument_the_remainder() {
+        let specs = [spec("count", ArgType::Integer), spec("topic", ArgType::String)];
+        assert_eq!(parse_args(&specs, "5 the world cup"), serde_json::json!({"count": 5, "topic": "the world cup"}));
     }
 }

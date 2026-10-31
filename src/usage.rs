@@ -8,16 +8,19 @@ use threatflux_anthropic_sdk::models::Usage;
 use tracing::warn;
 
 /// USD price per million input/output tokens, for the models this bot might
-/// plausibly use (the default `claude-haiku-4-5` — see `classify::MODEL` — plus
+/// plausibly use (the default `claude-haiku-5-5` — see `classify::MODEL` — plus
 /// anything a skill's `model:` frontmatter could override it to). Not fetched
 /// live; keep in sync with Anthropic's published pricing if it changes, or if a
 /// skill starts using a model not listed here.
 fn price_per_million_tokens(model: &str) -> Option<(f64, f64)> {
     match model {
+        "claude-haiku-5-5" => Some((0.10, 0.50)),
         "claude-haiku-4-5" => Some((1.00, 5.00)),
-        "claude-sonnet-5" | "claude-sonnet-4-6" => Some((3.00, 15.00)),
-        "claude-opus-4-8" | "claude-opus-4-7" | "claude-opus-4-6" => Some((5.00, 25.00)),
-        "claude-fable-5" | "claude-mythos-5" => Some((10.00, 50.00)),
+        "claude-sonnet-5-5" | "claude-sonnet-5" => Some((2.00, 10.00)),
+        "claude-sonnet-4-6" => Some((3.00, 15.00)),
+        "claude-opus-5-5" => Some((4.00, 20.00)),
+        "claude-opus-5" | "claude-opus-4-8" | "claude-opus-4-7" | "claude-opus-4-6" => Some((5.00, 25.00)),
+        "claude-fable-5-1" | "claude-fable-5" | "claude-mythos-5-1" | "claude-mythos-5" => Some((10.00, 50.00)),
         _ => None,
     }
 }
@@ -322,11 +325,18 @@ mod tests {
     }
 
     #[test]
+    fn every_model_the_bot_uses_has_a_price() {
+        for model in [crate::classify::MODEL, "claude-sonnet-5-5", "claude-opus-5-5"] {
+            assert!(price_per_million_tokens(model).is_some(), "{model}");
+        }
+    }
+
+    #[test]
     fn record_adds_web_search_fees_on_top_of_token_cost() {
         let tracker = UsageTracker::open(&unique_state_path("web-search-cost"), None).expect("open tracker");
         // 100,000 input tokens @ $3.00/M + 100,000 output tokens @ $15.00/M = $1.80 for
-        // claude-sonnet-5, plus 3 web searches @ $0.01 each = $0.03.
-        tracker.record("chat", "claude-sonnet-5", &usage_with_web_searches(100_000, 100_000, 3));
+        // claude-sonnet-4-6, plus 3 web searches @ $0.01 each = $0.03.
+        tracker.record("chat", "claude-sonnet-4-6", &usage_with_web_searches(100_000, 100_000, 3));
 
         let snapshot = tracker.snapshot();
         assert!((snapshot.overall.estimated_cost_usd - 1.83).abs() < 1e-9, "{}", snapshot.overall.estimated_cost_usd);

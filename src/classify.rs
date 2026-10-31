@@ -2,33 +2,24 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use threatflux_anthropic_sdk::Client as Anthropic;
-use threatflux_anthropic_sdk::builders::message_builder::MessageBuilder;
-use threatflux_anthropic_sdk::models::{ContentBlock, MessageResponse, Tool, ToolChoice};
-use threatflux_anthropic_sdk::types::HttpMethod;
 
-use crate::message_log::{LoggedMessage, PromptRecord, format_history_block, single_line};
-use crate::throttle::{Throttle, is_rate_limited};
+use crate::llm;
+use crate::message_log::{LoggedMessage, PromptRecord, format_history_block, short_name, single_line};
+use crate::throttle::Throttle;
 use crate::usage::UsageTracker;
 
-pub const MODEL: &str = "claude-haiku-4-5";
+pub const MODEL: &str = "claude-haiku-5-5";
 const TOOL_NAME: &str = "classify_message";
 /// Label `classify_message`'s calls are recorded under in `UsageTracker`.
 pub const USAGE_LABEL: &str = "classify";
 
-const SYSTEM_PROMPT_TEMPLATE: &str = "You classify a single chat message from a Matrix room into a \
-structured record. Always respond by calling the classify_message tool exactly once. You may be \
-given the room's recent chat history for context, one line per message as `[sender] message` \
-(oldest first) — each line is a distinct message from exactly the sender named in its own \
-brackets; never attribute a line's content to any other sender. The message to classify is given \
-separately afterward, marked `Message to classify, from [sender]`; classify only that message, \
-using the history for context (e.g. a short reply like \"yeah\" or \"no\" only makes sense in \
-light of what preceded it) — never classify a history line itself or confuse its sender with the \
-message's actual sender. Base every field only on the message text you are given; do not invent \
-sender, room, or timestamp information that isn't in the text.\n\n\
-When intent is \"command\", set `command.name` to the exact command name or alias invoked, and \
-`command.args` to an object keyed by the exact argument names listed below for that command — \
-not a name you invent yourself. Only include an argument if its value actually appears in the \
-message text; never invent one. Known commands:\n{command_reference}";
+const SYSTEM_PROMPT: &str = "You classify a single chat message from a Matrix room into a structured \
+record. Always respond by calling the classify_message tool exactly once. You may be given the room's \
+recent chat history for context; each line is a distinct message from exactly the sender in its own \
+brackets. The message to classify is given separately afterward, marked `Message to classify, from \
+[sender]`. Classify only that message, using the history for context (a short reply like \"yeah\" only \
+makes sense in light of what preceded it). Base every field only on the text you are given; do not \
+invent sender, room, or timestamp information.";
 
 /// Structured analysis of a single free-text message, extracted by the LLM.
 ///
@@ -107,27 +98,33 @@ pub struct ClassifyOutcome {
     pub raw_json: serde_json::Value,
 }
 
+impl MessageAnalysis {
+    /// Stands in for classification that didn't run or failed, so the message still
+    /// gets logged and, if it was addressed to the bot, answered.
+    pub fn unclassified(intent: Intent, summary: &str) -> Self {
+        Self {
+            intent,
+            confidence: 1.0,
+            requires_response: false,
+            summary: summary.to_string(),
+            sentiment: Sentiment::Neutral,
+            entities: Vec::new(),
+            command: None,
+        }
+    }
+}
+
 /// Classifies a single message's free text into a `MessageAnalysis` by forcing
 /// the model to call the `classify_message` tool with our schema as its input.
 ///
 /// `history` (typically `MessageLogger::recent`, called before this message is
-/// itself logged) is rendered via `format_history_block` ahead of the message,
-/// giving the classifier the same room context chat/greeting replies already
-/// get — a short message like "yeah" or "gsc" is otherwise ambiguous without
-/// knowing what it's replying to.
-///
-/// `command_reference` (`SkillRegistry::command_reference`) lists every loaded
-/// command's name, aliases, and expected `args` keys, so that when the message
-/// turns out to be a command, the model extracts `command.args` under the same
-/// key names the target skill's `resolve_args` will later validate against —
-/// without it, the model has no way to know a skill expects `name` rather than
-/// `strain`/`query`/anything else it might otherwise guess.
+/// itself logged) gives short messages like "yeah" their context.
 pub async fn classify_message(
     client: &Anthropic,
     message_text: &str,
     sender: &str,
     history: &[LoggedMessage],
-    command_reference: &str,
+    bot_name: &str,
     usage_tracker: &UsageTracker,
     rate_limit: &Throttle,
 ) -> Result<ClassifyOutcome> {
@@ -138,63 +135,45 @@ pub async fn classify_message(
         anyhow::bail!("Claude API is rate-limited; not classifying for another {remaining:?}");
     }
 
-    let tool = classify_tool()?;
-    let system_prompt = SYSTEM_PROMPT_TEMPLATE.replace("{command_reference}", command_reference);
+    let mut user_turn = format_history_block(history, bot_name);
+    user_turn.push_str(&format!("Message to classify, from [{}]:\n{}", short_name(sender), single_line(message_text)));
 
-    let mut user_turn = format_history_block(history);
-    user_turn.push_str(&format!("Message to classify, from [{sender}]:\n{}", single_line(message_text)));
+    let body = request_body(&user_turn);
+    let response = llm::send(client, body, None, USAGE_LABEL, usage_tracker, rate_limit)
+        .await
+        .context("classify_message request failed")?;
 
-    let params = MessageBuilder::new()
-        .model(MODEL)
-        .max_tokens(1024)
-        .system(system_prompt.clone())
-        .user(user_turn.clone())
-        .tools(vec![tool])
-        .tool_choice(ToolChoice::Tool {
-            name: TOOL_NAME.to_string(),
-        })
-        .build();
+    let input = tool_input(&response).context("model response did not include a classify_message tool call")?;
+    let analysis = serde_json::from_value(input.clone()).context("failed to parse classify_message tool input")?;
 
-    // threatflux-anthropic-sdk 0.2.0 declares `ToolChoice` `#[serde(untagged)]`,
-    // so `ToolChoice::Tool { name }` serializes to `{"name": ...}` with no
-    // `"type"` key at all — the API then 400s with "tool_choice.type: Field
-    // required". `MessagesApi::create` does that same broken serialization
-    // internally, so work around it by serializing the request ourselves,
-    // patching `tool_choice` into the shape the API actually expects, and
-    // sending it via the SDK's raw `Client::request` instead.
-    let mut body = serde_json::to_value(&params).context("failed to serialize classify_message request")?;
-    body["tool_choice"] = json!({"type": "tool", "name": TOOL_NAME});
-
-    let message: MessageResponse = match client.request(HttpMethod::Post, "/messages", Some(body), None).await {
-        Ok(message) => message,
-        Err(err) => {
-            if is_rate_limited(&err) {
-                rate_limit.note_rate_limited();
-            }
-            return Err(anyhow::Error::new(err).context("classify_message request to Claude failed"));
-        }
-    };
-
-    usage_tracker.record(USAGE_LABEL, MODEL, &message.usage);
-
-    for block in message.content {
-        if let ContentBlock::ToolUse { name, input, .. } = block
-            && name == TOOL_NAME
-        {
-            let analysis = serde_json::from_value(input.clone()).context("failed to parse classify_message tool input")?;
-            return Ok(ClassifyOutcome {
-                analysis,
-                prompt: PromptRecord { system: system_prompt, user: user_turn },
-                raw_json: input,
-            });
-        }
-    }
-
-    anyhow::bail!("model response did not include a classify_message tool call")
+    Ok(ClassifyOutcome {
+        analysis,
+        prompt: PromptRecord { system: SYSTEM_PROMPT.to_string(), user: user_turn },
+        raw_json: input,
+    })
 }
 
-fn classify_tool() -> Result<Tool> {
-    let schema_json = json!({
+fn request_body(user_turn: &str) -> serde_json::Value {
+    json!({
+        "model": MODEL,
+        "max_tokens": 1024,
+        "system": SYSTEM_PROMPT,
+        "messages": [{"role": "user", "content": user_turn}],
+        "tools": [classify_tool()],
+        "tool_choice": {"type": "tool", "name": TOOL_NAME},
+    })
+}
+
+fn tool_input(response: &serde_json::Value) -> Option<serde_json::Value> {
+    response["content"]
+        .as_array()?
+        .iter()
+        .find(|block| block["type"] == "tool_use" && block["name"] == TOOL_NAME)
+        .map(|block| block["input"].clone())
+}
+
+fn classify_tool() -> serde_json::Value {
+    let input_schema = json!({
         "type": "object",
         "properties": {
             "intent": {
@@ -213,7 +192,7 @@ fn classify_tool() -> Result<Tool> {
             },
             "requires_response": {
                 "type": "boolean",
-                "description": "Whether the bot should reply to this message at all, as opposed to ambient chat between humans."
+                "description": "Whether this is worth a reply from a bot in the room, as opposed to ambient chat between humans. A greeting to the room counts."
             },
             "summary": {
                 "type": "string",
@@ -237,62 +216,40 @@ fn classify_tool() -> Result<Tool> {
                     },
                     "required": ["type", "value"]
                 }
-            },
-            "command": {
-                "type": "object",
-                "description": "Only populate when intent is \"command\": the command name and its arguments.",
-                "properties": {
-                    "name": { "type": ["string", "null"] },
-                    "args": { "type": "object" }
-                }
             }
         },
         "required": ["intent", "confidence", "requires_response", "summary", "sentiment", "entities"]
     });
 
-    Ok(Tool::new(
-        TOOL_NAME,
-        "Record a structured classification of the user's message.",
-        schema_json,
-    ))
+    json!({
+        "name": TOOL_NAME,
+        "description": "Record a structured classification of the user's message.",
+        "input_schema": input_schema,
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// Regression test for the `ToolChoice::Tool` serialization workaround in
-    /// `classify_message`. If this starts failing, `threatflux-anthropic-sdk`
-    /// likely fixed `ToolChoice`'s `#[serde(untagged)]` bug upstream — remove
-    /// the manual `tool_choice` patch in `classify_message` (and this test)
-    /// rather than adjusting the assertion below.
     #[test]
-    fn tool_choice_serializes_without_a_type_field_so_it_must_be_patched() {
-        let params = MessageBuilder::new()
-            .model(MODEL)
-            .max_tokens(1024)
-            .tool_choice(ToolChoice::Tool { name: TOOL_NAME.to_string() })
-            .build();
-
-        let body = serde_json::to_value(&params).expect("serialize request");
-        assert_eq!(
-            body["tool_choice"],
-            json!({ "name": TOOL_NAME }),
-            "ToolChoice's serialization changed — the manual patch in classify_message is likely no longer needed"
-        );
+    fn request_forces_the_classify_tool() {
+        let body = request_body("hello");
+        assert_eq!(body["tool_choice"], json!({"type": "tool", "name": TOOL_NAME}));
+        assert_eq!(body["tools"][0]["name"], TOOL_NAME);
     }
 
     #[test]
-    fn patched_tool_choice_matches_the_shape_the_api_expects() {
-        let params = MessageBuilder::new()
-            .model(MODEL)
-            .max_tokens(1024)
-            .tool_choice(ToolChoice::Tool { name: TOOL_NAME.to_string() })
-            .build();
+    fn tool_input_is_found_after_a_leading_thinking_block() {
+        let response = json!({"content": [
+            {"type": "thinking", "thinking": "", "signature": "x"},
+            {"type": "tool_use", "id": "1", "name": TOOL_NAME, "input": {"intent": "greeting"}},
+        ]});
+        assert_eq!(tool_input(&response), Some(json!({"intent": "greeting"})));
+    }
 
-        let mut body = serde_json::to_value(&params).expect("serialize request");
-        body["tool_choice"] = json!({"type": "tool", "name": TOOL_NAME});
-
-        assert_eq!(body["tool_choice"], json!({"type": "tool", "name": TOOL_NAME}));
+    #[test]
+    fn tool_input_is_none_without_a_tool_call() {
+        assert_eq!(tool_input(&json!({"content": []})), None);
     }
 }

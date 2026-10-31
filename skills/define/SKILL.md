@@ -1,6 +1,7 @@
 ---
 name: define
 description: Define or explain a word, term, or concept.
+model: claude-sonnet-5-5
 usage: "define <term>"
 args:
   - name: term

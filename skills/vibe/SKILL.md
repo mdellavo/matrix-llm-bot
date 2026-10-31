@@ -1,6 +1,7 @@
 ---
 name: vibe
 description: Report the overall mood of recent conversation in this room.
+model: claude-sonnet-5-5
 usage: "vibe [count]"
 tools:
   - message_log

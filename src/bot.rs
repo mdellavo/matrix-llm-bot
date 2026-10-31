@@ -15,7 +15,8 @@ use crate::config::Config;
 use crate::greeting::GreetingCooldown;
 use crate::handler::{HandlerContext, on_room_message};
 use crate::ignore::IgnoredUsers;
-use crate::message_log::MessageLogger;
+use crate::message_log::{MessageLogger, short_name};
+use crate::room_memory::RoomSummaries;
 use crate::skills::SkillRegistry;
 use crate::throttle::Throttle;
 use crate::tools::ToolClients;
@@ -94,7 +95,8 @@ impl Bot {
             greeting_cooldown: Arc::clone(&greeting_cooldown),
             ignored_users: Arc::clone(&ignored_users),
             rate_limit: Arc::clone(&rate_limit),
-            bot_name: config.username.clone(),
+            room_summaries: Arc::new(RoomSummaries::default()),
+            bot_name: short_name(&config.username).to_string(),
         }));
 
         Ok(Self { client, message_log, skills, tool_clients, usage_tracker, greeting_cooldown, ignored_users, rate_limit })

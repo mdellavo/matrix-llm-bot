@@ -1,6 +1,7 @@
 ---
 name: standup
 description: Summarize what's happened recently in this room.
+model: claude-sonnet-5-5
 usage: "standup [count]"
 tools:
   - message_log

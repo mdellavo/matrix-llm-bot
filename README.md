@@ -2,7 +2,7 @@
 
 A Rust Matrix chat bot built on [`matrix-sdk`](https://github.com/matrix-org/matrix-rust-sdk), with TLS and E2E encryption support out of the box.
 
-It joins a configured set of rooms and uses Claude to understand every message it sees — classifying intent, sentiment, and (for commands) arguments — before deciding whether and how to respond. Commands dispatch to **skills**: prompt files modeled on Claude Code's Skills. Casual messages get a real, Claude-generated reply too, but only when the bot is actually addressed (an `@mention` or a reply), except greetings, which get a fun reply regardless, on a cooldown. A small built-in HTTP server exposes a status/debugging page alongside the sync loop.
+It joins a configured set of rooms and uses Claude to understand every message it sees — classifying intent and sentiment — and decides whether to respond based on whether it was addressed. Commands dispatch to **skills**: prompt files modeled on Claude Code's Skills. Casual messages get a real, Claude-generated reply too, but only when the bot is actually addressed (an `@mention`, a reply, or a message starting with its name), except greetings, which get a fun reply regardless, on a cooldown. A small built-in HTTP server exposes a status/debugging page alongside the sync loop.
 
 ## Setup
 
@@ -69,7 +69,7 @@ Frontmatter fields:
 - `name` / `description` (required) — the command name and its one-line description in `help`.
 - `usage` (optional) — a usage hint shown alongside the description in `help`.
 - `aliases` (optional) — other names that resolve to this skill.
-- `model` (optional) — overrides which Claude model runs this skill's prompt; defaults to the classifier's model.
+- `model` (optional) — overrides which Claude model runs this skill's prompt; defaults to the classifier's cheaper model. Skills that need judgment (`digest`, `standup`, `topics`, `vibe`, `define`) use `claude-sonnet-5-5`.
 - `tools` (optional) — capabilities the skill needs; the bot fetches the relevant context and injects it before calling Claude:
   - `message_log` — that room's recent messages.
   - `room_info` — the room's ID, name, and topic.
@@ -78,7 +78,7 @@ Frontmatter fields:
   - `urban_dictionary` / `imdb_lookup` / `leafly_strain` — outbound HTTP calls to Urban Dictionary, OMDb, and Leafly, respectively (see `src/tools.rs`).
 - `args` (optional) — declares expected arguments (name, type, required/default/bounds). If declared, arguments are validated before Claude is ever called; a skill with no `args` gets the classifier's raw extracted arguments unvalidated.
 
-A command's args are extracted by the same Claude call that classifies the message (`src/classify.rs`), matched against each skill's declared argument names so the classifier doesn't have to guess them. Commands only actually dispatch when the message starts with a literal `!` — the classifier can recognize command *intent* without one, but running a skill off just that guess would be too easy to trigger by accident.
+A `!command`'s args are parsed from the text after its name, without a model: they fill the skill's declared `args` in order, with the last one taking the rest of the line. Lists split on commas or " or ", or on spaces if there are neither.
 
 Eleven skills ship as worked examples under `skills/`:
 
@@ -104,9 +104,10 @@ A skill file with bad frontmatter or an unrecognized `tools`/`args` entry is ski
 
 - Session and E2E crypto state persist to `./data/store` (SQLite); `config.toml` and `data/` are git-ignored. Device verification/cross-signing isn't implemented — the bot implicitly trusts devices it encounters (see `Bot::new` in `src/bot.rs` before relying on this for rooms you care about).
 - Every message is logged per-room as JSONL (`src/message_log.rs`), whether or not the bot replies to it — this is what skills like `history`/`digest`/`vibe` read from, and what the status page's room browser shows. The exception is `ignored_users` (`config.toml`): messages from those senders are dropped in `on_room_message` before any of that — no classification, no logging, no reply — so an ignored user never shows up in message history either.
-- Non-command replies are Claude-generated, not canned, but gated: casual chat only gets a reply when the bot is actually addressed (`@mention` or a reply-to; see `is_directed_at_bot` in `src/handler.rs`), while greetings (ported from gordy) reply to anyone, on a per-room 5-minute cooldown (`src/greeting.rs`) so a busy room doesn't get greeted on every "hi". These replies are grounded in recent room history with each message clearly attributed to its sender (`format_chat_turn` in `src/handler.rs`), so the model doesn't lose track of who said what.
-- Classification (`classify_message` in `src/classify.rs`) is also grounded in recent room history (via the same `format_history_block` used for replies, `src/message_log.rs`), so a short message like "yeah" or "gsc" is classified in light of what preceded it rather than in a vacuum — a smaller window than replies get (`CLASSIFY_HISTORY_LIMIT` in `src/handler.rs`), since classification runs on every message the bot sees, not just ones it replies to.
-- Replies show a typing indicator while being generated and are always directed at (and `@`-mention) whoever triggered them.
+- Addressing is decided first, in code: a message gets a Claude-generated reply when it @mentions the bot, replies to one of its messages, or starts with its name (`gordy: ...`, `gordy, ...`, `gordy what...`), whatever the classifier thought of it. A bare acknowledgement is the one exception. Unaddressed messages get nothing, except a greeting to the room, once per room per 5 minutes (`reply_kind` in `src/handler.rs`).
+- Classification (`classify_message` in `src/classify.rs`) records intent, sentiment, and entities, and spots room greetings. It doesn't run for `!commands`, and if it fails the message is still logged and still answered if addressed.
+- Chat replies (`claude-opus-5-5`) see the last 50 messages with timestamps, including the bot's own replies, the message being replied to, and notes on older chat (`src/room_memory.rs`, rebuilt after a restart). They can web search up to 3 times per reply when facts might be wrong or stale, at $0.01 per search.
+- Replies show a typing indicator while being generated and are sent as real Matrix replies to the message that triggered them.
 - Claude API token usage and an estimated USD cost are tracked in-memory per command/reply type and exposed on the status page (`src/usage.rs`) — cost estimates are based on a hardcoded pricing table, not fetched live.
 - The status/debugging server (`src/status_server.rs`) has **no authentication** and binds to `127.0.0.1` by default — only widen `http_listen_addr` deliberately, and put it behind your own auth/reverse proxy if you do.
 - `anthropic-sdk-rust` is a third-party community crate, not an Anthropic-maintained SDK — pin/review it accordingly.

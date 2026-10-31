@@ -546,8 +546,8 @@ mod tests {
                 origin_server_ts_ms: 1_000,
                 body: "hello there",
                 analysis: &test_analysis("alice says hi"),
-                classify_prompt: &classify_prompt,
-                classify_raw_json: &classify_raw_json,
+                classify_prompt: Some(&classify_prompt),
+                classify_raw_json: Some(&classify_raw_json),
                 response: None,
             })
             .expect("log message 1");
@@ -564,8 +564,8 @@ mod tests {
                 origin_server_ts_ms: 2_000,
                 body: "hi alice",
                 analysis: &test_analysis("bob says hi"),
-                classify_prompt: &classify_prompt,
-                classify_raw_json: &classify_raw_json,
+                classify_prompt: Some(&classify_prompt),
+                classify_raw_json: Some(&classify_raw_json),
                 response: Some(&reply),
             })
             .expect("log message 2");

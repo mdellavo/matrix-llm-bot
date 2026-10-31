@@ -1,6 +1,7 @@
 ---
 name: topics
 description: Show what's been discussed recently in this room.
+model: claude-sonnet-5-5
 usage: "topics [count]"
 tools:
   - message_log
