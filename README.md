@@ -117,3 +117,49 @@ A skill file with bad frontmatter or an unrecognized `tools`/`args` entry is ski
 - Claude API token usage and an estimated USD cost are tracked in-memory per command/reply type and exposed on the status page (`src/usage.rs`) — cost estimates are based on a hardcoded pricing table, not fetched live.
 - The status/debugging server (`src/status_server.rs`) has **no authentication** and binds to `127.0.0.1` by default — only widen `http_listen_addr` deliberately, and put it behind your own auth/reverse proxy if you do.
 - `anthropic-sdk-rust` is a third-party community crate, not an Anthropic-maintained SDK — pin/review it accordingly.
+
+## Roadmap
+
+Ideas for later, not commitments. See [CHANGELOG.md](CHANGELOG.md) for what's shipped.
+
+### Quality
+
+- Build a test set from real replies, so prompt and model changes can be measured
+- Use 👍/👎 reactions on bot messages as feedback on which replies landed
+- Tune tone, reply length, and search use from live results
+
+### Features
+
+- Reminders: "gordy, remind me Friday to..."
+- Scheduled posts, such as a daily digest or a catch-up on what someone missed
+- Threads and DMs: keep replies inside threads, and decide how DMs should work
+
+### Reliability
+
+- Handle edited messages, which currently keep their original text in the log
+- Back up the `data` directory, which holds the bot's logs and memory
+- Track removed reactions
+
+### Cost and performance
+
+- Per-user rate limits
+- Prompt caching, which means moving the timestamp out of the system prompt
+- Cheaper classification, by skipping messages that clearly don't need it or running it after the reply
+- Faster log reads, using SQLite or an in-memory buffer instead of re-reading the file
+- Log rotation
+- Fuller cost tracking: price cache tokens, and show spend per day and per person
+
+### Security and admin
+
+- Login for the status page
+- Device verification instead of trusting all devices
+- Stronger limits on prompt injection from web results and room text
+- Admin commands to ignore a user, reload skills, or show spend from chat
+
+### Deployment
+
+- Keep the bot's service definition in the deploy config
+- Deploy pinned tags or commits, not `main`
+- CI for tests and clippy on every push
+- Alerts for sync failures, Claude errors, and spend
+- Replace the third-party Anthropic SDK with a small HTTP client, now that calls are raw HTTP

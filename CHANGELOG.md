@@ -1,0 +1,123 @@
+# Changelog
+
+Notable changes to matrix-llm-bot, built from the git history. Each version covers
+one day of commits, newest first.
+
+## 0.11.0 - 2026-10-31
+
+### Added
+
+- Long-term memory: chat replies can save and delete facts, kept per room, and `!memories` lists them
+- Reading links from the conversation with web fetch
+- Image understanding for attached, replied-to, and just-posted images
+- Reactions: lone-emoji replies are posted as reactions, addressed thanks get a 👍, and people's reactions appear in history
+- `!search` over the room's whole log, and a `web_search` tool for skills, used by `!define`
+- Optional unprompted comments, off by default (`interjection_chance`, `interjection_cooldown_secs`)
+- Notes on older chat, which persist across restarts along with saved facts (`memory_path`)
+- Display names in history and logs
+- Web search whenever facts may be wrong or stale, capped at 3 per reply
+
+### Changed
+
+- Models: `claude-opus-5-5` for chat and greetings, `claude-sonnet-5-5` for skills that need judgment, and `claude-haiku-5-5` for classification and everything else
+- Addressing is decided in code first: mentions, replies to the bot, and messages starting with its name are answered whatever the classifier decided
+- `!commands` are parsed without a model
+- Chat replies see the last 50 messages, with timestamps, plus the message being replied to
+- Rewrote the chat and greeting prompts
+- Replies are sent as real Matrix replies
+- Each room's messages are handled in order, and quick follow-ups from the same person are answered together
+- All Claude calls go through one layer (`src/llm.rs`)
+
+### Fixed
+
+- The bot couldn't see its own replies, so it couldn't follow up on what it had said
+- Skills couldn't see the bot's replies either
+- Directed greetings could go unanswered during the greeting cooldown
+- Paused and cut-off replies were posted incomplete, and refusals went unhandled
+- Narration before a search was posted, and cited sentences were split apart
+- Messages were lost from history when classification failed
+- Updated out-of-date model prices
+
+## 0.10.0 - 2026-08-17
+
+### Added
+
+- Chat and greeting replies know the bot's identity and the room's name, topic, and current time
+
+## 0.9.0 - 2026-08-07
+
+### Changed
+
+- Chat web search is limited to explicit user requests
+
+## 0.8.0 - 2026-07-31
+
+### Fixed
+
+- `classify_message` failing with a 400 error, "tool_choice.type: Field required"
+
+## 0.7.0 - 2026-07-30
+
+### Added
+
+- Claude API usage persists across restarts
+- Throttling after a rate limit
+- Hard cost limit for Claude API calls (`cost_limit_usd`)
+- Web search tool for chat
+- Web search usage breakdown on the status page
+
+## 0.6.0 - 2026-07-29
+
+### Changed
+
+- Switched to `threatflux-anthropic-sdk` with rustls and dropped vendored OpenSSL
+
+## 0.5.0 - 2026-07-25
+
+### Added
+
+- Ignored-users config
+- Dedicated model for chat and greeting replies
+- Reply logging
+- Classification grounded in recent room history
+- Classification and reply prompts recorded and shown on the status page
+
+## 0.4.0 - 2026-07-22
+
+### Fixed
+
+- Ambiguous speaker attribution in chat history context
+
+## 0.3.0 - 2026-07-21
+
+### Added
+
+- Usage cost estimates
+- Greeting behavior ported from the older gordy bot
+
+### Changed
+
+- Shorter greeting replies and a simpler README
+
+### Fixed
+
+- Docker build failing on missing pkg-config and OpenSSL
+
+## 0.2.0 - 2026-07-20
+
+### Added
+
+- Commands ported from the older gordy bot
+- Claude usage tracking
+- Claude-generated chat replies
+- Dockerfile for building and deploying with Docker Compose
+
+### Changed
+
+- User experience polish
+
+## 0.1.0 - 2026-07-18
+
+### Added
+
+- Initial release: Matrix bot with Claude-powered message classification and skills
