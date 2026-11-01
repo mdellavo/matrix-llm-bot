@@ -31,6 +31,24 @@ fn price_per_million_tokens(model: &str) -> Option<(f64, f64)> {
     }
 }
 
+/// What a 5-minute cache write costs relative to normal input, on every model.
+const CACHE_WRITE_MULTIPLIER: f64 = 1.25;
+
+/// USD price per million tokens read from the prompt cache. Usually a tenth of the
+/// input price, but the newest models are set separately.
+fn cache_read_price(model: &str, input_price: f64) -> f64 {
+    match model {
+        "claude-opus-5-5" => 0.20,
+        "claude-sonnet-5-5" => 0.10,
+        "claude-fable-5-1" | "claude-mythos-5-1" => 0.25,
+        _ => input_price * 0.1,
+    }
+}
+
+fn per_million(tokens: u32, price: f64) -> f64 {
+    (f64::from(tokens) / 1_000_000.0) * price
+}
+
 /// Estimated USD cost of one completion's tokens, or `None` if `model` isn't
 /// in `price_per_million_tokens`'s table. Excludes server-side tool fees (e.g.
 /// web search) — added separately in `UsageTotals::add` since they don't
@@ -38,8 +56,20 @@ fn price_per_million_tokens(model: &str) -> Option<(f64, f64)> {
 fn estimate_cost_usd(model: &str, usage: &Usage) -> Option<f64> {
     let (input_price, output_price) = price_per_million_tokens(model)?;
     Some(
-        (f64::from(usage.input_tokens) / 1_000_000.0) * input_price
-            + (f64::from(usage.output_tokens) / 1_000_000.0) * output_price,
+        per_million(usage.input_tokens, input_price)
+            + per_million(usage.output_tokens, output_price)
+            + per_million(usage.cache_read_input_tokens, cache_read_price(model, input_price))
+            + per_million(usage.cache_creation_input_tokens, input_price * CACHE_WRITE_MULTIPLIER),
+    )
+}
+
+/// What caching changed about one completion's cost compared to sending those tokens
+/// normally: reads save money and writes cost a little extra, so this can be negative.
+fn cache_savings_usd(model: &str, usage: &Usage) -> Option<f64> {
+    let (input_price, _) = price_per_million_tokens(model)?;
+    Some(
+        per_million(usage.cache_read_input_tokens, input_price - cache_read_price(model, input_price))
+            - per_million(usage.cache_creation_input_tokens, input_price * (CACHE_WRITE_MULTIPLIER - 1.0)),
     )
 }
 
@@ -89,6 +119,16 @@ pub struct UsageTotals {
     /// `web_search_requests`.
     #[serde(default)]
     pub web_search_cost_usd: f64,
+    /// Input tokens served from the prompt cache. Not included in `input_tokens`, which
+    /// the API reports as only what wasn't cached.
+    #[serde(default)]
+    pub cache_read_tokens: u64,
+    /// Input tokens written to the prompt cache, also not in `input_tokens`.
+    #[serde(default)]
+    pub cache_write_tokens: u64,
+    /// Net saving from caching: see `cache_savings_usd`.
+    #[serde(default)]
+    pub cache_saved_usd: f64,
 }
 
 impl UsageTotals {
@@ -104,6 +144,9 @@ impl UsageTotals {
         self.input_tokens += u64::from(usage.input_tokens);
         self.output_tokens += u64::from(usage.output_tokens);
         self.request_count += 1;
+        self.cache_read_tokens += u64::from(usage.cache_read_input_tokens);
+        self.cache_write_tokens += u64::from(usage.cache_creation_input_tokens);
+        self.cache_saved_usd += cache_savings_usd(model, usage).unwrap_or(0.0);
 
         let web_search_requests = web_search_request_count(usage);
         let search_cost = f64::from(web_search_requests) * WEB_SEARCH_PRICE_PER_REQUEST;
@@ -234,7 +277,8 @@ impl UsageTracker {
 fn load_totals(connection: &Connection) -> rusqlite::Result<Vec<(String, UsageTotals)>> {
     let mut statement = connection.prepare(
         "SELECT label, input_tokens, output_tokens, request_count, estimated_cost_usd, unpriced_requests, \
-         web_search_requests, web_search_cost_usd FROM usage_totals",
+         web_search_requests, web_search_cost_usd, cache_read_tokens, cache_write_tokens, cache_saved_usd \
+         FROM usage_totals",
     )?;
     statement
         .query_map([], |row| {
@@ -248,6 +292,9 @@ fn load_totals(connection: &Connection) -> rusqlite::Result<Vec<(String, UsageTo
                     unpriced_requests: row.get::<_, i64>(5)? as u64,
                     web_search_requests: row.get::<_, i64>(6)? as u64,
                     web_search_cost_usd: row.get(7)?,
+                    cache_read_tokens: row.get::<_, i64>(8)? as u64,
+                    cache_write_tokens: row.get::<_, i64>(9)? as u64,
+                    cache_saved_usd: row.get(10)?,
                 },
             ))
         })?
@@ -258,11 +305,14 @@ pub fn save_totals(connection: &Connection, label: &str, totals: &UsageTotals) -
     connection
         .execute(
             "INSERT INTO usage_totals (label, input_tokens, output_tokens, request_count, estimated_cost_usd, \
-             unpriced_requests, web_search_requests, web_search_cost_usd) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) \
+             unpriced_requests, web_search_requests, web_search_cost_usd, cache_read_tokens, cache_write_tokens, \
+             cache_saved_usd) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11) \
              ON CONFLICT (label) DO UPDATE SET input_tokens = excluded.input_tokens, \
              output_tokens = excluded.output_tokens, request_count = excluded.request_count, \
              estimated_cost_usd = excluded.estimated_cost_usd, unpriced_requests = excluded.unpriced_requests, \
-             web_search_requests = excluded.web_search_requests, web_search_cost_usd = excluded.web_search_cost_usd",
+             web_search_requests = excluded.web_search_requests, web_search_cost_usd = excluded.web_search_cost_usd, \
+             cache_read_tokens = excluded.cache_read_tokens, cache_write_tokens = excluded.cache_write_tokens, \
+             cache_saved_usd = excluded.cache_saved_usd",
             params![
                 label,
                 totals.input_tokens as i64,
@@ -272,6 +322,9 @@ pub fn save_totals(connection: &Connection, label: &str, totals: &UsageTotals) -
                 totals.unpriced_requests as i64,
                 totals.web_search_requests as i64,
                 totals.web_search_cost_usd,
+                totals.cache_read_tokens as i64,
+                totals.cache_write_tokens as i64,
+                totals.cache_saved_usd,
             ],
         )
         .context("failed to save usage totals")?;
@@ -284,6 +337,34 @@ mod tests {
 
     fn test_db() -> Arc<Database> {
         Arc::new(Database::open_in_memory())
+    }
+
+    #[test]
+    fn prices_cache_reads_and_writes_and_tracks_the_saving() {
+        let tracker = UsageTracker::open(test_db(), None).unwrap();
+        let mut cached = usage(1_000_000, 0);
+        cached.cache_read_input_tokens = 1_000_000;
+        cached.cache_creation_input_tokens = 1_000_000;
+        tracker.record("chat", "claude-opus-5-5", &cached);
+
+        let overall = tracker.snapshot().overall;
+        // $4 input + $0.20 read + $5 write.
+        assert!((overall.estimated_cost_usd - 9.20).abs() < 1e-9, "{}", overall.estimated_cost_usd);
+        // $3.80 saved on the read, less the $1 write premium.
+        assert!((overall.cache_saved_usd - 2.80).abs() < 1e-9, "{}", overall.cache_saved_usd);
+        assert_eq!((overall.input_tokens, overall.cache_read_tokens, overall.cache_write_tokens), (1_000_000, 1_000_000, 1_000_000));
+    }
+
+    #[test]
+    fn cache_totals_survive_a_restart() {
+        let database = test_db();
+        let mut cached = usage(1, 1);
+        cached.cache_read_input_tokens = 700;
+        UsageTracker::open(Arc::clone(&database), None).unwrap().record("chat", "claude-opus-5-5", &cached);
+
+        let reopened = UsageTracker::open(database, None).unwrap().snapshot();
+        assert_eq!(reopened.overall.cache_read_tokens, 700);
+        assert!(reopened.by_label[0].totals.cache_saved_usd > 0.0);
     }
 
     fn usage(input_tokens: u32, output_tokens: u32) -> Usage {

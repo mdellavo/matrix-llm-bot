@@ -54,6 +54,9 @@ To test Claude calls without the API, use the fake Messages server in `src/llm.r
 - Leave room in `max_tokens`, because thinking counts toward it.
 - Check model IDs, parameters, and tool versions against current Anthropic docs, not
   memory. They change between model generations.
+- Keep the chat system prompt and `stable_context` the same between replies. A
+  timestamp or per-message value there silently stops cache reads, with no error, so
+  put those in the new part of the user turn and check the status page's hit rate.
 - When adding a model, add its price to `price_per_million_tokens` in `src/usage.rs`.
   Unpriced models don't count toward the cost limit.
 

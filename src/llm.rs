@@ -54,6 +54,13 @@ pub struct CompletionRequest<'a> {
     pub model: &'a str,
     pub system: &'a str,
     pub user: &'a str,
+    /// Caches the tools, system prompt, and `stable_context`. Only for calls whose
+    /// system prompt doesn't change and that repeat often enough to pay back the
+    /// write premium. A prefix under the model's minimum is silently not cached.
+    pub cache: bool,
+    /// Sent ahead of `user` and cached with the prefix, for context that stays the
+    /// same from one request to the next.
+    pub stable_context: &'a str,
     /// Thinking counts toward this on current models, so it must leave room for both.
     pub max_tokens: u32,
     /// `output_config.effort`; `None` keeps the model's default.
@@ -130,6 +137,12 @@ pub async fn complete(
             if let Some(results) = tool_results {
                 messages.push(json!({"role": "user", "content": results}));
             }
+            // Each continuation resends everything, so from here on the whole
+            // conversation is worth caching. Not on the first request, where the
+            // tail is unique to this message and would never be read back.
+            if request.cache {
+                body["cache_control"] = cache_marker();
+            }
             continue;
         }
 
@@ -155,20 +168,28 @@ fn run_local_tools(content: &[Value], tools: &dyn LocalTools) -> Vec<Value> {
         .collect()
 }
 
+fn cache_marker() -> Value {
+    json!({"type": "ephemeral"})
+}
+
 fn user_content(request: &CompletionRequest<'_>) -> Value {
-    if request.images.is_empty() {
+    if request.images.is_empty() && request.stable_context.is_empty() {
         return json!(request.user);
     }
-    let mut blocks: Vec<Value> = request
-        .images
-        .iter()
-        .map(|image| {
-            json!({
-                "type": "image",
-                "source": {"type": "base64", "media_type": image.media_type, "data": image.data},
-            })
+    let mut blocks = Vec::new();
+    if !request.stable_context.is_empty() {
+        let mut block = json!({"type": "text", "text": request.stable_context});
+        if request.cache {
+            block["cache_control"] = cache_marker();
+        }
+        blocks.push(block);
+    }
+    blocks.extend(request.images.iter().map(|image| {
+        json!({
+            "type": "image",
+            "source": {"type": "base64", "media_type": image.media_type, "data": image.data},
         })
-        .collect();
+    }));
     blocks.push(json!({"type": "text", "text": request.user}));
     json!(blocks)
 }
@@ -198,6 +219,10 @@ fn build_body(request: &CompletionRequest<'_>) -> Value {
         "system": request.system,
         "messages": [{"role": "user", "content": user_content(request)}],
     });
+    if request.cache {
+        // The prefix a reply can always read, whatever happens to the history after it.
+        body["system"] = json!([{"type": "text", "text": request.system, "cache_control": cache_marker()}]);
+    }
     if let Some(effort) = request.effort {
         body["output_config"] = json!({"effort": effort});
     }
@@ -323,6 +348,34 @@ mod tests {
         let content = &body["messages"][0]["content"];
         assert_eq!(content[0]["source"]["data"], "abc");
         assert_eq!(content[1], json!({"type": "text", "text": "what is this"}));
+    }
+
+    #[test]
+    fn build_body_marks_the_system_prompt_and_stable_context_for_caching() {
+        let images = [ImageInput { media_type: "image/png", data: "abc".to_string() }];
+        let body = build_body(&CompletionRequest {
+            system: "s",
+            stable_context: "old history",
+            user: "new message",
+            images: &images,
+            cache: true,
+            ..Default::default()
+        });
+
+        assert_eq!(body["system"][0]["cache_control"]["type"], "ephemeral");
+        let content = &body["messages"][0]["content"];
+        assert_eq!(content[0]["text"], "old history");
+        assert_eq!(content[0]["cache_control"]["type"], "ephemeral");
+        assert_eq!(content[1]["type"], "image");
+        assert_eq!(content[2], json!({"type": "text", "text": "new message"}));
+        assert!(body.get("cache_control").is_none(), "the first request's tail is unique to it");
+    }
+
+    #[test]
+    fn build_body_leaves_uncached_calls_alone() {
+        let body = build_body(&CompletionRequest { system: "s", user: "u", ..Default::default() });
+        assert_eq!(body["system"], "s");
+        assert_eq!(body["messages"][0]["content"], "u");
     }
 
     #[test]
@@ -479,6 +532,20 @@ mod tests {
             assert_eq!(seen.len(), 2);
             assert_eq!(seen[1].1["messages"][1], json!({"role": "assistant", "content": paused}));
             assert_eq!(usage.snapshot().overall.request_count, 2);
+        }
+
+        #[tokio::test]
+        async fn a_continuation_caches_the_whole_conversation() {
+            let paused = response(json!([{"type": "text", "text": "working"}]), "pause_turn", "claude-opus-5-5");
+            let done = response(json!([{"type": "text", "text": "done"}]), "end_turn", "claude-opus-5-5");
+            let (client, seen) = serve(vec![paused, done]).await;
+
+            let cached = CompletionRequest { cache: true, ..request() };
+            complete(&client, &cached, &tracker("cache"), &Throttle::new(Duration::from_secs(1))).await.unwrap();
+
+            let seen = seen.lock().unwrap();
+            assert!(seen[0].1.get("cache_control").is_none());
+            assert_eq!(seen[1].1["cache_control"]["type"], "ephemeral");
         }
 
         #[tokio::test]

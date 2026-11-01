@@ -893,9 +893,30 @@ async fn classify(ctx: &HandlerContext, room: &Room, body: &str, sender_name: &s
 /// Number of recent room messages sent verbatim with a chat reply.
 const CHAT_HISTORY_LIMIT: usize = 50;
 
-/// Number of messages read from the log for a chat reply. Those beyond
-/// `CHAT_HISTORY_LIMIT` are only seen through `RoomSummaries`.
+/// Fewest recent messages sent with a chat reply. The history moves in steps of
+/// `CHAT_HISTORY_STEP`, so it runs from this to `CHAT_HISTORY_MIN + STEP - 1`,
+/// averaging `CHAT_HISTORY_LIMIT`.
+const CHAT_HISTORY_MIN: usize = 37;
+
+/// History is cut at multiples of this. A window that slid one message at a time would
+/// start with different text on every reply, so nothing after it could ever be read
+/// from the prompt cache.
+const CHAT_HISTORY_STEP: usize = 25;
+
+/// Number of messages read from the log for a chat reply. Those before the history
+/// are only seen through `RoomSummaries`.
 const CHAT_LOG_WINDOW: usize = 250;
+
+/// Where a room's recent messages divide, as positions in the `loaded` newest of its
+/// `total` messages: everything before the first is left to the room summary, up to
+/// the second is history that stays put between replies, and the rest is new.
+fn history_split(total: usize, loaded: usize) -> (usize, usize) {
+    let oldest_loaded = total.saturating_sub(loaded);
+    let step_down = |position: usize| position / CHAT_HISTORY_STEP * CHAT_HISTORY_STEP;
+    let start = step_down(total.saturating_sub(CHAT_HISTORY_MIN)).saturating_sub(oldest_loaded);
+    let stable_end = step_down(total).saturating_sub(oldest_loaded);
+    (start.min(loaded), stable_end.min(loaded))
+}
 
 /// Number of recent room messages fed into `classify_message` as context. Smaller
 /// than `CHAT_HISTORY_LIMIT` since classification runs on every message.
@@ -945,8 +966,8 @@ there. A joke that could be pasted under any message isn't worth making, and mos
 room is crude and likes to give you a hard time, so swearing and trash talk are fine and you can give it back. \
 Keep it among friends: nothing about protected traits, nothing meant to really hurt, no made-up personal details.
 
-The conversation is in the user turn: recent history with timestamps, possibly notes on older chat, then the \
-message to answer. If there's a thread, that's the conversation you're in, and the room history is background. Reactions on a line show how it landed, including on your own replies. Each `[name]` tag says exactly who wrote that line, and lines tagged [{bot_name}] are things \
+The conversation is in the user turn: recent history with timestamps, possibly notes on older chat, the current \
+time, then the message to answer. If there's a thread, that's the conversation you're in, and the room history is background. Reactions on a line show how it landed, including on your own replies. Each `[name]` tag says exactly who wrote that line, and lines tagged [{bot_name}] are things \
 you said, so stand by them, build on them, or admit a mistake. Timestamps show what's live and what's stale, so \
 don't treat an old conversation as if it's still going. Use the history when it's relevant and ignore it when \
 it isn't.
@@ -1057,9 +1078,14 @@ async fn generate_grounded_reply(ctx: &HandlerContext, room: &Room, input: &Repl
             Vec::new()
         }
     };
-    let (older, history) = log.split_at(log.len().saturating_sub(CHAT_HISTORY_LIMIT));
+    let total = ctx.message_log.count(room_id).unwrap_or(log.len());
+    let (start, stable_end) = history_split(total, log.len());
+    let older = &log[..start];
+
+    // The thread is only taken out of the newest messages. Removing it from the stable
+    // part would change that text for this reply alone and lose the cache.
     let in_thread = |entry: &LoggedMessage| input.thread.iter().any(|message| message.event_id == entry.event_id);
-    let history: Vec<LoggedMessage> = history.iter().filter(|entry| !in_thread(entry)).cloned().collect();
+    let recent: Vec<LoggedMessage> = log[stable_end..].iter().filter(|entry| !in_thread(entry)).cloned().collect();
 
     let (notes, facts) = match kind {
         ReplyKind::Greeting => (None, None),
@@ -1069,8 +1095,11 @@ async fn generate_grounded_reply(ctx: &HandlerContext, room: &Room, input: &Repl
         ),
     };
 
-    let user_turn = format_chat_turn(&ChatTurn {
-        history: &history,
+    let now = chrono::Utc::now().format("%Y-%m-%d %H:%M").to_string();
+    let (stable_context, new_context) = chat_turn_parts(&ChatTurn {
+        history: &log[start..stable_end],
+        recent: &recent,
+        now: Some(&now),
         thread: input.thread,
         notes: notes.as_deref(),
         facts: facts.as_deref(),
@@ -1081,12 +1110,21 @@ async fn generate_grounded_reply(ctx: &HandlerContext, room: &Room, input: &Repl
         image_failed: input.image_failed,
         pages: input.pages,
     });
-    let prompt = PromptRecord { system: system_prompt.clone(), user: user_turn.clone() };
+    let prompt = PromptRecord { system: system_prompt.clone(), user: format!("{stable_context}{new_context}") };
 
     let memory_tools = MemoryTools { memory: &ctx.memory, room_id, told_by: input.sender_name };
-    let base = CompletionRequest { model: CHAT_MODEL, system: &system_prompt, user: &user_turn, label, ..Default::default() };
+    let base = CompletionRequest {
+        model: CHAT_MODEL,
+        system: &system_prompt,
+        stable_context: &stable_context,
+        user: &new_context,
+        label,
+        ..Default::default()
+    };
     let request = match kind {
+        // The only kind big enough and frequent enough to pay back cache writes.
         ReplyKind::Chat => CompletionRequest {
+            cache: true,
             max_tokens: CHAT_MAX_TOKENS,
             effort: Some("medium"),
             web_search_max_uses: Some(CHAT_MAX_SEARCHES),
@@ -1120,7 +1158,12 @@ async fn generate_grounded_reply(ctx: &HandlerContext, room: &Room, input: &Repl
 
 /// What the model reads as the user turn.
 struct ChatTurn<'a> {
+    /// History that stays the same between replies.
     history: &'a [LoggedMessage],
+    /// Messages newer than `history`.
+    recent: &'a [LoggedMessage],
+    /// The current time, which goes late so it can't disturb what's cached.
+    now: Option<&'a str>,
     thread: &'a [LoggedMessage],
     notes: Option<&'a str>,
     facts: Option<&'a str>,
@@ -1132,21 +1175,32 @@ struct ChatTurn<'a> {
     pages: &'a [LinkPreview],
 }
 
-/// Renders the user turn: saved facts, notes on older chat, the recent transcript,
-/// the thread, what the message replies to, then the message itself. The message keeps its real
-/// line breaks since it can't be confused with a transcript line down here on its own.
-fn format_chat_turn(chat: &ChatTurn<'_>) -> String {
-    let mut turn = String::new();
+/// Renders the user turn in two parts. First what changes rarely, and so can be
+/// cached: saved facts, notes on older chat, and the settled history. Then what's new:
+/// recent messages, the thread, what the message replies to, the time, and the message
+/// itself. The message keeps its real line breaks since it can't be confused with a
+/// transcript line down here on its own.
+fn chat_turn_parts(chat: &ChatTurn<'_>) -> (String, String) {
+    let mut stable = String::new();
 
     if let Some(facts) = chat.facts {
-        turn.push_str(&format!("Facts you've saved about this room:\n{facts}\n\n"));
+        stable.push_str(&format!("Facts you've saved about this room:\n{facts}\n\n"));
     }
 
     if let Some(notes) = chat.notes {
-        turn.push_str(&format!("Notes on older chat in this room:\n{notes}\n\n"));
+        stable.push_str(&format!("Notes on older chat in this room:\n{notes}\n\n"));
     }
 
-    turn.push_str(&message_log::format_history_block(chat.history, chat.bot_name));
+    stable.push_str(&message_log::format_history_block(chat.history, chat.bot_name));
+
+    let mut turn = String::new();
+    if !chat.recent.is_empty() {
+        if chat.history.is_empty() {
+            turn.push_str(&message_log::format_history_block(chat.recent, chat.bot_name));
+        } else {
+            turn.push_str(&format!("Newer messages:\n{}\n", message_log::format_transcript(chat.recent, chat.bot_name)));
+        }
+    }
     turn.push_str(&message_log::format_thread_block(chat.thread, chat.bot_name));
 
     if let Some(target) = chat.reply_target {
@@ -1166,8 +1220,18 @@ fn format_chat_turn(chat: &ChatTurn<'_>) -> String {
         turn.push_str("An image came with this message, but it couldn't be loaded, so say that if it matters.\n\n");
     }
 
+    if let Some(now) = chat.now {
+        turn.push_str(&format!("The current time is {now} UTC.\n\n"));
+    }
+
     turn.push_str(&format!("Message to reply to, from [{}]:\n{}", chat.sender_name, chat.message_text.trim()));
-    turn
+    (stable, turn)
+}
+
+#[cfg(test)]
+fn format_chat_turn(chat: &ChatTurn<'_>) -> String {
+    let (stable, new) = chat_turn_parts(chat);
+    format!("{stable}{new}")
 }
 
 /// A linked page for the user turn, marked so its text reads as quoted web content.
@@ -1181,17 +1245,13 @@ fn format_page(page: &LinkPreview) -> String {
     block
 }
 
-/// One orientation sentence for the system prompts: the room's name and topic, if
-/// set, and the current time, so replies can recognize a time-sensitive question.
+/// One orientation sentence for the system prompts: the room's name and topic, if set.
+/// The time goes in the user turn instead, since anything that changes here would stop
+/// the prompt cache from ever being read.
 fn room_context_line(room: &Room, conversation: Conversation, sender_name: &str) -> String {
-    let now = chrono::Utc::now().format("%Y-%m-%d %H:%M");
     match conversation {
-        Conversation::OneOnOne => {
-            return format!("This is a private chat between you and {sender_name}. The current time is {now} UTC.");
-        }
-        Conversation::SmallGroup => {
-            return format!("This is a small private group chat you were invited into. The current time is {now} UTC.");
-        }
+        Conversation::OneOnOne => return format!("This is a private chat between you and {sender_name}."),
+        Conversation::SmallGroup => return "This is a small private group chat you were invited into.".to_string(),
         Conversation::Room => {}
     }
 
@@ -1202,7 +1262,7 @@ fn room_context_line(room: &Room, conversation: Conversation, sender_name: &str)
             None => "(unnamed room)".to_string(),
         },
     };
-    format!("This room is {room_desc}. The current time is {now} UTC.")
+    format!("This room is {room_desc}.")
 }
 
 /// Dispatches a `!command` to a built-in or a loaded skill, or replies that it
@@ -1409,6 +1469,8 @@ mod tests {
     fn chat_turn<'a>(sender_name: &'a str, message_text: &'a str) -> ChatTurn<'a> {
         ChatTurn {
             history: &[],
+            recent: &[],
+            now: None,
             thread: &[],
             notes: None,
             facts: None,
@@ -1445,6 +1507,46 @@ mod tests {
         let replied = turn.find("reply to [gordy], who wrote: the blue one").expect("reply target present");
         let current = turn.find("Message to reply to, from [carol]:\nwhy?").expect("message present");
         assert!(facts < notes && notes < alice && alice < replied && replied < current, "{turn}");
+    }
+
+    #[test]
+    fn history_starts_stay_put_until_a_step_is_crossed() {
+        let mut starts = std::collections::HashSet::new();
+        for total in 100..125 {
+            let (start, stable_end) = history_split(total, total);
+            starts.insert((start, stable_end));
+            let sent = total - start;
+            assert!((CHAT_HISTORY_MIN..CHAT_HISTORY_MIN + CHAT_HISTORY_STEP).contains(&sent), "{total}: {sent}");
+        }
+        assert!(starts.len() <= 3, "{starts:?}");
+    }
+
+    #[test]
+    fn history_split_handles_a_short_room_and_a_partial_load() {
+        assert_eq!(history_split(0, 0), (0, 0));
+        assert_eq!(history_split(10, 10), (0, 0));
+        assert_eq!(history_split(30, 30), (0, 25));
+
+        // 1,000 messages with the newest 250 loaded: positions are within those 250.
+        assert_eq!(history_split(1000, 250), (200, 250));
+        assert_eq!(history_split(1010, 250), (190, 240));
+    }
+
+    #[test]
+    fn the_time_and_new_messages_stay_out_of_the_cached_part() {
+        let history = vec![logged_message("@alice:example.org", "settled")];
+        let recent = vec![logged_message("@bob:example.org", "brand new")];
+        let (stable, new) = chat_turn_parts(&ChatTurn {
+            history: &history,
+            recent: &recent,
+            now: Some("2026-11-01 12:00"),
+            facts: Some("#1: a fact"),
+            ..chat_turn("carol", "hi")
+        });
+
+        assert!(stable.contains("settled") && stable.contains("#1: a fact"), "{stable}");
+        assert!(!stable.contains("brand new") && !stable.contains("12:00"), "{stable}");
+        assert!(new.contains("brand new") && new.contains("The current time is 2026-11-01 12:00 UTC."), "{new}");
     }
 
     #[test]

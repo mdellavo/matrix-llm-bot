@@ -14,6 +14,8 @@ one day of commits, newest first.
 
 ### Changed
 
+- Chat replies use prompt caching, and the history they see moves in steps of 25 messages to make that work
+- Usage and cost estimates include cache reads and writes, and the status page shows hit rate and net saving
 - Burst merging also applies to quick follow-ups in the same thread
 
 ## 0.11.0 - 2026-10-31

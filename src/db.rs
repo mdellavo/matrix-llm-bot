@@ -87,6 +87,10 @@ const MIGRATIONS: &[&str] = &["
         invited_by TEXT NOT NULL,
         joined_at TEXT NOT NULL
     );
+", "
+    ALTER TABLE usage_totals ADD COLUMN cache_read_tokens INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE usage_totals ADD COLUMN cache_write_tokens INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE usage_totals ADD COLUMN cache_saved_usd REAL NOT NULL DEFAULT 0;
 "];
 
 #[derive(Debug)]

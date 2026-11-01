@@ -395,6 +395,14 @@ impl MessageLogger {
         })
     }
 
+    /// How many messages are stored for `room_id`.
+    pub fn count(&self, room_id: &str) -> Result<usize> {
+        let count: i64 = self.database.with(|connection| {
+            connection.query_row("SELECT COUNT(*) FROM messages WHERE room_id = ?1", [room_id], |row| row.get(0))
+        })?;
+        Ok(usize::try_from(count).unwrap_or(0))
+    }
+
     /// Up to `limit` most recent messages of a thread, oldest first. Includes the root,
     /// which may have been logged before anyone replied to it, and the message whose
     /// reply is the root when someone starts a thread on something the bot said.

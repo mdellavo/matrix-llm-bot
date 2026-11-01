@@ -263,6 +263,10 @@ const INDEX_HTML: &str = r#"<!doctype html>
     <dt>Total tokens</dt><dd id="usage-total-tokens">…</dd>
     <dt>Input tokens</dt><dd id="usage-input-tokens">…</dd>
     <dt>Output tokens</dt><dd id="usage-output-tokens">…</dd>
+    <dt>Cache read tokens</dt><dd id="usage-cache-read">…</dd>
+    <dt>Cache write tokens</dt><dd id="usage-cache-write">…</dd>
+    <dt>Cache hit rate</dt><dd id="usage-cache-rate">…</dd>
+    <dt>Saved by caching</dt><dd id="usage-cache-saved">…</dd>
     <dt>Requests</dt><dd id="usage-requests">…</dd>
     <dt>Estimated cost</dt><dd id="usage-cost">…</dd>
     <dt>Average per request</dt><dd id="usage-cost-per-request">…</dd>
@@ -275,7 +279,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
   <p id="usage-cost-limit-note" style="display: none;"></p>
   <table>
     <thead>
-      <tr><th>Label</th><th>Input tokens</th><th>Output tokens</th><th>Total tokens</th><th>Requests</th><th>Est. cost</th><th>Web searches</th><th>Web search cost</th></tr>
+      <tr><th>Label</th><th>Input tokens</th><th>Output tokens</th><th>Total tokens</th><th>Cache read</th><th>Requests</th><th>Est. cost</th><th>Web searches</th><th>Web search cost</th></tr>
     </thead>
     <tbody id="usage-body"></tbody>
   </table>
@@ -550,11 +554,16 @@ async function loadUsage() {
   const tbody = document.getElementById('usage-body');
   tbody.innerHTML = '';
   if (!res.ok) {
-    tbody.innerHTML = `<tr><td colspan="8">Failed to load usage: ${escapeHtml(await res.text())}</td></tr>`;
+    tbody.innerHTML = `<tr><td colspan="9">Failed to load usage: ${escapeHtml(await res.text())}</td></tr>`;
     return;
   }
   const usage = await res.json();
-  document.getElementById('usage-total-tokens').textContent = formatCount(usage.input_tokens + usage.output_tokens);
+  const cachedInput = usage.cache_read_tokens + usage.cache_write_tokens;
+  document.getElementById('usage-total-tokens').textContent = formatCount(usage.input_tokens + usage.output_tokens + cachedInput);
+  document.getElementById('usage-cache-read').textContent = formatCount(usage.cache_read_tokens);
+  document.getElementById('usage-cache-write').textContent = formatCount(usage.cache_write_tokens);
+  document.getElementById('usage-cache-rate').textContent = formatPercent(usage.cache_read_tokens, usage.input_tokens + cachedInput);
+  document.getElementById('usage-cache-saved').textContent = formatSmallCost(usage.cache_saved_usd);
   document.getElementById('usage-input-tokens').textContent = formatCount(usage.input_tokens);
   document.getElementById('usage-output-tokens').textContent = formatCount(usage.output_tokens);
   document.getElementById('usage-requests').textContent = formatCount(usage.request_count);
@@ -583,7 +592,7 @@ async function loadUsage() {
   }
 
   if (usage.by_label.length === 0) {
-    tbody.innerHTML = '<tr><td colspan="8">(no Claude API calls recorded yet)</td></tr>';
+    tbody.innerHTML = '<tr><td colspan="9">(no Claude API calls recorded yet)</td></tr>';
     return;
   }
   for (const entry of usage.by_label) {
@@ -592,7 +601,8 @@ async function loadUsage() {
       <td>${escapeHtml(entry.label)}</td>
       <td>${formatCount(entry.input_tokens)}</td>
       <td>${formatCount(entry.output_tokens)}</td>
-      <td>${formatCount(entry.input_tokens + entry.output_tokens)}</td>
+      <td>${formatCount(entry.input_tokens + entry.output_tokens + entry.cache_read_tokens + entry.cache_write_tokens)}</td>
+      <td>${formatCount(entry.cache_read_tokens)}</td>
       <td>${formatCount(entry.request_count)}</td>
       <td>${formatCost(entry.estimated_cost_usd)}${entry.unpriced_requests > 0 ? ' *' : ''}</td>
       <td>${formatCount(entry.web_search_requests)}</td>
