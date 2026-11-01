@@ -80,6 +80,8 @@ pub struct MessageLogParams<'a> {
     pub response: Option<&'a GeneratedReply>,
     /// The event the reply was sent as, which is how reactions find it.
     pub response_event_id: Option<&'a str>,
+    /// The thread the message is part of, or that the bot's reply started on it.
+    pub thread_root_id: Option<&'a str>,
 }
 
 /// A logged message as read back. Also serialized directly as the JSON response of
@@ -112,6 +114,8 @@ pub struct LoggedMessage {
     pub response_label: Option<String>,
     #[serde(default)]
     pub response_event_id: Option<String>,
+    #[serde(default)]
+    pub thread_root_id: Option<String>,
     /// Filled in from the room's reaction log on read, not stored on the line.
     #[serde(default)]
     pub reactions: Vec<LoggedReaction>,
@@ -136,7 +140,7 @@ pub struct MessageLogger {
 /// The columns `read_message` expects. Prompts are left out unless asked for, since
 /// they're most of a row's size and only the status page shows them.
 const MESSAGE_COLUMNS: &str = "room_id, event_id, sender, sender_name, origin_server_ts_ms, logged_at, body, \
-    has_image, analysis_json, links_json, response, response_label, response_event_id";
+    has_image, analysis_json, links_json, response, response_label, response_event_id, thread_root_id";
 const PROMPT_COLUMNS: &str = "classify_prompt_json, classify_raw_json, response_prompt_json";
 
 /// Most terms from one search that are matched in SQL.
@@ -172,9 +176,10 @@ fn read_message(row: &Row<'_>, with_prompts: bool) -> rusqlite::Result<Option<Lo
         response: row.get(10)?,
         response_label: row.get(11)?,
         response_event_id: row.get(12)?,
-        classify_prompt: if with_prompts { parse_column(row.get(13)?, &event_id) } else { None },
-        classify_raw_json: if with_prompts { parse_column(row.get(14)?, &event_id) } else { None },
-        response_prompt: if with_prompts { parse_column(row.get(15)?, &event_id) } else { None },
+        thread_root_id: row.get(13)?,
+        classify_prompt: if with_prompts { parse_column(row.get(14)?, &event_id) } else { None },
+        classify_raw_json: if with_prompts { parse_column(row.get(15)?, &event_id) } else { None },
+        response_prompt: if with_prompts { parse_column(row.get(16)?, &event_id) } else { None },
         event_id,
         reactions: Vec::new(),
         response_reactions: Vec::new(),
@@ -216,6 +221,7 @@ struct NewMessage<'a> {
     response: Option<&'a str>,
     response_label: Option<&'a str>,
     response_event_id: Option<&'a str>,
+    thread_root_id: Option<&'a str>,
 }
 
 /// A repeated event ID is ignored, so a message can never be logged twice.
@@ -223,7 +229,8 @@ fn insert_message(connection: &Connection, message: &NewMessage<'_>) -> rusqlite
     connection.prepare_cached(
         "INSERT OR IGNORE INTO messages (room_id, event_id, sender, sender_name, origin_server_ts_ms, logged_at, body, \
          has_image, analysis_json, links_json, classify_prompt_json, classify_raw_json, response_prompt_json, response, \
-         response_label, response_event_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+         response_label, response_event_id, thread_root_id) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
     )?
     .execute(params![
         message.room_id,
@@ -242,6 +249,7 @@ fn insert_message(connection: &Connection, message: &NewMessage<'_>) -> rusqlite
         message.response,
         message.response_label,
         message.response_event_id,
+        message.thread_root_id,
     ])
 }
 
@@ -285,6 +293,7 @@ pub fn import_entry(transaction: &Transaction<'_>, entry: &LoggedMessage) -> Res
             response: entry.response.as_deref(),
             response_label: entry.response_label.as_deref(),
             response_event_id: entry.response_event_id.as_deref(),
+            thread_root_id: entry.thread_root_id.as_deref(),
         },
     )
     .context("failed to import message")?;
@@ -317,6 +326,7 @@ impl MessageLogger {
             classify_raw_json,
             response,
             response_event_id,
+            thread_root_id,
         } = params;
 
         let logged_at = chrono::Utc::now().to_rfc3339();
@@ -337,6 +347,7 @@ impl MessageLogger {
             response: response.map(|response| response.text.as_str()),
             response_label: response.map(|response| response.label.as_str()),
             response_event_id,
+            thread_root_id,
         };
         self.database.with(|connection| insert_message(connection, &message))?;
         Ok(())
@@ -374,6 +385,30 @@ impl MessageLogger {
             let mut statement = connection.prepare_cached(&sql)?;
             let mut entries = statement
                 .query_map(params![room_id, limit], |row| read_message(row, with_prompts))?
+                .filter_map(Result::transpose)
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            entries.reverse();
+            for entry in &mut entries {
+                attach_reactions(connection, entry)?;
+            }
+            Ok(entries)
+        })
+    }
+
+    /// Up to `limit` most recent messages of a thread, oldest first. Includes the root,
+    /// which may have been logged before anyone replied to it, and the message whose
+    /// reply is the root when someone starts a thread on something the bot said.
+    pub fn thread(&self, room_id: &str, root_id: &str, limit: usize) -> Result<Vec<LoggedMessage>> {
+        let sql = format!(
+            "SELECT {MESSAGE_COLUMNS} FROM messages WHERE room_id = ?1 \
+             AND (thread_root_id = ?2 OR event_id = ?2 OR response_event_id = ?2) ORDER BY id DESC LIMIT ?3"
+        );
+
+        self.database.with(|connection| {
+            let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+            let mut statement = connection.prepare_cached(&sql)?;
+            let mut entries = statement
+                .query_map(params![room_id, root_id, limit], |row| read_message(row, false))?
                 .filter_map(Result::transpose)
                 .collect::<rusqlite::Result<Vec<_>>>()?;
             entries.reverse();
@@ -487,6 +522,14 @@ pub fn format_history_block(history: &[LoggedMessage], bot_name: &str) -> String
     )
 }
 
+/// Formats a thread for a reply inside it, or an empty string if there isn't one.
+pub fn format_thread_block(thread: &[LoggedMessage], bot_name: &str) -> String {
+    if thread.is_empty() {
+        return String::new();
+    }
+    format!("This thread so far, which is the conversation you're in (same format, oldest first):\n{}\n", format_transcript(thread, bot_name))
+}
+
 /// One line per message, oldest first. The bot's own replies get their own lines,
 /// because they're stored on the message that triggered them and would otherwise
 /// be invisible, leaving it unable to follow up on anything it said.
@@ -592,6 +635,7 @@ mod tests {
             has_image: false,
             links: Vec::new(),
             response_event_id: None,
+            thread_root_id: None,
             reactions: Vec::new(),
             response_reactions: Vec::new(),
         }
@@ -700,8 +744,46 @@ mod tests {
                 classify_raw_json: None,
                 response: reply.as_ref(),
                 response_event_id: response.map(|(_, id)| id),
+                thread_root_id: None,
             })
             .unwrap();
+    }
+
+    #[test]
+    fn a_thread_is_its_root_and_replies_without_the_rest_of_the_room() {
+        let logger = test_logger("threads");
+        let analysis = logged_message("@alice:x", "").analysis;
+        let log = |event_id: &str, body: &str, thread_root_id: Option<&str>, response_event_id: Option<&str>| {
+            logger
+                .log(MessageLogParams {
+                    room_id: "!r",
+                    event_id,
+                    sender: "@alice:x",
+                    sender_name: None,
+                    origin_server_ts_ms: 1,
+                    body,
+                    has_image: false,
+                    links: &[],
+                    analysis: &analysis,
+                    classify_prompt: None,
+                    classify_raw_json: None,
+                    response: None,
+                    response_event_id,
+                    thread_root_id,
+                })
+                .unwrap();
+        };
+        log("$root", "the root", None, None);
+        log("$other", "something else", None, None);
+        log("$reply", "in the thread", Some("$root"), None);
+        log("$greeted", "hello", None, Some("$bot"));
+        log("$on-bot", "about that", Some("$bot"), None);
+
+        let bodies = |root: &str| -> Vec<String> {
+            logger.thread("!r", root, 10).unwrap().into_iter().map(|entry| entry.body).collect()
+        };
+        assert_eq!(bodies("$root"), ["the root", "in the thread"]);
+        assert_eq!(bodies("$bot"), ["hello", "about that"]);
     }
 
     #[test]
@@ -777,6 +859,7 @@ mod tests {
                 classify_raw_json: None,
                 response: None,
                 response_event_id: None,
+                thread_root_id: None,
             })
             .unwrap();
 

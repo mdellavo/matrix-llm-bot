@@ -2,7 +2,7 @@
 
 A Rust Matrix chat bot built on [`matrix-sdk`](https://github.com/matrix-org/matrix-rust-sdk), with TLS and E2E encryption support out of the box.
 
-It joins a configured set of rooms, records what's said in SQLite, and uses Claude to classify intent and sentiment. `!commands` dispatch to **skills**: prompt files modeled on Claude Code's Skills. Other messages get a Claude-generated reply when the bot is addressed (an `@mention`, a reply, or a message starting with its name), and greetings to the room get one on a cooldown. Replies can draw on room history, saved memories, web search, links, and images. A small built-in HTTP server exposes a status/debugging page alongside the sync loop.
+It joins a configured set of rooms, records what's said in SQLite, and uses Claude to classify intent and sentiment. `!commands` dispatch to **skills**: prompt files modeled on Claude Code's Skills. Other messages get a Claude-generated reply when the bot is addressed (an `@mention`, a reply, a message starting with its name, or a follow-up in its thread), and greetings to the room get one on a cooldown. Replies can draw on room history, saved memories, web search, links, and images. A small built-in HTTP server exposes a status/debugging page alongside the sync loop.
 
 ## Setup
 
@@ -175,7 +175,8 @@ A skill file with bad frontmatter or an unrecognized `tools`/`args` entry is ski
 - Reactions: a lone-emoji reply is sent as a reaction. Reactions from others are saved and shown in history. Removed reactions aren't tracked.
 - Each room's messages are handled one at a time, in order (`src/room_queue.rs`). Quick follow-ups from the same person are answered together, after a 1.5 second wait on addressed messages.
 - Unprompted comments are off by default. Set `interjection_chance` to turn them on; the bot can still decide to pass, and `interjection_cooldown_secs` limits them per room.
-- Replies show a typing indicator while being generated and are sent as real Matrix replies to the message that triggered them.
+- Replies show a typing indicator while being generated. Replies to commands and conversation go in a thread on the original post, or stay in the thread they were asked in. Greetings and unprompted comments are plain replies outside a thread.
+- Threads: once the bot has posted in a thread, every message there counts as addressed to it, unless the message mentions someone or replies to someone else. A bare acknowledgement gets no reply. The reply sees the whole thread, up to its last 50 messages, plus any images and links in it, however old. Each follow-up is a full chat reply, so a busy thread costs more than room chat.
 - Claude API token usage and an estimated USD cost are tracked per command/reply type, saved so they survive restarts, and shown on the status page (`src/usage.rs`). Estimates come from a hardcoded pricing table, not fetched live, and leave out cache tokens. Set `cost_limit_usd` to stop Claude calls at a spending cap.
 - The status/debugging server (`src/status_server.rs`) has **no authentication** and binds to `127.0.0.1` by default — only widen `http_listen_addr` deliberately, and put it behind your own auth/reverse proxy if you do.
 - `threatflux-anthropic-sdk` is a third-party community crate, not an Anthropic-maintained SDK — pin/review it accordingly. Claude calls use its raw request method (`src/llm.rs`), since its typed builders don't cover the newer API fields.
@@ -194,7 +195,7 @@ Ideas for later, not commitments. See [CHANGELOG.md](CHANGELOG.md) for what's sh
 
 - Reminders: "gordy, remind me Friday to..."
 - Scheduled posts, such as a daily digest or a catch-up on what someone missed
-- Threads and DMs: keep replies inside threads, and decide how DMs should work
+- DMs: decide how they should work
 
 ### Reliability
 

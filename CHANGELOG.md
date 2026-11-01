@@ -3,6 +3,17 @@
 Notable changes to matrix-llm-bot, built from the git history. Each version covers
 one day of commits, newest first.
 
+## 0.12.0 - 2026-11-01
+
+### Added
+
+- Threads: replies to commands and conversation go in a thread on the original post
+- Follow-ups in a thread are answered without addressing the bot, using the thread's messages, images, and links
+
+### Changed
+
+- Burst merging also applies to quick follow-ups in the same thread
+
 ## 0.11.0 - 2026-10-31
 
 ### Added

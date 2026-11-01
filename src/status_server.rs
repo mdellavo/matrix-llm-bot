@@ -558,6 +558,7 @@ mod tests {
                 classify_raw_json: Some(&classify_raw_json),
                 response: None,
                 response_event_id: None,
+                thread_root_id: None,
             })
             .expect("log message 1");
         let reply = GeneratedReply {
@@ -580,6 +581,7 @@ mod tests {
                 classify_raw_json: Some(&classify_raw_json),
                 response: Some(&reply),
                 response_event_id: None,
+                thread_root_id: None,
             })
             .expect("log message 2");
 

@@ -11,12 +11,12 @@ use matrix_sdk::{
         EventId, OwnedEventId, UserId,
         events::{
             reaction::{OriginalSyncReactionEvent, ReactionEventContent},
-            relation::Annotation,
+            relation::{Annotation, Thread},
             room::{
                 MediaSource,
                 message::{
                     AddMentions, ForwardThread, ImageMessageEventContent, MessageType, OriginalSyncRoomMessageEvent,
-                    Relation, ReplyMetadata, RoomMessageEventContent,
+                    Relation, ReplyMetadata, ReplyWithinThread, RoomMessageEventContent,
                 },
             },
         },
@@ -124,15 +124,70 @@ struct RepliedTo {
     sender_name: String,
     body: Option<String>,
     image: Option<ImageMessageEventContent>,
+    /// The thread the message is in, for replies from clients that don't do threads.
+    thread_root: Option<OwnedEventId>,
+}
+
+/// The message `event` deliberately replies to, if any. A thread message's
+/// `in_reply_to` is usually only a fallback for clients without threads, naming
+/// whatever came last, so that doesn't count.
+fn reply_target_id(event: &OriginalSyncRoomMessageEvent) -> Option<&EventId> {
+    match event.content.relates_to.as_ref()? {
+        Relation::Reply(reply) => Some(&reply.in_reply_to.event_id),
+        Relation::Thread(thread) if !thread.is_falling_back => thread.in_reply_to.as_ref().map(|reply| &*reply.event_id),
+        _ => None,
+    }
+}
+
+/// The thread a message event's `content` says it's in.
+fn thread_in_content(content: &serde_json::Value) -> Option<OwnedEventId> {
+    let relation = content.get("m.relates_to")?;
+    if relation["rel_type"].as_str()? != "m.thread" {
+        return None;
+    }
+    relation["event_id"].as_str()?.try_into().ok()
+}
+
+/// The thread `event` belongs to: the one it says, the one the message it replies to
+/// is in, or for an edit, the one the edited message is in.
+async fn existing_thread(event: &OriginalSyncRoomMessageEvent, room: &Room, reply_target: Option<&RepliedTo>) -> Option<OwnedEventId> {
+    match &event.content.relates_to {
+        Some(Relation::Thread(thread)) => Some(thread.event_id.clone()),
+        Some(Relation::Replacement(edit)) => {
+            let original = room.event(&edit.event_id, None).await.ok()?;
+            thread_in_content(&original.kind.raw().get_field::<serde_json::Value>("content").ok().flatten()?)
+        }
+        _ => reply_target.and_then(|target| target.thread_root.clone()),
+    }
+}
+
+/// The event a new thread would start from. A thread can't be rooted on an edit, so
+/// that's the message that was edited.
+fn new_thread_root(event: &OriginalSyncRoomMessageEvent) -> &EventId {
+    match &event.content.relates_to {
+        Some(Relation::Replacement(edit)) => &edit.event_id,
+        _ => &event.event_id,
+    }
+}
+
+/// Whether the bot has posted in this thread, or the thread hangs off its own message.
+fn bot_in_thread(thread: &[LoggedMessage], root: &EventId) -> bool {
+    thread.iter().any(|entry| {
+        entry.response_event_id.as_deref().is_some_and(|reply| entry.thread_root_id.is_some() || reply == root.as_str())
+    })
+}
+
+/// A message in a thread the bot is part of is for the bot, the same as the next line
+/// of a conversation, unless it's clearly for someone else.
+fn is_thread_follow_up(in_bot_thread: bool, mentions_someone: bool, replies_to_someone_else: bool) -> bool {
+    in_bot_thread && !mentions_someone && !replies_to_someone_else
 }
 
 /// Fetches the message `event` replies to, if it is a reply.
 async fn replied_to(event: &OriginalSyncRoomMessageEvent, room: &Room) -> Option<RepliedTo> {
-    let Some(Relation::Reply(reply)) = &event.content.relates_to else {
-        return None;
-    };
+    let target_id = reply_target_id(event)?;
 
-    match room.event(&reply.in_reply_to.event_id, None).await {
+    match room.event(target_id, None).await {
         Ok(target) => {
             let sender = target.kind.sender()?;
             let content = target.kind.raw().get_field::<serde_json::Value>("content").ok().flatten();
@@ -142,6 +197,7 @@ async fn replied_to(event: &OriginalSyncRoomMessageEvent, room: &Room) -> Option
                 sender: sender.to_string(),
                 body,
                 image: content.as_ref().and_then(image_in_content),
+                thread_root: content.as_ref().and_then(thread_in_content),
             })
         }
         Err(err) => {
@@ -213,28 +269,34 @@ async fn load_image(client: &Client, image: &ImageMessageEventContent) -> Option
     Some(ImageInput { media_type, data: base64::engine::general_purpose::STANDARD.encode(&bytes) })
 }
 
-/// The image this message is about, whether attached, replied to, or just posted:
-/// people tend to post a picture and then ask about it in the next message.
+/// The image this message is about, whether attached, replied to, in the thread, or
+/// just posted: people tend to post a picture and then ask about it in the next
+/// message.
 async fn find_image(
     ctx: &HandlerContext,
     room: &Room,
     own: Option<&ImageMessageEventContent>,
     reply_target: Option<&RepliedTo>,
+    thread: &[LoggedMessage],
     now_ms: i64,
 ) -> Option<ImageMessageEventContent> {
     if let Some(image) = own.cloned().or_else(|| reply_target.and_then(|target| target.image.clone())) {
         return Some(image);
     }
-    if reply_target.is_some() {
-        return None;
-    }
 
-    let previous = ctx.message_log.recent(room.room_id().as_str(), 1).ok()?.pop()?;
-    if !previous.has_image || now_ms - previous.origin_server_ts_ms > FOLLOW_UP_WINDOW_MS {
+    let source = if !thread.is_empty() {
+        thread.iter().rev().find(|entry| entry.has_image)?.event_id.clone()
+    } else if reply_target.is_some() {
         return None;
-    }
+    } else {
+        let previous = ctx.message_log.recent(room.room_id().as_str(), 1).ok()?.pop()?;
+        if !previous.has_image || now_ms - previous.origin_server_ts_ms > FOLLOW_UP_WINDOW_MS {
+            return None;
+        }
+        previous.event_id
+    };
 
-    let event_id = EventId::parse(&previous.event_id).ok()?;
+    let event_id = EventId::parse(&source).ok()?;
     let event = room.event(&event_id, None).await.ok()?;
     let content = event.kind.raw().get_field::<serde_json::Value>("content").ok().flatten()?;
     image_in_content(&content)
@@ -247,13 +309,15 @@ const MAX_PAGES_PER_REPLY: usize = 3;
 const LINK_LOOKBACK_MESSAGES: usize = 10;
 
 /// The pages this message is about, most relevant first: linked in the message,
-/// in the message it replies to, or posted in the last few minutes. People tend to
-/// share a link and then ask about it, the same way they do with images.
+/// in the message it replies to, and either in its thread or posted in the last few
+/// minutes. People tend to share a link and then ask about it, the same way they do
+/// with images.
 async fn find_pages(
     ctx: &HandlerContext,
     room: &Room,
     own: &[LinkPreview],
     reply_target: Option<&RepliedTo>,
+    thread: &[LoggedMessage],
     now_ms: i64,
 ) -> Vec<LinkPreview> {
     let mut pages = own.to_vec();
@@ -262,11 +326,16 @@ async fn find_pages(
         pages.extend(ctx.links.fetch_all(body).await);
     }
 
-    let recent = ctx.message_log.recent(room.room_id().as_str(), LINK_LOOKBACK_MESSAGES).unwrap_or_default();
-    for entry in recent.iter().rev() {
-        if now_ms - entry.origin_server_ts_ms <= FOLLOW_UP_WINDOW_MS {
-            pages.extend(entry.links.iter().cloned());
+    if thread.is_empty() {
+        let recent = ctx.message_log.recent(room.room_id().as_str(), LINK_LOOKBACK_MESSAGES).unwrap_or_default();
+        for entry in recent.iter().rev() {
+            if now_ms - entry.origin_server_ts_ms <= FOLLOW_UP_WINDOW_MS {
+                pages.extend(entry.links.iter().cloned());
+            }
         }
+    }
+    for entry in thread.iter().rev() {
+        pages.extend(entry.links.iter().cloned());
     }
 
     let mut seen = Vec::new();
@@ -371,14 +440,22 @@ pub struct QueuedMessage {
 }
 
 impl QueuedMessage {
-    /// The text of a message that could be part of a burst: plain text, not a command.
+    /// The text of a message that could be part of a burst: plain text, not a command,
+    /// and either a new message or the next one in a thread.
     fn burst_text(&self) -> Option<&str> {
+        let joinable = matches!(self.event.content.relates_to, None | Some(Relation::Thread(_)));
         match &self.event.content.msgtype {
-            MessageType::Text(text) if self.event.content.relates_to.is_none() && parse_command(&text.body).is_none() => {
-                Some(&text.body)
-            }
+            MessageType::Text(text) if joinable && parse_command(&text.body).is_none() => Some(&text.body),
             _ => None,
         }
+    }
+}
+
+/// The thread a message says it's in, without looking anything up.
+fn stated_thread(event: &OriginalSyncRoomMessageEvent) -> Option<&EventId> {
+    match &event.content.relates_to {
+        Some(Relation::Thread(thread)) => Some(&thread.event_id),
+        _ => None,
     }
 }
 
@@ -455,6 +532,15 @@ async fn process_message(ctx: &HandlerContext, inbox: &mut Inbox<QueuedMessage>,
     let reply_target = replied_to(&event, &room).await;
     let body = if reply_target.is_some() { strip_reply_fallback(text) } else { text };
 
+    let joined_thread = existing_thread(&event, &room, reply_target.as_ref()).await;
+    let thread = match &joined_thread {
+        Some(root) => ctx.message_log.thread(room.room_id().as_str(), root.as_str(), CHAT_HISTORY_LIMIT).unwrap_or_else(|err| {
+            warn!(?err, room = %room.room_id(), "failed to load thread; replying without it");
+            Vec::new()
+        }),
+        None => Vec::new(),
+    };
+
     let command = if own_image.is_none() { parse_command(body) } else { None };
     let mentioned = client.user_id().is_some_and(|own_id| {
         event.content.mentions.as_ref().is_some_and(|mentions| mentions.user_ids.contains(own_id))
@@ -462,7 +548,12 @@ async fn process_message(ctx: &HandlerContext, inbox: &mut Inbox<QueuedMessage>,
     let replied_to_bot = reply_target
         .as_ref()
         .is_some_and(|target| client.user_id().is_some_and(|own_id| own_id.as_str() == target.sender));
-    let directed_at_bot = mentioned || replied_to_bot || addresses_bot_by_name(body, &ctx.bot_name);
+    let addressed = mentioned || replied_to_bot || addresses_bot_by_name(body, &ctx.bot_name);
+    let mentions_someone = event.content.mentions.as_ref().is_some_and(|mentions| !mentions.user_ids.is_empty());
+    let follow_up = joined_thread.as_ref().is_some_and(|root| {
+        is_thread_follow_up(bot_in_thread(&thread, root), mentions_someone, reply_target.is_some() && !replied_to_bot)
+    });
+    let directed_at_bot = addressed || follow_up;
 
     // Started before classification when a reply is already certain, so the wait for
     // the classifier shows as typing too.
@@ -513,10 +604,16 @@ async fn process_message(ctx: &HandlerContext, inbox: &mut Inbox<QueuedMessage>,
         typing = Some(TypingIndicator::start(room.clone()));
     }
 
-    // Follow-ups from the same person become part of the one message being answered.
+    // Follow-ups from the same person in the same place become part of the one message
+    // being answered.
     let burst = if kind == Some(ReplyKind::Chat) && own_image.is_none() {
         let sender = event.sender.clone();
-        inbox.take_burst(BURST_WINDOW, |next| next.event.sender == sender && next.burst_text().is_some()).await
+        let same_thread = stated_thread(&event).map(ToOwned::to_owned);
+        inbox
+            .take_burst(BURST_WINDOW, |next| {
+                next.event.sender == sender && next.burst_text().is_some() && stated_thread(&next.event) == same_thread.as_deref()
+            })
+            .await
     } else {
         Vec::new()
     };
@@ -535,7 +632,7 @@ async fn process_message(ctx: &HandlerContext, inbox: &mut Inbox<QueuedMessage>,
         (None, Some(kind)) => {
             let now_ms = event.origin_server_ts.get().into();
             let image = match kind {
-                ReplyKind::Chat => find_image(ctx, &room, own_image, reply_target.as_ref(), now_ms).await,
+                ReplyKind::Chat => find_image(ctx, &room, own_image, reply_target.as_ref(), &thread, now_ms).await,
                 _ => None,
             };
             let images: Vec<ImageInput> = match &image {
@@ -545,7 +642,7 @@ async fn process_message(ctx: &HandlerContext, inbox: &mut Inbox<QueuedMessage>,
             let pages = match kind {
                 ReplyKind::Chat => {
                     let own_links: Vec<LinkPreview> = links.iter().chain(burst_links.iter().flatten()).cloned().collect();
-                    find_pages(ctx, &room, &own_links, reply_target.as_ref(), now_ms).await
+                    find_pages(ctx, &room, &own_links, reply_target.as_ref(), &thread, now_ms).await
                 }
                 _ => Vec::new(),
             };
@@ -554,6 +651,7 @@ async fn process_message(ctx: &HandlerContext, inbox: &mut Inbox<QueuedMessage>,
                 message_text: &full_text,
                 sender_name: &sender_name,
                 reply_target: reply_target.as_ref(),
+                thread: &thread,
                 image_failed: image.is_some() && images.is_empty(),
                 images: &images,
                 pages: &pages,
@@ -567,15 +665,24 @@ async fn process_message(ctx: &HandlerContext, inbox: &mut Inbox<QueuedMessage>,
         typing.stop(&room).await;
     }
 
-    // Replies point at the last message they answer, and sit there in the log too,
-    // so history reads in the order it happened.
+    // Sits on the last message it answers in the log, so history reads in the order it
+    // happened, and a reaction goes there too.
     let last_event_id = burst.last().map_or(&event.event_id, |follow_up| &follow_up.event.event_id);
 
+    // Commands and conversation get a thread on the original post. Greetings and
+    // unprompted comments stay where they were said, since a thread would hide them.
+    let starts_thread = command.is_some() || kind == Some(ReplyKind::Chat);
+    let thread_root = joined_thread.clone().or_else(|| starts_thread.then(|| new_thread_root(&event).to_owned()));
+    let reply_to = match &thread_root {
+        Some(root) if stated_thread(&event).is_none() => root,
+        _ => last_event_id,
+    };
+
     let response_event_id = match &response {
-        Some(response) => deliver(&room, last_event_id, &event.sender, &response.text).await,
+        Some(response) => deliver(&room, reply_to, thread_root.as_ref(), &event.sender, &response.text).await,
         None => {
             // "gordy: thanks" doesn't need an answer, but it shouldn't get silence.
-            if directed_at_bot && command.is_none() && analysis.intent == Intent::Acknowledgement {
+            if addressed && command.is_none() && analysis.intent == Intent::Acknowledgement {
                 send_reaction(&room, last_event_id, "👍").await;
             }
             None
@@ -594,6 +701,7 @@ async fn process_message(ctx: &HandlerContext, inbox: &mut Inbox<QueuedMessage>,
         lines.push((&follow_up.event, follow_up.burst_text().unwrap_or_default(), follow_up_links.as_slice(), None, &follow_up_analysis));
     }
 
+    let logged_thread = joined_thread.as_ref().or(thread_root.as_ref().filter(|_| response_event_id.is_some()));
     let last_line = lines.len() - 1;
     for (index, (line_event, line_body, line_links, outcome, line_analysis)) in lines.into_iter().enumerate() {
         let is_last = index == last_line;
@@ -611,6 +719,7 @@ async fn process_message(ctx: &HandlerContext, inbox: &mut Inbox<QueuedMessage>,
             classify_raw_json: outcome.map(|outcome| &outcome.raw_json),
             response: response.as_ref().filter(|_| is_last),
             response_event_id: response_event_id.as_ref().filter(|_| is_last).map(|id| id.as_str()),
+            thread_root_id: logged_thread.map(|root| root.as_str()),
         });
         if let Err(err) = result {
             warn!(?err, room = %room.room_id(), "failed to write message log entry");
@@ -634,13 +743,19 @@ fn should_interject(ctx: &HandlerContext, room: &Room, analysis: &MessageAnalysi
 
 /// Posts a reply, or a reaction if the reply is a lone emoji, returning the reply's
 /// event ID. Reactions get none, since nobody reacts to a reaction.
-async fn deliver(room: &Room, event_id: &OwnedEventId, sender: &UserId, text: &str) -> Option<OwnedEventId> {
+async fn deliver(
+    room: &Room,
+    event_id: &OwnedEventId,
+    thread_root: Option<&OwnedEventId>,
+    sender: &UserId,
+    text: &str,
+) -> Option<OwnedEventId> {
     if is_lone_emoji(text) {
         send_reaction(room, event_id, text.trim()).await;
         return None;
     }
 
-    match send_message(room, event_id, sender, text).await {
+    match send_message(room, event_id, thread_root, sender, text).await {
         Ok(reply_id) => Some(reply_id),
         Err(err) => {
             warn!(?err, room = %room.room_id(), "failed to send response");
@@ -733,7 +848,7 @@ room is crude and likes to give you a hard time, so swearing and trash talk are 
 Keep it among friends: nothing about protected traits, nothing meant to really hurt, no made-up personal details.
 
 The conversation is in the user turn: recent history with timestamps, possibly notes on older chat, then the \
-message to answer. Reactions on a line show how it landed, including on your own replies. Each `[name]` tag says exactly who wrote that line, and lines tagged [{bot_name}] are things \
+message to answer. If there's a thread, that's the conversation you're in, and the room history is background. Reactions on a line show how it landed, including on your own replies. Each `[name]` tag says exactly who wrote that line, and lines tagged [{bot_name}] are things \
 you said, so stand by them, build on them, or admit a mistake. Timestamps show what's live and what's stale, so \
 don't treat an old conversation as if it's still going. Use the history when it's relevant and ignore it when \
 it isn't.
@@ -803,6 +918,8 @@ struct ReplyInput<'a> {
     message_text: &'a str,
     sender_name: &'a str,
     reply_target: Option<&'a RepliedTo>,
+    /// The thread being replied in, from the log.
+    thread: &'a [LoggedMessage],
     images: &'a [ImageInput],
     /// Linked pages this message is about.
     pages: &'a [LinkPreview],
@@ -842,6 +959,8 @@ async fn generate_grounded_reply(ctx: &HandlerContext, room: &Room, input: &Repl
         }
     };
     let (older, history) = log.split_at(log.len().saturating_sub(CHAT_HISTORY_LIMIT));
+    let in_thread = |entry: &LoggedMessage| input.thread.iter().any(|message| message.event_id == entry.event_id);
+    let history: Vec<LoggedMessage> = history.iter().filter(|entry| !in_thread(entry)).cloned().collect();
 
     let (notes, facts) = match kind {
         ReplyKind::Greeting => (None, None),
@@ -852,7 +971,8 @@ async fn generate_grounded_reply(ctx: &HandlerContext, room: &Room, input: &Repl
     };
 
     let user_turn = format_chat_turn(&ChatTurn {
-        history,
+        history: &history,
+        thread: input.thread,
         notes: notes.as_deref(),
         facts: facts.as_deref(),
         reply_target: input.reply_target,
@@ -902,6 +1022,7 @@ async fn generate_grounded_reply(ctx: &HandlerContext, room: &Room, input: &Repl
 /// What the model reads as the user turn.
 struct ChatTurn<'a> {
     history: &'a [LoggedMessage],
+    thread: &'a [LoggedMessage],
     notes: Option<&'a str>,
     facts: Option<&'a str>,
     reply_target: Option<&'a RepliedTo>,
@@ -913,7 +1034,7 @@ struct ChatTurn<'a> {
 }
 
 /// Renders the user turn: saved facts, notes on older chat, the recent transcript,
-/// what the message replies to, then the message itself. The message keeps its real
+/// the thread, what the message replies to, then the message itself. The message keeps its real
 /// line breaks since it can't be confused with a transcript line down here on its own.
 fn format_chat_turn(chat: &ChatTurn<'_>) -> String {
     let mut turn = String::new();
@@ -927,6 +1048,7 @@ fn format_chat_turn(chat: &ChatTurn<'_>) -> String {
     }
 
     turn.push_str(&message_log::format_history_block(chat.history, chat.bot_name));
+    turn.push_str(&message_log::format_thread_block(chat.thread, chat.bot_name));
 
     if let Some(target) = chat.reply_target {
         let quoted = target.body.as_deref().map(message_log::single_line);
@@ -1030,15 +1152,28 @@ fn help_reply(skills: &SkillRegistry) -> String {
     reply
 }
 
-/// Posts `body` as a real Matrix reply to the message that prompted it, rendering
-/// Markdown into a `formatted_body` since skill prompts routinely produce it. Being a
-/// reply is what links the two in clients and notifies `sender`.
-pub async fn send_message(room: &Room, event_id: &EventId, sender: &UserId, body: &str) -> matrix_sdk::Result<OwnedEventId> {
-    let content = RoomMessageEventContent::text_markdown(body).make_reply_to(
-        ReplyMetadata::new(event_id, sender, None),
-        ForwardThread::No,
-        AddMentions::Yes,
-    );
+/// A Matrix reply to `event_id`, inside the thread at `thread_root` if there is one,
+/// rendering Markdown into a `formatted_body` since skill prompts routinely produce it.
+/// Being a reply is what links the two in clients and notifies `sender`.
+fn reply_content(event_id: &EventId, thread_root: Option<&OwnedEventId>, sender: &UserId, body: &str) -> RoomMessageEventContent {
+    let content = RoomMessageEventContent::text_markdown(body);
+    match thread_root {
+        Some(root) => {
+            let thread = Thread::without_fallback(root.clone());
+            content.make_for_thread(ReplyMetadata::new(event_id, sender, Some(&thread)), ReplyWithinThread::Yes, AddMentions::Yes)
+        }
+        None => content.make_reply_to(ReplyMetadata::new(event_id, sender, None), ForwardThread::No, AddMentions::Yes),
+    }
+}
+
+pub async fn send_message(
+    room: &Room,
+    event_id: &EventId,
+    thread_root: Option<&OwnedEventId>,
+    sender: &UserId,
+    body: &str,
+) -> matrix_sdk::Result<OwnedEventId> {
+    let content = reply_content(event_id, thread_root, sender, body);
     Ok(room.send(content).await?.response.event_id)
 }
 
@@ -1065,6 +1200,7 @@ mod tests {
             has_image: false,
             links: Vec::new(),
             response_event_id: None,
+            thread_root_id: None,
             reactions: Vec::new(),
             response_reactions: Vec::new(),
         }
@@ -1151,6 +1287,7 @@ mod tests {
     fn chat_turn<'a>(sender_name: &'a str, message_text: &'a str) -> ChatTurn<'a> {
         ChatTurn {
             history: &[],
+            thread: &[],
             notes: None,
             facts: None,
             reply_target: None,
@@ -1170,6 +1307,7 @@ mod tests {
             sender_name: "gordy".to_string(),
             body: Some("the blue one".to_string()),
             image: None,
+            thread_root: None,
         };
         let turn = format_chat_turn(&ChatTurn {
             history: &history,
@@ -1185,6 +1323,98 @@ mod tests {
         let replied = turn.find("reply to [gordy], who wrote: the blue one").expect("reply target present");
         let current = turn.find("Message to reply to, from [carol]:\nwhy?").expect("message present");
         assert!(facts < notes && notes < alice && alice < replied && replied < current, "{turn}");
+    }
+
+    #[test]
+    fn format_chat_turn_puts_the_thread_after_the_room_and_before_the_message() {
+        let history = vec![logged_message("@alice:example.org", "unrelated")];
+        let mut root = logged_message("@bob:example.org", "best editor?");
+        root.response = Some("helix".to_string());
+        let thread = vec![root];
+        let turn = format_chat_turn(&ChatTurn { history: &history, thread: &thread, ..chat_turn("bob", "why?") });
+
+        let room = turn.find("[alice] unrelated").expect("history present");
+        let header = turn.find("This thread so far").expect("thread present");
+        let reply = turn.find("[gordy] helix").expect("bot's reply present");
+        let current = turn.find("Message to reply to, from [bob]:\nwhy?").expect("message present");
+        assert!(room < header && header < reply && reply < current, "{turn}");
+    }
+
+    fn event_id(id: &str) -> OwnedEventId {
+        id.try_into().unwrap()
+    }
+
+    fn thread_relation(content: RoomMessageEventContent) -> Thread {
+        match content.relates_to {
+            Some(Relation::Thread(thread)) => thread,
+            other => panic!("expected a thread relation, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_first_reply_starts_a_thread_on_the_original_post() {
+        let (post, sender) = (event_id("$post"), matrix_sdk::ruma::user_id!("@alice:example.org"));
+        let content = reply_content(&post, Some(&post), sender, "**hi**");
+
+        assert!(content.mentions.as_ref().is_some_and(|mentions| mentions.user_ids.contains(sender)));
+        let thread = thread_relation(content);
+        assert_eq!(thread.event_id, post);
+        assert_eq!(thread.in_reply_to.map(|reply| reply.event_id), Some(post));
+        assert!(!thread.is_falling_back);
+    }
+
+    #[test]
+    fn a_follow_up_reply_stays_in_the_thread_and_answers_the_latest_message() {
+        let (root, latest) = (event_id("$root"), event_id("$latest"));
+        let content = reply_content(&latest, Some(&root), matrix_sdk::ruma::user_id!("@alice:example.org"), "hi");
+
+        let thread = thread_relation(content);
+        assert_eq!(thread.event_id, root);
+        assert_eq!(thread.in_reply_to.map(|reply| reply.event_id), Some(latest));
+    }
+
+    #[test]
+    fn replies_outside_threads_stay_plain_replies() {
+        let content = reply_content(&event_id("$post"), None, matrix_sdk::ruma::user_id!("@alice:example.org"), "hi");
+        assert!(matches!(content.relates_to, Some(Relation::Reply(_))));
+    }
+
+    #[test]
+    fn thread_in_content_reads_only_thread_relations() {
+        let threaded = serde_json::json!({"m.relates_to": {"rel_type": "m.thread", "event_id": "$root"}});
+        assert_eq!(thread_in_content(&threaded), Some(event_id("$root")));
+
+        let reply = serde_json::json!({"m.relates_to": {"m.in_reply_to": {"event_id": "$other"}}});
+        assert_eq!(thread_in_content(&reply), None);
+        assert_eq!(thread_in_content(&serde_json::json!({"body": "hi"})), None);
+    }
+
+    #[test]
+    fn the_bot_is_in_a_thread_it_replied_in_or_that_hangs_off_its_message() {
+        let root = event_id("$root");
+
+        let mut replied = logged_message("@alice:example.org", "q");
+        replied.response_event_id = Some("$bot".to_string());
+        replied.thread_root_id = Some("$root".to_string());
+        assert!(bot_in_thread(&[replied], &root));
+
+        let mut greeted = logged_message("@alice:example.org", "hi");
+        greeted.response_event_id = Some("$root".to_string());
+        assert!(bot_in_thread(&[greeted], &root));
+
+        let mut greeted_elsewhere = logged_message("@alice:example.org", "hi");
+        greeted_elsewhere.response_event_id = Some("$bot".to_string());
+        assert!(!bot_in_thread(&[greeted_elsewhere], &root));
+
+        assert!(!bot_in_thread(&[logged_message("@alice:example.org", "chatter")], &root));
+    }
+
+    #[test]
+    fn thread_messages_for_other_people_are_not_follow_ups() {
+        assert!(is_thread_follow_up(true, false, false));
+        assert!(!is_thread_follow_up(false, false, false));
+        assert!(!is_thread_follow_up(true, true, false));
+        assert!(!is_thread_follow_up(true, false, true));
     }
 
     #[test]

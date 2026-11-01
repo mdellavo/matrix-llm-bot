@@ -77,6 +77,10 @@ const MIGRATIONS: &[&str] = &["
         source TEXT PRIMARY KEY,
         imported_at TEXT NOT NULL
     );
+", "
+    ALTER TABLE messages ADD COLUMN thread_root_id TEXT;
+    CREATE INDEX messages_thread ON messages (room_id, thread_root_id, id);
+    CREATE INDEX messages_response ON messages (room_id, response_event_id);
 "];
 
 #[derive(Debug)]
@@ -165,6 +169,27 @@ mod tests {
             .with(|connection| connection.query_row("SELECT COUNT(*) FROM imports", [], |row| row.get(0)))
             .unwrap();
         assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn a_database_from_before_threads_gains_the_thread_column() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        connection.execute_batch(MIGRATIONS[0]).unwrap();
+        connection.pragma_update(None, "user_version", 1).unwrap();
+        connection
+            .execute(
+                "INSERT INTO messages (room_id, event_id, sender, origin_server_ts_ms, logged_at, body, analysis_json) \
+                 VALUES ('!r', '$a', '@a:x', 1, 'now', 'hi', '{}')",
+                [],
+            )
+            .unwrap();
+
+        migrate(&mut connection).unwrap();
+
+        let (body, thread): (String, Option<String>) = connection
+            .query_row("SELECT body, thread_root_id FROM messages", [], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap();
+        assert_eq!((body.as_str(), thread), ("hi", None));
     }
 
     #[test]
