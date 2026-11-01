@@ -10,6 +10,7 @@ one day of commits, newest first.
 - Threads: replies to commands and conversation go in a thread on the original post
 - Follow-ups in a thread are answered without addressing the bot, using the thread's messages, images, and links
 - Status page activity stats: totals, rooms, people, the last 14 days, reply kinds, intents, sentiment, reactions, database size, and average cost per request and reply
+- Replies can see images linked directly in chat, not just attached ones
 - Private conversations with one or more people: the bot accepts invites from allowed users (`dm_allowed_users`) and answers without being addressed, and these rooms stay off the status page
 
 ### Changed

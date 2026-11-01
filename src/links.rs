@@ -13,7 +13,9 @@ use reqwest::Url;
 use reqwest::dns::{Addrs, Name, Resolve, Resolving};
 use reqwest::redirect::Policy;
 use serde::{Deserialize, Serialize};
-use tracing::debug;
+use tracing::{debug, warn};
+
+use crate::llm::{ImageInput, MAX_IMAGE_BYTES};
 
 const MAX_LINKS_PER_MESSAGE: usize = 3;
 const MAX_REDIRECTS: usize = 3;
@@ -22,6 +24,8 @@ const MAX_TITLE_CHARS: usize = 200;
 const MAX_DESCRIPTION_CHARS: usize = 300;
 const MAX_TEXT_CHARS: usize = 4000;
 const FETCH_TIMEOUT: Duration = Duration::from_secs(8);
+/// An image is only downloaded when a reply needs it, and can be much bigger than a page.
+const IMAGE_FETCH_TIMEOUT: Duration = Duration::from_secs(20);
 const USER_AGENT: &str = concat!("matrix-llm-bot/", env!("CARGO_PKG_VERSION"), " (link preview)");
 
 /// Hosts whose links are Matrix plumbing rather than something people shared.
@@ -38,6 +42,15 @@ pub struct LinkPreview {
     /// The start of the page's readable text.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub text: Option<String>,
+    /// The link is an image in a format Claude can read. Only downloaded when a reply
+    /// needs it, so nothing is stored and a link nobody asks about costs nothing.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub image: bool,
+}
+
+/// The stated types of images Claude can read.
+fn is_readable_image(content_type: &str) -> bool {
+    matches!(content_type, "image/jpeg" | "image/jpg" | "image/png" | "image/gif" | "image/webp")
 }
 
 /// The http(s) URLs in a message, in order and without repeats.
@@ -201,6 +214,38 @@ impl LinkFetcher {
         previews
     }
 
+    /// Downloads a linked image for Claude, under the same address checks as any other
+    /// link. Failures are logged, since the reply will say it couldn't see the image.
+    pub async fn fetch_image(&self, url: &str) -> Option<ImageInput> {
+        let url = Url::parse(url).ok()?;
+        if !self.enabled || !is_allowed_url(&url, self.allow_private) {
+            return None;
+        }
+
+        match self.try_fetch_image(&url).await {
+            Ok(image) => Some(image),
+            Err(err) => {
+                warn!(?err, host = url.host_str(), "failed to download linked image");
+                None
+            }
+        }
+    }
+
+    async fn try_fetch_image(&self, url: &Url) -> Result<ImageInput> {
+        let mut response = self.client.get(url.clone()).timeout(IMAGE_FETCH_TIMEOUT).send().await?.error_for_status()?;
+
+        // Stopped early rather than cut short: part of an image is no use to Claude.
+        let too_big = |size: u64| size > MAX_IMAGE_BYTES as u64;
+        anyhow::ensure!(!response.content_length().is_some_and(too_big), "image is too large");
+
+        let mut body = Vec::new();
+        while let Some(chunk) = response.chunk().await? {
+            body.extend_from_slice(&chunk);
+            anyhow::ensure!(!too_big(body.len() as u64), "image is too large");
+        }
+        ImageInput::from_bytes(&body).context("not an image Claude can read")
+    }
+
     async fn fetch(&self, url: Url) -> Option<LinkPreview> {
         if !is_allowed_url(&url, self.allow_private) {
             debug!(%url, "not fetching disallowed link");
@@ -227,9 +272,10 @@ impl LinkFetcher {
             .to_ascii_lowercase();
 
         if content_type.starts_with("image/") || content_type.starts_with("video/") || content_type.starts_with("audio/") {
-            let kind = content_type.split(';').next().unwrap_or_default().to_string();
+            let kind = content_type.split(';').next().unwrap_or_default().trim().to_string();
             let description = Some(format!("A {kind} file."));
-            return Ok(Some(LinkPreview { url: url.to_string(), title: None, description, text: None }));
+            let image = is_readable_image(&kind);
+            return Ok(Some(LinkPreview { url: url.to_string(), title: None, description, text: None, image }));
         }
 
         let is_html = content_type.contains("html");
@@ -255,6 +301,7 @@ impl LinkFetcher {
                 title: None,
                 description: None,
                 text: Some(clip(&collapse_whitespace(&body), MAX_TEXT_CHARS)).filter(|text| !text.is_empty()),
+                image: false,
             }
         };
         Ok(Some(preview).filter(|preview| preview.title.is_some() || preview.description.is_some() || preview.text.is_some()))
@@ -274,6 +321,7 @@ fn parse_html(url: &str, html: &str) -> LinkPreview {
         description: meta(&["og:description", "description", "twitter:description"])
             .and_then(|description| tidy(description, MAX_DESCRIPTION_CHARS)),
         text: tidy(visible_text(html, &lower), MAX_TEXT_CHARS),
+        image: false,
     }
 }
 
@@ -563,11 +611,56 @@ mod tests {
 
     #[tokio::test]
     async fn describes_media_without_downloading_it() {
-        let app = Router::new().route("/cat.png", get(|| async { ([(header::CONTENT_TYPE, "image/png")], "bytes") }));
+        let app = Router::new()
+            .route("/cat.png", get(|| async { ([(header::CONTENT_TYPE, "image/png; charset=binary")], "bytes") }))
+            .route("/cat.svg", get(|| async { ([(header::CONTENT_TYPE, "image/svg+xml")], "<svg>") }))
+            .route("/cat.mp4", get(|| async { ([(header::CONTENT_TYPE, "video/mp4")], "bytes") }));
         let base = serve(app).await;
 
-        let previews = LinkFetcher::build(true, true).unwrap().fetch_all(&format!("{base}/cat.png")).await;
+        let previews = LinkFetcher::build(true, true).unwrap().fetch_all(&format!("{base}/cat.png {base}/cat.svg {base}/cat.mp4")).await;
         assert_eq!(previews[0].description.as_deref(), Some("A image/png file."));
+        assert_eq!(previews.iter().map(|preview| preview.image).collect::<Vec<_>>(), [true, false, false]);
+    }
+
+    const PNG: &[u8] = &[0x89, b'P', b'N', b'G', 1, 2, 3];
+
+    #[tokio::test]
+    async fn downloads_a_linked_image_following_redirects() {
+        let app = Router::new()
+            .route("/cat.png", get(|| async { ([(header::CONTENT_TYPE, "image/png")], PNG) }))
+            .route("/moved", get(|| async { Redirect::temporary("/cat.png") }));
+        let base = serve(app).await;
+
+        let image = LinkFetcher::build(true, true).unwrap().fetch_image(&format!("{base}/moved")).await.expect("image");
+        assert_eq!(image.media_type, "image/png");
+        assert_eq!(image.data, base64::Engine::encode(&base64::engine::general_purpose::STANDARD, PNG));
+    }
+
+    #[tokio::test]
+    async fn the_type_a_site_states_does_not_make_something_an_image() {
+        let app = Router::new().route("/fake.png", get(|| async { ([(header::CONTENT_TYPE, "image/png")], "<html>") }));
+        let base = serve(app).await;
+
+        assert!(LinkFetcher::build(true, true).unwrap().fetch_image(&format!("{base}/fake.png")).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn refuses_a_linked_image_over_the_size_limit() {
+        fn oversized() -> Vec<u8> {
+            let mut body = vec![0; MAX_IMAGE_BYTES + 1];
+            body[..PNG.len()].copy_from_slice(PNG);
+            body
+        }
+        let app = Router::new().route("/big.png", get(|| async { oversized() }));
+        let base = serve(app).await;
+
+        assert!(LinkFetcher::build(true, true).unwrap().fetch_image(&format!("{base}/big.png")).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn the_real_fetcher_will_not_download_an_image_from_a_local_server() {
+        let base = serve(Router::new().route("/cat.png", get(|| async { PNG }))).await;
+        assert!(LinkFetcher::new(true).unwrap().fetch_image(&format!("{base}/cat.png")).await.is_none());
     }
 
     #[tokio::test]

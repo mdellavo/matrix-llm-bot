@@ -10,6 +10,7 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use base64::Engine;
 use serde_json::{Value, json};
 use threatflux_anthropic_sdk::Client as Anthropic;
 use threatflux_anthropic_sdk::models::Usage;
@@ -40,6 +41,31 @@ pub struct ImageInput {
     pub media_type: &'static str,
     /// Base64-encoded file contents.
     pub data: String,
+}
+
+/// Claude's limit is 5MB of base64, which is this many bytes of file.
+pub const MAX_IMAGE_BYTES: usize = 3_750_000;
+
+/// Identifies an image by its first bytes rather than trusting the sender's or the
+/// website's stated type.
+fn image_media_type(bytes: &[u8]) -> Option<&'static str> {
+    match bytes {
+        [0x89, b'P', b'N', b'G', ..] => Some("image/png"),
+        [0xFF, 0xD8, 0xFF, ..] => Some("image/jpeg"),
+        [b'G', b'I', b'F', b'8', ..] => Some("image/gif"),
+        [b'R', b'I', b'F', b'F', _, _, _, _, b'W', b'E', b'B', b'P', ..] => Some("image/webp"),
+        _ => None,
+    }
+}
+
+impl ImageInput {
+    /// Prepares a file for Claude, or `None` if it's too big or not an image Claude reads.
+    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() > MAX_IMAGE_BYTES {
+            return None;
+        }
+        Some(Self { media_type: image_media_type(bytes)?, data: base64::engine::general_purpose::STANDARD.encode(bytes) })
+    }
 }
 
 /// Tools the bot runs itself, as opposed to server tools Anthropic runs.
@@ -348,6 +374,29 @@ mod tests {
         let content = &body["messages"][0]["content"];
         assert_eq!(content[0]["source"]["data"], "abc");
         assert_eq!(content[1], json!({"type": "text", "text": "what is this"}));
+    }
+
+    #[test]
+    fn image_media_type_goes_by_the_file_not_the_sender() {
+        assert_eq!(image_media_type(&[0x89, b'P', b'N', b'G', 0x0D]), Some("image/png"));
+        assert_eq!(image_media_type(&[0xFF, 0xD8, 0xFF, 0xE0]), Some("image/jpeg"));
+        assert_eq!(image_media_type(b"GIF89a"), Some("image/gif"));
+        assert_eq!(image_media_type(b"RIFF\0\0\0\0WEBPVP8 "), Some("image/webp"));
+        assert_eq!(image_media_type(b"<svg></svg>"), None);
+    }
+
+    #[test]
+    fn image_input_reads_the_file_not_its_label() {
+        let png = [0x89, b'P', b'N', b'G', 1, 2, 3];
+        assert_eq!(ImageInput::from_bytes(&png).unwrap().media_type, "image/png");
+        assert!(ImageInput::from_bytes(b"<html>not an image</html>").is_none());
+    }
+
+    #[test]
+    fn image_input_refuses_a_file_over_claudes_limit() {
+        let mut big = vec![0; MAX_IMAGE_BYTES + 1];
+        big[..3].copy_from_slice(&[0xFF, 0xD8, 0xFF]);
+        assert!(ImageInput::from_bytes(&big).is_none());
     }
 
     #[test]

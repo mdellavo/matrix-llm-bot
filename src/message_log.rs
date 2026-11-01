@@ -907,6 +907,7 @@ mod tests {
             title: Some("Big news".to_string()),
             description: Some("Something happened".to_string()),
             text: Some("The full article".to_string()),
+            image: false,
         }];
 
         let transcript = format_transcript(&[entry], "gordy");

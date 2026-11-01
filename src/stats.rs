@@ -299,7 +299,7 @@ mod tests {
     #[test]
     fn counts_messages_replies_threads_and_windows() {
         let (database, logger) = setup();
-        let links = [LinkPreview { url: "https://example.com".to_string(), title: None, description: None, text: None }];
+        let links = [LinkPreview { url: "https://example.com".to_string(), title: None, description: None, text: None, image: false }];
 
         log(&logger, &Line { reply: Some("$r1"), thread_root_id: Some("$a"), intent: Intent::Question, ..line("!r", "$a", "@alice:x") });
         log(&logger, &Line { thread_root_id: Some("$a"), links: &links, ..line("!r", "$b", "@bob:x") });
