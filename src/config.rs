@@ -96,6 +96,12 @@ pub struct Config {
     /// public addresses are fetched. Defaults to true.
     #[serde(default = "default_fetch_links")]
     pub fetch_links: bool,
+
+    /// Who may start a private conversation by inviting the bot: user IDs
+    /// (`@alice:example.org`) and whole servers (`:example.org`). Invites from anyone
+    /// else are declined. Empty (the default) means the bot's own homeserver.
+    #[serde(default)]
+    pub dm_allowed_users: Vec<String>,
 }
 
 fn default_database_path() -> PathBuf {
@@ -164,6 +170,12 @@ impl Config {
             (0.0..=1.0).contains(&self.interjection_chance),
             "interjection_chance must be between 0 and 1"
         );
+        for entry in &self.dm_allowed_users {
+            anyhow::ensure!(
+                (entry.starts_with('@') || entry.starts_with(':')) && entry.contains(':') && entry.len() > 1,
+                "dm_allowed_users entries must look like @user:example.org or :example.org, got {entry}"
+            );
+        }
         Ok(())
     }
 }

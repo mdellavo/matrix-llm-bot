@@ -13,8 +13,9 @@ use tracing::{info, warn};
 
 use crate::config::Config;
 use crate::db::Database;
+use crate::direct_rooms::DirectRooms;
 use crate::greeting::GreetingCooldown;
-use crate::handler::{HandlerContext, on_reaction, on_room_message};
+use crate::handler::{HandlerContext, answer_pending_invites, on_invite, on_reaction, on_room_message};
 use crate::ignore::IgnoredUsers;
 use crate::legacy_import::import_legacy_data;
 use crate::links::LinkFetcher;
@@ -38,6 +39,8 @@ pub struct Bot {
     greeting_cooldown: Arc<GreetingCooldown>,
     ignored_users: Arc<IgnoredUsers>,
     rate_limit: Arc<Throttle>,
+    direct_rooms: Arc<DirectRooms>,
+    database: Arc<Database>,
 }
 
 impl Bot {
@@ -88,6 +91,7 @@ impl Bot {
         let greeting_cooldown = Arc::new(GreetingCooldown::new(crate::greeting::DEFAULT_COOLDOWN));
         let ignored_users = Arc::new(IgnoredUsers::new(config.ignored_users.clone()));
         let rate_limit = Arc::new(Throttle::new(std::time::Duration::from_secs(config.rate_limit_backoff_secs)));
+        let direct_rooms = Arc::new(DirectRooms::new(Arc::clone(&database), config.dm_allowed_users.clone()));
 
         // Bundled into one `HandlerContext` (see its doc comment in `handler.rs`)
         // and registered as a single event-handler context, rather than one
@@ -102,7 +106,8 @@ impl Bot {
             greeting_cooldown: Arc::clone(&greeting_cooldown),
             ignored_users: Arc::clone(&ignored_users),
             rate_limit: Arc::clone(&rate_limit),
-            memory: Arc::new(RoomMemory::new(database)),
+            direct_rooms: Arc::clone(&direct_rooms),
+            memory: Arc::new(RoomMemory::new(Arc::clone(&database))),
             room_queues: Arc::new(RoomQueues::default()),
             links: Arc::new(LinkFetcher::new(config.fetch_links)?),
             interjection_chance: config.interjection_chance,
@@ -112,7 +117,7 @@ impl Bot {
             bot_name: short_name(&config.username).to_string(),
         }));
 
-        Ok(Self { client, message_log, skills, tool_clients, usage_tracker, greeting_cooldown, ignored_users, rate_limit })
+        Ok(Self { client, message_log, skills, tool_clients, usage_tracker, greeting_cooldown, ignored_users, rate_limit, direct_rooms, database })
     }
 
     /// Restores a previously saved session if one exists at `<store_path>/session.json`
@@ -201,6 +206,18 @@ impl Bot {
         Arc::clone(&self.rate_limit)
     }
 
+    /// A clone of the private-room list, for callers (e.g. the status server) that
+    /// need to keep those conversations out of what they show.
+    pub fn direct_rooms(&self) -> Arc<DirectRooms> {
+        Arc::clone(&self.direct_rooms)
+    }
+
+    /// A clone of the database handle, for callers (e.g. the status server) that report
+    /// on what's stored.
+    pub fn database(&self) -> Arc<Database> {
+        Arc::clone(&self.database)
+    }
+
     /// Joins every room configured for monitoring. Already-joined rooms are skipped.
     pub async fn join_configured_rooms(&self, rooms: &[String]) -> Result<()> {
         for room in rooms {
@@ -226,6 +243,10 @@ impl Bot {
 
         self.client.add_event_handler(on_room_message);
         self.client.add_event_handler(on_reaction);
+        self.client.add_event_handler(on_invite);
+
+        // The handler only sees new invites, not ones that came in while offline.
+        answer_pending_invites(&self.client, &self.direct_rooms, &self.ignored_users).await;
 
         info!("starting sync loop");
         let settings = SyncSettings::default().token(response.next_batch);

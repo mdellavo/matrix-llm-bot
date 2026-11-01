@@ -2,6 +2,7 @@ mod bot;
 mod classify;
 mod config;
 mod db;
+mod direct_rooms;
 mod greeting;
 mod handler;
 mod ignore;
@@ -12,6 +13,7 @@ mod message_log;
 mod room_memory;
 mod room_queue;
 mod skills;
+mod stats;
 mod status_server;
 mod throttle;
 mod tools;
@@ -60,6 +62,8 @@ async fn main() -> Result<()> {
         tool_clients: bot.tool_clients(),
         usage_tracker: bot.usage_tracker(),
         rate_limit: bot.rate_limit(),
+        direct_rooms: bot.direct_rooms(),
+        database: bot.database(),
         homeserver_url: config.homeserver_url.clone(),
     });
     let http_listen_addr = config.http_listen_addr;

@@ -26,11 +26,13 @@ To test Claude calls without the API, use the fake Messages server in `src/llm.r
 | `src/classify.rs` | Intent and sentiment classification |
 | `src/links.rs` | Fetching linked pages, limited to public addresses |
 | `src/db.rs` | The SQLite database and its schema migrations |
+| `src/direct_rooms.rs` | Private rooms, and who may start one |
 | `src/legacy_import.rs` | One-time import of pre-SQLite data files |
 | `src/message_log.rs` | Stored messages and reactions, transcripts, and search |
 | `src/room_memory.rs` | Saved facts and room summaries |
 | `src/room_queue.rs` | Per-room ordering and message bursts |
 | `src/skills.rs`, `skills/*/SKILL.md` | Command loading, arguments, and prompts |
+| `src/stats.rs`, `src/status_server.rs` | Status page and the activity counts behind it |
 | `src/usage.rs` | Token counts, prices, and the cost limit |
 
 ## Protect runtime state

@@ -176,6 +176,8 @@ A skill file with bad frontmatter or an unrecognized `tools`/`args` entry is ski
 - Each room's messages are handled one at a time, in order (`src/room_queue.rs`). Quick follow-ups from the same person are answered together, after a 1.5 second wait on addressed messages.
 - Unprompted comments are off by default. Set `interjection_chance` to turn them on; the bot can still decide to pass, and `interjection_cooldown_secs` limits them per room.
 - Replies show a typing indicator while being generated. Replies to commands and conversation go in a thread on the original post, or stay in the thread they were asked in. Greetings and unprompted comments are plain replies outside a thread.
+- Private conversations: invite the bot to a room and it joins, if `dm_allowed_users` allows the inviter (by default, anyone on its own homeserver). Other invites are declined. With one person, every message is answered with a normal message, and a bare acknowledgement gets a 👍. With a few people, up to 10 members counting the bot, it answers everything except messages that mention someone or reply to someone else, and uses replies so it's clear who it's answering. Neither uses threads unless someone starts one. Above 10 members it behaves as in any other room. Memory stays with the room, so nothing crosses between chats. Only the inviter is checked, so they vouch for anyone they add. These rooms are left off the status page, but they are stored in the database like everything else.
+- Status page: bot and Claude usage details, plus activity counted from the database: message, reply, thread, image, link, and reaction totals, per-room and per-person tables, the last 14 days, and breakdowns of reply kinds, intents, and sentiment. Private conversations appear only as a total.
 - Threads: once the bot has posted in a thread, every message there counts as addressed to it, unless the message mentions someone or replies to someone else. A bare acknowledgement gets no reply. The reply sees the whole thread, up to its last 50 messages, plus any images and links in it, however old. Each follow-up is a full chat reply, so a busy thread costs more than room chat.
 - Claude API token usage and an estimated USD cost are tracked per command/reply type, saved so they survive restarts, and shown on the status page (`src/usage.rs`). Estimates come from a hardcoded pricing table, not fetched live, and leave out cache tokens. Set `cost_limit_usd` to stop Claude calls at a spending cap.
 - The status/debugging server (`src/status_server.rs`) has **no authentication** and binds to `127.0.0.1` by default — only widen `http_listen_addr` deliberately, and put it behind your own auth/reverse proxy if you do.
@@ -195,7 +197,6 @@ Ideas for later, not commitments. See [CHANGELOG.md](CHANGELOG.md) for what's sh
 
 - Reminders: "gordy, remind me Friday to..."
 - Scheduled posts, such as a daily digest or a catch-up on what someone missed
-- DMs: decide how they should work
 
 ### Reliability
 

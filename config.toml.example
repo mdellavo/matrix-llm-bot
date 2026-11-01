@@ -63,3 +63,8 @@ rooms = ["#some-room:matrix.org"]
 # Optional: fetch pages linked in chat, so the bot knows what was shared without
 # being asked. Only public addresses are fetched. Defaults to true.
 # fetch_links = true
+
+# Optional: who may start a private conversation by inviting the bot, as user IDs and
+# whole servers. Invites from anyone else are declined. Each reply there costs a Claude
+# call, so consider setting cost_limit_usd too. Defaults to the bot's own homeserver.
+# dm_allowed_users = ["@alice:matrix.org", ":example.org"]

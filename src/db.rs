@@ -1,5 +1,5 @@
 //! The bot's own SQLite database: messages, reactions, saved facts, room summaries,
-//! and usage totals. Matrix session and encryption state is separate, in
+//! private rooms, and usage totals. Matrix session and encryption state is separate, in
 //! matrix-sdk's own stores.
 //!
 //! Queries are synchronous and run on the caller's task. They're short, and a single
@@ -81,6 +81,12 @@ const MIGRATIONS: &[&str] = &["
     ALTER TABLE messages ADD COLUMN thread_root_id TEXT;
     CREATE INDEX messages_thread ON messages (room_id, thread_root_id, id);
     CREATE INDEX messages_response ON messages (room_id, response_event_id);
+", "
+    CREATE TABLE direct_rooms (
+        room_id TEXT PRIMARY KEY,
+        invited_by TEXT NOT NULL,
+        joined_at TEXT NOT NULL
+    );
 "];
 
 #[derive(Debug)]

@@ -14,6 +14,8 @@ use matrix_sdk::Client;
 use serde::{Deserialize, Serialize};
 use tracing::info;
 
+use crate::db::Database;
+use crate::direct_rooms::DirectRooms;
 use crate::message_log::MessageLogger;
 use crate::skills::SkillRegistry;
 use crate::throttle::Throttle;
@@ -35,6 +37,8 @@ pub struct AppState {
     pub tool_clients: Arc<ToolClients>,
     pub usage_tracker: Arc<UsageTracker>,
     pub rate_limit: Arc<Throttle>,
+    pub direct_rooms: Arc<DirectRooms>,
+    pub database: Arc<Database>,
     pub homeserver_url: String,
 }
 
@@ -45,6 +49,7 @@ fn router(state: Arc<AppState>) -> Router {
         .route("/api/rooms/{room_id}/messages", get(api_room_messages))
         .route("/api/skills", get(api_skills))
         .route("/api/usage", get(api_usage))
+        .route("/api/stats", get(api_stats))
         .with_state(state)
 }
 
@@ -82,11 +87,18 @@ struct RoomSummary {
     display_name: Option<String>,
 }
 
+/// Private conversations stay off this page, since it has no login. If that can't be
+/// checked, the room is treated as private.
+fn is_private(state: &AppState, room_id: &str) -> bool {
+    state.direct_rooms.contains(room_id).unwrap_or(true)
+}
+
 async fn api_status(State(state): State<Arc<AppState>>) -> Json<StatusResponse> {
     let rooms = state
         .client
         .joined_rooms()
         .into_iter()
+        .filter(|room| !is_private(&state, room.room_id().as_str()))
         .map(|room| RoomSummary {
             room_id: room.room_id().to_string(),
             display_name: room.name(),
@@ -114,6 +126,10 @@ async fn api_room_messages(
     Path(room_id): Path<String>,
     Query(query): Query<MessagesQuery>,
 ) -> impl IntoResponse {
+    if is_private(&state, &room_id) {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+
     let limit = query.limit.unwrap_or(DEFAULT_MESSAGES_LIMIT).clamp(1, MAX_MESSAGES_LIMIT);
 
     match state.message_log.recent_with_prompts(&room_id, limit) {
@@ -157,6 +173,14 @@ async fn api_usage(State(state): State<Arc<AppState>>) -> Json<crate::usage::Usa
     Json(state.usage_tracker.snapshot())
 }
 
+/// Activity counted from the database. See `crate::stats`.
+async fn api_stats(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    match crate::stats::collect(&state.database, chrono::Utc::now().timestamp_millis()) {
+        Ok(stats) => Json(stats).into_response(),
+        Err(err) => (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response(),
+    }
+}
+
 async fn index() -> Html<&'static str> {
     Html(INDEX_HTML)
 }
@@ -183,6 +207,14 @@ const INDEX_HTML: &str = r#"<!doctype html>
   .details-block:last-child { margin-bottom: 0; }
   .details-block pre { white-space: pre-wrap; word-break: break-word; max-height: 300px; overflow: auto; background: #8881; padding: 0.5rem; border-radius: 4px; margin: 0.25rem 0; }
   .details-block summary { cursor: pointer; }
+  .tiles { display: grid; grid-template-columns: repeat(auto-fill, minmax(9.5rem, 1fr)); gap: 0.5rem; margin: 1rem 0; }
+  .tile { border: 1px solid #8884; border-radius: 6px; padding: 0.5rem 0.75rem; }
+  .tile b { display: block; font-size: 1.35rem; font-weight: 600; font-variant-numeric: tabular-nums; }
+  .tile span { font-size: 0.8rem; opacity: 0.75; }
+  .columns { display: grid; grid-template-columns: repeat(auto-fit, minmax(16rem, 1fr)); gap: 1rem; }
+  .columns h3 { font-size: 0.95rem; margin: 1rem 0 0; }
+  td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
+  .table-scroll { overflow-x: auto; }
 </style>
 </head>
 <body>
@@ -196,6 +228,36 @@ const INDEX_HTML: &str = r#"<!doctype html>
     <dt>Claude API rate limit</dt><dd id="rate-limited">…</dd>
   </dl>
 
+  <h2>Activity</h2>
+  <div class="tiles" id="stat-tiles"></div>
+  <p id="stats-note"></p>
+  <div class="table-scroll"><table>
+    <thead>
+      <tr><th>Room</th><th class="num">Messages</th><th class="num">Replies</th><th class="num">People</th><th class="num">Threads</th><th>Last message</th></tr>
+    </thead>
+    <tbody id="stats-rooms"></tbody>
+  </table></div>
+  <div class="columns">
+    <div>
+      <h3>Last 14 days (UTC)</h3>
+      <table>
+        <thead><tr><th>Day</th><th class="num">Messages</th><th class="num">Replies</th></tr></thead>
+        <tbody id="stats-daily"></tbody>
+      </table>
+    </div>
+    <div>
+      <h3>Most active people</h3>
+      <table>
+        <thead><tr><th>Person</th><th class="num">Messages</th><th class="num">Replies</th></tr></thead>
+        <tbody id="stats-people"></tbody>
+      </table>
+    </div>
+    <div><h3>Replies by kind</h3><table><tbody id="stats-reply-kinds"></tbody></table></div>
+    <div><h3>Intents</h3><table><tbody id="stats-intents"></tbody></table></div>
+    <div><h3>Sentiment</h3><table><tbody id="stats-sentiments"></tbody></table></div>
+    <div><h3>Reactions</h3><table><tbody id="stats-reactions"></tbody></table></div>
+  </div>
+
   <h2>Claude API usage</h2>
   <dl>
     <dt>Total tokens</dt><dd id="usage-total-tokens">…</dd>
@@ -203,6 +265,8 @@ const INDEX_HTML: &str = r#"<!doctype html>
     <dt>Output tokens</dt><dd id="usage-output-tokens">…</dd>
     <dt>Requests</dt><dd id="usage-requests">…</dd>
     <dt>Estimated cost</dt><dd id="usage-cost">…</dd>
+    <dt>Average per request</dt><dd id="usage-cost-per-request">…</dd>
+    <dt>Average per reply</dt><dd id="usage-cost-per-reply">…</dd>
     <dt>Cost limit</dt><dd id="usage-cost-limit">…</dd>
     <dt>Web searches</dt><dd id="usage-web-searches">…</dd>
     <dt>Web search cost</dt><dd id="usage-web-search-cost">…</dd>
@@ -383,6 +447,104 @@ function formatCost(usd) {
   return usd.toLocaleString('en-US', { style: 'currency', currency: 'USD' });
 }
 
+// Costs per call are often under a cent, where rounding to cents would show $0.00.
+function formatSmallCost(usd) {
+  return usd.toLocaleString('en-US', { style: 'currency', currency: 'USD', maximumFractionDigits: 4 });
+}
+
+function formatBytes(bytes) {
+  const units = ['B', 'KB', 'MB', 'GB'];
+  let value = bytes;
+  let unit = 0;
+  while (value >= 1024 && unit < units.length - 1) {
+    value /= 1024;
+    unit += 1;
+  }
+  return `${value.toLocaleString('en-US', { maximumFractionDigits: 1 })} ${units[unit]}`;
+}
+
+function formatTime(ms) {
+  return ms == null ? 'never' : new Date(ms).toLocaleString();
+}
+
+function formatPercent(part, whole) {
+  return whole > 0 ? `${(part / whole * 100).toLocaleString('en-US', { maximumFractionDigits: 1 })}%` : '—';
+}
+
+function fillRows(id, columns, rows, render) {
+  const tbody = document.getElementById(id);
+  tbody.innerHTML = rows.length > 0
+    ? rows.map(render).join('')
+    : `<tr><td colspan="${columns}">(nothing yet)</td></tr>`;
+}
+
+function countRow(whole) {
+  return (entry) => `<tr><td>${escapeHtml(entry.name)}</td><td class="num">${formatCount(entry.count)}</td><td class="num">${formatPercent(entry.count, whole)}</td></tr>`;
+}
+
+function sumCounts(entries) {
+  return entries.reduce((sum, entry) => sum + entry.count, 0);
+}
+
+let roomNames = {};
+let replyCount = null;
+let lastCost = null;
+
+function showCostPerReply() {
+  if (replyCount == null || lastCost == null) return;
+  document.getElementById('usage-cost-per-reply').textContent = replyCount > 0 ? formatSmallCost(lastCost / replyCount) : '—';
+}
+
+async function loadStats() {
+  const res = await fetch('/api/stats');
+  const tiles = document.getElementById('stat-tiles');
+  if (!res.ok) {
+    tiles.textContent = `Failed to load stats: ${await res.text()}`;
+    return;
+  }
+  const stats = await res.json();
+  const t = stats.totals;
+
+  const tileValues = [
+    ['Messages', formatCount(t.messages)],
+    ['Last 24 hours', formatCount(t.messages_24h)],
+    ['Last 7 days', formatCount(t.messages_7d)],
+    ['Replies sent', formatCount(t.replies)],
+    ['Reply rate', formatPercent(t.replies, t.messages)],
+    ['People', formatCount(t.people)],
+    ['Threads', formatCount(t.threads)],
+    ['Images', formatCount(t.images)],
+    ['Links', formatCount(t.links)],
+    ['Reactions', formatCount(t.reactions)],
+    ['Saved facts', formatCount(t.facts)],
+    ['Room summaries', formatCount(t.room_summaries)],
+    ['Private chats', formatCount(t.private_conversations)],
+    ['Database size', formatBytes(stats.database_bytes)],
+  ];
+  tiles.innerHTML = tileValues.map(([label, value]) => `<div class="tile"><b>${escapeHtml(value)}</b><span>${escapeHtml(label)}</span></div>`).join('');
+
+  document.getElementById('stats-note').textContent =
+    `First message ${formatTime(t.first_message_ms)}. Last message ${formatTime(t.last_message_ms)}. Private chats are counted above and left out of everything else here.`;
+
+  fillRows('stats-rooms', 6, stats.rooms, (room) => `<tr>
+    <td>${escapeHtml(roomNames[room.room_id] ?? room.room_id)}</td>
+    <td class="num">${formatCount(room.messages)}</td>
+    <td class="num">${formatCount(room.replies)}</td>
+    <td class="num">${formatCount(room.people)}</td>
+    <td class="num">${formatCount(room.threads)}</td>
+    <td>${escapeHtml(formatTime(room.last_message_ms))}</td>
+  </tr>`);
+  fillRows('stats-daily', 3, stats.daily, (day) => `<tr><td>${escapeHtml(day.day)}</td><td class="num">${formatCount(day.messages)}</td><td class="num">${formatCount(day.replies)}</td></tr>`);
+  fillRows('stats-people', 3, stats.people, (person) => `<tr><td>${escapeHtml(person.name)}</td><td class="num">${formatCount(person.messages)}</td><td class="num">${formatCount(person.replies)}</td></tr>`);
+  fillRows('stats-reply-kinds', 3, stats.reply_kinds, countRow(sumCounts(stats.reply_kinds)));
+  fillRows('stats-intents', 3, stats.intents, countRow(sumCounts(stats.intents)));
+  fillRows('stats-sentiments', 3, stats.sentiments, countRow(sumCounts(stats.sentiments)));
+  fillRows('stats-reactions', 3, stats.reactions, countRow(sumCounts(stats.reactions)));
+
+  replyCount = t.replies;
+  showCostPerReply();
+}
+
 async function loadUsage() {
   const res = await fetch('/api/usage');
   const tbody = document.getElementById('usage-body');
@@ -397,6 +559,9 @@ async function loadUsage() {
   document.getElementById('usage-output-tokens').textContent = formatCount(usage.output_tokens);
   document.getElementById('usage-requests').textContent = formatCount(usage.request_count);
   document.getElementById('usage-cost').textContent = formatCost(usage.estimated_cost_usd);
+  document.getElementById('usage-cost-per-request').textContent = usage.request_count > 0 ? formatSmallCost(usage.estimated_cost_usd / usage.request_count) : '—';
+  lastCost = usage.estimated_cost_usd;
+  showCostPerReply();
   document.getElementById('usage-cost-limit').textContent = usage.cost_limit_usd == null ? 'none' : formatCost(usage.cost_limit_usd);
   document.getElementById('usage-web-searches').textContent = formatCount(usage.web_search_requests);
   document.getElementById('usage-web-search-cost').textContent = formatCost(usage.web_search_cost_usd);
@@ -449,6 +614,8 @@ async function loadStatus(selectFirstRoom) {
     ? 'not throttled'
     : `throttled — retrying in ${data.rate_limited_seconds_remaining}s`;
 
+  roomNames = Object.fromEntries(data.rooms.filter((room) => room.display_name).map((room) => [room.room_id, room.display_name]));
+
   const roomSelect = document.getElementById('room-select');
   const previousValue = roomSelect.value;
   roomSelect.innerHTML = '';
@@ -471,10 +638,11 @@ document.getElementById('room-select').addEventListener('change', (e) => loadMes
 document.getElementById('refresh').addEventListener('click', async () => {
   await loadStatus(false);
   loadMessages(document.getElementById('room-select').value);
+  loadStats();
   loadUsage();
 });
 
-loadStatus(true);
+loadStatus(true).then(loadStats);
 loadSkills();
 loadUsage();
 </script>
@@ -588,9 +756,13 @@ mod tests {
         let skills_dir = unique_temp_dir("status-server-skills");
         let skills = Arc::new(SkillRegistry::load(&skills_dir).expect("load skills"));
         let tool_clients = Arc::new(ToolClients::new(None));
+        let direct_database = Arc::clone(&database);
+        let stats_database = Arc::clone(&database);
         let usage_tracker = Arc::new(UsageTracker::open(database, None).expect("open usage tracker"));
         usage_tracker.record("classify", "claude-haiku-4-5", &test_usage(120, 30));
         let rate_limit = Arc::new(Throttle::new(std::time::Duration::from_secs(60)));
+        let direct_rooms = Arc::new(DirectRooms::new(direct_database, Vec::new()));
+        direct_rooms.add("!private:example.org", "@alice:example.org").expect("add private room");
 
         let state = Arc::new(AppState {
             start_time: Instant::now(),
@@ -600,6 +772,8 @@ mod tests {
             tool_clients,
             usage_tracker,
             rate_limit,
+            direct_rooms,
+            database: stats_database,
             homeserver_url: "http://example.invalid".to_string(),
         });
 
@@ -626,6 +800,19 @@ mod tests {
         assert!(status["rate_limited_seconds_remaining"].is_null(), "not throttled in this test");
         // The client never synced, so it has no joined rooms — the route still works.
         assert_eq!(status["rooms"].as_array().expect("rooms array").len(), 0);
+
+        let stats_resp = http.get(format!("{base}/api/stats")).send().await.expect("GET /api/stats");
+        assert!(stats_resp.status().is_success());
+        let stats: serde_json::Value = stats_resp.json().await.expect("stats json");
+        assert_eq!(stats["totals"]["private_conversations"], 1);
+        assert!(stats["totals"]["messages"].as_u64().expect("message count") > 0);
+
+        let private_resp = http
+            .get(format!("{base}/api/rooms/!private:example.org/messages"))
+            .send()
+            .await
+            .expect("GET a private room's messages");
+        assert_eq!(private_resp.status(), reqwest::StatusCode::NOT_FOUND);
 
         let messages_resp = http
             .get(format!("{base}/api/rooms/{room_id}/messages?limit=10"))

@@ -14,6 +14,7 @@ use matrix_sdk::{
             relation::{Annotation, Thread},
             room::{
                 MediaSource,
+                member::{MembershipState, StrippedRoomMemberEvent},
                 message::{
                     AddMentions, ForwardThread, ImageMessageEventContent, MessageType, OriginalSyncRoomMessageEvent,
                     Relation, ReplyMetadata, ReplyWithinThread, RoomMessageEventContent,
@@ -26,6 +27,7 @@ use threatflux_anthropic_sdk::Client as Anthropic;
 use tracing::{debug, info, warn};
 
 use crate::classify::{ClassifyOutcome, Intent, MessageAnalysis, classify_message};
+use crate::direct_rooms::DirectRooms;
 use crate::greeting::GreetingCooldown;
 use crate::ignore::IgnoredUsers;
 use crate::links::{LinkFetcher, LinkPreview};
@@ -177,10 +179,35 @@ fn bot_in_thread(thread: &[LoggedMessage], root: &EventId) -> bool {
     })
 }
 
-/// A message in a thread the bot is part of is for the bot, the same as the next line
-/// of a conversation, unless it's clearly for someone else.
-fn is_thread_follow_up(in_bot_thread: bool, mentions_someone: bool, replies_to_someone_else: bool) -> bool {
-    in_bot_thread && !mentions_someone && !replies_to_someone_else
+/// In a conversation the bot is part of, a message is for the bot, the same as the
+/// next line of a conversation, unless it's clearly for someone else.
+fn is_follow_up(in_conversation: bool, mentions_someone: bool, replies_to_someone_else: bool) -> bool {
+    in_conversation && !mentions_someone && !replies_to_someone_else
+}
+
+/// The kind of place a message was said in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Conversation {
+    /// A room people use with each other: the bot speaks when addressed.
+    Room,
+    /// Just the bot and one person.
+    OneOnOne,
+    /// A few people and the bot.
+    SmallGroup,
+}
+
+/// Most members, counting the bot, for a room it was invited into to be treated as a
+/// conversation with it. Past this it's a room people happen to have added it to, and
+/// answering every message would be noise and a real cost.
+const MAX_SMALL_GROUP_MEMBERS: u64 = 10;
+
+fn conversation_kind(invited_into: bool, members: u64) -> Conversation {
+    match members {
+        _ if !invited_into => Conversation::Room,
+        0..=2 => Conversation::OneOnOne,
+        _ if members <= MAX_SMALL_GROUP_MEMBERS => Conversation::SmallGroup,
+        _ => Conversation::Room,
+    }
 }
 
 /// Fetches the message `event` replies to, if it is a reply.
@@ -420,6 +447,7 @@ pub struct HandlerContext {
     pub greeting_cooldown: Arc<GreetingCooldown>,
     pub ignored_users: Arc<IgnoredUsers>,
     pub rate_limit: Arc<Throttle>,
+    pub direct_rooms: Arc<DirectRooms>,
     pub memory: Arc<RoomMemory>,
     pub room_queues: Arc<RoomQueues<QueuedMessage>>,
     pub links: Arc<LinkFetcher>,
@@ -493,6 +521,63 @@ pub async fn on_room_message(event: OriginalSyncRoomMessageEvent, room: Room, cl
     });
 }
 
+/// How long to wait before each attempt to join. An invite from another server can
+/// arrive before the bot's own server can see the room.
+const JOIN_ATTEMPT_DELAYS: [Duration; 3] = [Duration::ZERO, Duration::from_secs(2), Duration::from_secs(8)];
+
+/// Registered as a sync event handler; answers invites to the bot.
+pub async fn on_invite(event: StrippedRoomMemberEvent, room: Room, client: Client, Ctx(ctx): Ctx<Arc<HandlerContext>>) {
+    let for_bot = client.user_id().is_some_and(|own_id| own_id.as_str() == event.state_key.as_str());
+    if for_bot && event.content.membership == MembershipState::Invite {
+        answer_invite(room, &event.sender, &ctx.direct_rooms, &ctx.ignored_users);
+    }
+}
+
+/// Answers invites that arrived while the bot wasn't running.
+pub async fn answer_pending_invites(client: &Client, direct_rooms: &Arc<DirectRooms>, ignored_users: &IgnoredUsers) {
+    for room in client.invited_rooms() {
+        match room.invite_details().await {
+            Ok(invite) => answer_invite(room, &invite.inviter_id, direct_rooms, ignored_users),
+            Err(err) => warn!(?err, room = %room.room_id(), "failed to read pending invite"),
+        }
+    }
+}
+
+/// Joins the room if the inviter is allowed to start a conversation, and declines
+/// otherwise. Runs in the background so a slow join doesn't hold up the sync.
+fn answer_invite(room: Room, inviter: &UserId, direct_rooms: &Arc<DirectRooms>, ignored_users: &IgnoredUsers) {
+    let allowed = !ignored_users.contains(inviter.as_str()) && direct_rooms.allows(inviter.as_str(), room.own_user_id().server_name().as_str());
+    let direct_rooms = Arc::clone(direct_rooms);
+    let inviter = inviter.to_owned();
+
+    tokio::spawn(async move {
+        if !allowed {
+            info!(room = %room.room_id(), %inviter, "declining invite");
+            if let Err(err) = room.leave().await {
+                warn!(?err, room = %room.room_id(), "failed to decline invite");
+            }
+            return;
+        }
+
+        // Recorded first, so a message arriving right after the join is treated correctly.
+        if let Err(err) = direct_rooms.add(room.room_id().as_str(), inviter.as_str()) {
+            warn!(?err, room = %room.room_id(), "failed to record private room; not joining");
+            return;
+        }
+
+        for delay in JOIN_ATTEMPT_DELAYS {
+            tokio::time::sleep(delay).await;
+            match room.join().await {
+                Ok(()) => {
+                    info!(room = %room.room_id(), %inviter, "joined private conversation");
+                    return;
+                }
+                Err(err) => warn!(?err, room = %room.room_id(), "failed to join invited room"),
+            }
+        }
+    });
+}
+
 /// Registered as a sync event handler; records reactions so the bot can see how
 /// its replies and everyone else's messages landed.
 pub async fn on_reaction(event: OriginalSyncReactionEvent, room: Room, client: Client, Ctx(ctx): Ctx<Arc<HandlerContext>>) {
@@ -548,11 +633,17 @@ async fn process_message(ctx: &HandlerContext, inbox: &mut Inbox<QueuedMessage>,
     let replied_to_bot = reply_target
         .as_ref()
         .is_some_and(|target| client.user_id().is_some_and(|own_id| own_id.as_str() == target.sender));
-    let addressed = mentioned || replied_to_bot || addresses_bot_by_name(body, &ctx.bot_name);
-    let mentions_someone = event.content.mentions.as_ref().is_some_and(|mentions| !mentions.user_ids.is_empty());
-    let follow_up = joined_thread.as_ref().is_some_and(|root| {
-        is_thread_follow_up(bot_in_thread(&thread, root), mentions_someone, reply_target.is_some() && !replied_to_bot)
+    let invited_into = ctx.direct_rooms.contains(room.room_id().as_str()).unwrap_or_else(|err| {
+        warn!(?err, room = %room.room_id(), "failed to check for a private room; treating it as a normal one");
+        false
     });
+    let conversation = conversation_kind(invited_into, room.active_members_count());
+
+    let addressed = conversation == Conversation::OneOnOne || mentioned || replied_to_bot || addresses_bot_by_name(body, &ctx.bot_name);
+    let mentions_someone = event.content.mentions.as_ref().is_some_and(|mentions| !mentions.user_ids.is_empty());
+    let in_conversation =
+        conversation == Conversation::SmallGroup || joined_thread.as_ref().is_some_and(|root| bot_in_thread(&thread, root));
+    let follow_up = is_follow_up(in_conversation, mentions_someone, reply_target.is_some() && !replied_to_bot);
     let directed_at_bot = addressed || follow_up;
 
     // Started before classification when a reply is already certain, so the wait for
@@ -650,6 +741,7 @@ async fn process_message(ctx: &HandlerContext, inbox: &mut Inbox<QueuedMessage>,
                 kind,
                 message_text: &full_text,
                 sender_name: &sender_name,
+                conversation,
                 reply_target: reply_target.as_ref(),
                 thread: &thread,
                 image_failed: image.is_some() && images.is_empty(),
@@ -670,16 +762,22 @@ async fn process_message(ctx: &HandlerContext, inbox: &mut Inbox<QueuedMessage>,
     let last_event_id = burst.last().map_or(&event.event_id, |follow_up| &follow_up.event.event_id);
 
     // Commands and conversation get a thread on the original post. Greetings and
-    // unprompted comments stay where they were said, since a thread would hide them.
-    let starts_thread = command.is_some() || kind == Some(ReplyKind::Chat);
+    // unprompted comments stay where they were said, since a thread would hide them,
+    // and a private conversation already is one thread.
+    let starts_thread = conversation == Conversation::Room && (command.is_some() || kind == Some(ReplyKind::Chat));
     let thread_root = joined_thread.clone().or_else(|| starts_thread.then(|| new_thread_root(&event).to_owned()));
     let reply_to = match &thread_root {
         Some(root) if stated_thread(&event).is_none() => root,
         _ => last_event_id,
     };
+    let placement = match (&thread_root, conversation) {
+        (Some(root), _) => Placement::Thread(root),
+        (None, Conversation::OneOnOne) => Placement::Plain,
+        (None, _) => Placement::Reply,
+    };
 
     let response_event_id = match &response {
-        Some(response) => deliver(&room, reply_to, thread_root.as_ref(), &event.sender, &response.text).await,
+        Some(response) => deliver(&room, reply_to, placement, &event.sender, &response.text).await,
         None => {
             // "gordy: thanks" doesn't need an answer, but it shouldn't get silence.
             if addressed && command.is_none() && analysis.intent == Intent::Acknowledgement {
@@ -746,7 +844,7 @@ fn should_interject(ctx: &HandlerContext, room: &Room, analysis: &MessageAnalysi
 async fn deliver(
     room: &Room,
     event_id: &OwnedEventId,
-    thread_root: Option<&OwnedEventId>,
+    placement: Placement<'_>,
     sender: &UserId,
     text: &str,
 ) -> Option<OwnedEventId> {
@@ -755,7 +853,7 @@ async fn deliver(
         return None;
     }
 
-    match send_message(room, event_id, thread_root, sender, text).await {
+    match send_message(room, event_id, placement, sender, text).await {
         Ok(reply_id) => Some(reply_id),
         Err(err) => {
             warn!(?err, room = %room.room_id(), "failed to send response");
@@ -917,6 +1015,7 @@ struct ReplyInput<'a> {
     /// The message, including any burst follow-ups.
     message_text: &'a str,
     sender_name: &'a str,
+    conversation: Conversation,
     reply_target: Option<&'a RepliedTo>,
     /// The thread being replied in, from the log.
     thread: &'a [LoggedMessage],
@@ -946,7 +1045,7 @@ async fn generate_grounded_reply(ctx: &HandlerContext, room: &Room, input: &Repl
         return Some(GeneratedReply::plain(RATE_LIMITED_REPLY, label));
     }
 
-    let system_prompt = template.replace("{bot_name}", &ctx.bot_name).replace("{room_context}", &room_context_line(room));
+    let system_prompt = template.replace("{bot_name}", &ctx.bot_name).replace("{room_context}", &room_context_line(room, input.conversation, input.sender_name));
 
     // `on_room_message` logs the current message only after this call returns, so
     // the log never includes it.
@@ -1084,7 +1183,18 @@ fn format_page(page: &LinkPreview) -> String {
 
 /// One orientation sentence for the system prompts: the room's name and topic, if
 /// set, and the current time, so replies can recognize a time-sensitive question.
-fn room_context_line(room: &Room) -> String {
+fn room_context_line(room: &Room, conversation: Conversation, sender_name: &str) -> String {
+    let now = chrono::Utc::now().format("%Y-%m-%d %H:%M");
+    match conversation {
+        Conversation::OneOnOne => {
+            return format!("This is a private chat between you and {sender_name}. The current time is {now} UTC.");
+        }
+        Conversation::SmallGroup => {
+            return format!("This is a small private group chat you were invited into. The current time is {now} UTC.");
+        }
+        Conversation::Room => {}
+    }
+
     let room_desc = match room.topic().filter(|topic| !topic.trim().is_empty()) {
         Some(topic) => format!("\"{}\" (topic: {topic})", room.name().unwrap_or_else(|| "(unnamed room)".to_string())),
         None => match room.name() {
@@ -1092,7 +1202,7 @@ fn room_context_line(room: &Room) -> String {
             None => "(unnamed room)".to_string(),
         },
     };
-    format!("This room is {room_desc}. The current time is {} UTC.", chrono::Utc::now().format("%Y-%m-%d %H:%M"))
+    format!("This room is {room_desc}. The current time is {now} UTC.")
 }
 
 /// Dispatches a `!command` to a built-in or a loaded skill, or replies that it
@@ -1152,28 +1262,40 @@ fn help_reply(skills: &SkillRegistry) -> String {
     reply
 }
 
-/// A Matrix reply to `event_id`, inside the thread at `thread_root` if there is one,
-/// rendering Markdown into a `formatted_body` since skill prompts routinely produce it.
-/// Being a reply is what links the two in clients and notifies `sender`.
-fn reply_content(event_id: &EventId, thread_root: Option<&OwnedEventId>, sender: &UserId, body: &str) -> RoomMessageEventContent {
+/// How a response sits in the room.
+#[derive(Debug, Clone, Copy)]
+pub enum Placement<'a> {
+    /// Inside the thread at this root.
+    Thread(&'a OwnedEventId),
+    Reply,
+    /// A normal message. With only two people there, a reply says nothing and just
+    /// clutters the chat.
+    Plain,
+}
+
+/// The response to `event_id`, rendering Markdown into a `formatted_body` since skill
+/// prompts routinely produce it. Being a reply is what links the two in clients and
+/// notifies `sender`.
+fn reply_content(event_id: &EventId, placement: Placement<'_>, sender: &UserId, body: &str) -> RoomMessageEventContent {
     let content = RoomMessageEventContent::text_markdown(body);
-    match thread_root {
-        Some(root) => {
+    match placement {
+        Placement::Thread(root) => {
             let thread = Thread::without_fallback(root.clone());
             content.make_for_thread(ReplyMetadata::new(event_id, sender, Some(&thread)), ReplyWithinThread::Yes, AddMentions::Yes)
         }
-        None => content.make_reply_to(ReplyMetadata::new(event_id, sender, None), ForwardThread::No, AddMentions::Yes),
+        Placement::Reply => content.make_reply_to(ReplyMetadata::new(event_id, sender, None), ForwardThread::No, AddMentions::Yes),
+        Placement::Plain => content,
     }
 }
 
 pub async fn send_message(
     room: &Room,
     event_id: &EventId,
-    thread_root: Option<&OwnedEventId>,
+    placement: Placement<'_>,
     sender: &UserId,
     body: &str,
 ) -> matrix_sdk::Result<OwnedEventId> {
-    let content = reply_content(event_id, thread_root, sender, body);
+    let content = reply_content(event_id, placement, sender, body);
     Ok(room.send(content).await?.response.event_id)
 }
 
@@ -1354,7 +1476,7 @@ mod tests {
     #[test]
     fn a_first_reply_starts_a_thread_on_the_original_post() {
         let (post, sender) = (event_id("$post"), matrix_sdk::ruma::user_id!("@alice:example.org"));
-        let content = reply_content(&post, Some(&post), sender, "**hi**");
+        let content = reply_content(&post, Placement::Thread(&post), sender, "**hi**");
 
         assert!(content.mentions.as_ref().is_some_and(|mentions| mentions.user_ids.contains(sender)));
         let thread = thread_relation(content);
@@ -1366,7 +1488,7 @@ mod tests {
     #[test]
     fn a_follow_up_reply_stays_in_the_thread_and_answers_the_latest_message() {
         let (root, latest) = (event_id("$root"), event_id("$latest"));
-        let content = reply_content(&latest, Some(&root), matrix_sdk::ruma::user_id!("@alice:example.org"), "hi");
+        let content = reply_content(&latest, Placement::Thread(&root), matrix_sdk::ruma::user_id!("@alice:example.org"), "hi");
 
         let thread = thread_relation(content);
         assert_eq!(thread.event_id, root);
@@ -1375,8 +1497,24 @@ mod tests {
 
     #[test]
     fn replies_outside_threads_stay_plain_replies() {
-        let content = reply_content(&event_id("$post"), None, matrix_sdk::ruma::user_id!("@alice:example.org"), "hi");
+        let content = reply_content(&event_id("$post"), Placement::Reply, matrix_sdk::ruma::user_id!("@alice:example.org"), "hi");
         assert!(matches!(content.relates_to, Some(Relation::Reply(_))));
+    }
+
+    #[test]
+    fn a_plain_response_is_not_related_to_anything() {
+        let content = reply_content(&event_id("$post"), Placement::Plain, matrix_sdk::ruma::user_id!("@alice:example.org"), "hi");
+        assert!(content.relates_to.is_none());
+        assert!(content.mentions.is_none());
+    }
+
+    #[test]
+    fn only_rooms_the_bot_was_invited_into_are_conversations_with_it() {
+        assert_eq!(conversation_kind(false, 2), Conversation::Room);
+        assert_eq!(conversation_kind(true, 2), Conversation::OneOnOne);
+        assert_eq!(conversation_kind(true, 3), Conversation::SmallGroup);
+        assert_eq!(conversation_kind(true, MAX_SMALL_GROUP_MEMBERS), Conversation::SmallGroup);
+        assert_eq!(conversation_kind(true, MAX_SMALL_GROUP_MEMBERS + 1), Conversation::Room);
     }
 
     #[test]
@@ -1410,11 +1548,11 @@ mod tests {
     }
 
     #[test]
-    fn thread_messages_for_other_people_are_not_follow_ups() {
-        assert!(is_thread_follow_up(true, false, false));
-        assert!(!is_thread_follow_up(false, false, false));
-        assert!(!is_thread_follow_up(true, true, false));
-        assert!(!is_thread_follow_up(true, false, true));
+    fn messages_for_other_people_are_not_follow_ups() {
+        assert!(is_follow_up(true, false, false));
+        assert!(!is_follow_up(false, false, false));
+        assert!(!is_follow_up(true, true, false));
+        assert!(!is_follow_up(true, false, true));
     }
 
     #[test]
