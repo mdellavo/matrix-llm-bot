@@ -6,6 +6,7 @@ It joins configured rooms and any private conversation an allowed user invites i
 
 - **Chat:** replies when addressed, in threads, with room history, memory, web search, linked pages, and images.
 - **Commands:** `!commands` run **skills**, which are prompt files modeled on Claude Code's Skills.
+- **Help:** ask about the bot in chat or with `!help <question>`, and it answers from this README and the changelog.
 - **Private conversations:** one-on-one and small group chats where the bot answers without being addressed.
 - **Status page:** a built-in web page with activity stats, Claude costs, and a message browser.
 
@@ -152,7 +153,7 @@ Frontmatter fields:
 
 A `!command`'s args are parsed from the text after its name, without a model: they fill the skill's declared `args` in order, with the last one taking the rest of the line. Lists split on commas or " or ", or on spaces if there are neither.
 
-Twelve skills ship as worked examples under `skills/`, alongside the built-in `!help`, which lists commands, and `!memories`, which lists saved facts. An unknown command gets a reply pointing to `!help`.
+Twelve skills ship as worked examples under `skills/`, alongside the built-in `!help`, which lists commands or answers `!help <question>` (see [Help](#help)), and `!memories`, which lists saved facts. An unknown command gets a reply pointing to `!help`.
 
 | Skill | Aliases | Tools | Demonstrates |
 | --- | --- | --- | --- |
@@ -251,6 +252,18 @@ or image access.
 If Claude refuses a request, the bot uses Anthropic's fallback models where available,
 and otherwise says it won't answer. A reply that runs out of tokens is posted with a
 note that it was cut off.
+
+### Help
+
+Ask the bot for help in chat, or with `!help <question>`, and it reads this README and the
+changelog from the `main` branch on GitHub and answers from them. It decides when it needs
+them, using a `read_bot_docs` tool, so `!help <question>` is a normal chat reply. Plain
+`!help` still just lists commands.
+
+Copies are kept in memory for an hour. If GitHub can't be reached, an expired copy is used,
+and with no copy at all the bot says it can't load the docs. Because the docs come from
+`main`, a merged change can be described before it's deployed. A question that reads the
+README adds about 5,000 tokens of input.
 
 ### Memory
 

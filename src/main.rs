@@ -1,4 +1,5 @@
 mod bot;
+mod bot_docs;
 mod classify;
 mod config;
 mod db;

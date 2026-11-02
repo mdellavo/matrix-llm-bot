@@ -11,6 +11,7 @@ use matrix_sdk::{
 use threatflux_anthropic_sdk::Client as Anthropic;
 use tracing::{info, warn};
 
+use crate::bot_docs::BotDocs;
 use crate::config::Config;
 use crate::db::Database;
 use crate::direct_rooms::DirectRooms;
@@ -110,6 +111,7 @@ impl Bot {
             memory: Arc::new(RoomMemory::new(Arc::clone(&database))),
             room_queues: Arc::new(RoomQueues::default()),
             links: Arc::new(LinkFetcher::new(config.fetch_links)?),
+            docs: Arc::new(BotDocs::new()?),
             interjection_chance: config.interjection_chance,
             interjection_cooldown: Arc::new(GreetingCooldown::new(std::time::Duration::from_secs(
                 config.interjection_cooldown_secs,

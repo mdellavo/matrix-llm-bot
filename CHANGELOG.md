@@ -3,6 +3,12 @@
 Notable changes to matrix-llm-bot, built from the git history. Each version covers
 one day of commits, newest first.
 
+## 0.13.0 - 2026-11-02
+
+### Added
+
+- Help from the docs: asked about itself in chat or with `!help <question>`, the bot reads its README and changelog from GitHub and answers from them
+
 ## 0.12.0 - 2026-11-01
 
 ### Added

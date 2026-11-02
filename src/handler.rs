@@ -25,6 +25,7 @@ use matrix_sdk::{
 use threatflux_anthropic_sdk::Client as Anthropic;
 use tracing::{debug, info, warn};
 
+use crate::bot_docs::{BotDocs, ChatTools};
 use crate::classify::{ClassifyOutcome, Intent, MessageAnalysis, classify_message};
 use crate::direct_rooms::DirectRooms;
 use crate::greeting::GreetingCooldown;
@@ -61,6 +62,11 @@ fn parse_command(message_text: &str) -> Option<ParsedCommand<'_>> {
     }
     let (name, args) = rest.split_once(char::is_whitespace).unwrap_or((rest, ""));
     Some(ParsedCommand { name, args: args.trim() })
+}
+
+/// Whether this is `!help` with a question after it, rather than a request for the list.
+fn is_help_question(command: &ParsedCommand<'_>) -> bool {
+    command.name.eq_ignore_ascii_case("help") && !command.args.is_empty()
 }
 
 /// How the bot should answer a non-command message, if at all.
@@ -439,6 +445,7 @@ pub struct HandlerContext {
     pub memory: Arc<RoomMemory>,
     pub room_queues: Arc<RoomQueues<QueuedMessage>>,
     pub links: Arc<LinkFetcher>,
+    pub docs: Arc<BotDocs>,
     /// See `Config::interjection_chance`.
     pub interjection_chance: f64,
     /// Limits unprompted comments per room, the same way greetings are limited.
@@ -614,7 +621,10 @@ async fn process_message(ctx: &HandlerContext, inbox: &mut Inbox<QueuedMessage>,
         None => Vec::new(),
     };
 
-    let command = if own_image.is_none() { parse_command(body) } else { None };
+    let parsed = if own_image.is_none() { parse_command(body) } else { None };
+    // `!help how do threads work` is a question for the bot, not a command to run.
+    let help_question = parsed.as_ref().is_some_and(is_help_question);
+    let command = parsed.filter(|_| !help_question);
     let mentioned = client.user_id().is_some_and(|own_id| {
         event.content.mentions.as_ref().is_some_and(|mentions| mentions.user_ids.contains(own_id))
     });
@@ -627,7 +637,7 @@ async fn process_message(ctx: &HandlerContext, inbox: &mut Inbox<QueuedMessage>,
     });
     let conversation = conversation_kind(invited_into, room.active_members_count());
 
-    let addressed = conversation == Conversation::OneOnOne || mentioned || replied_to_bot || addresses_bot_by_name(body, &ctx.bot_name);
+    let addressed = help_question || conversation == Conversation::OneOnOne || mentioned || replied_to_bot || addresses_bot_by_name(body, &ctx.bot_name);
     let mentions_someone = event.content.mentions.as_ref().is_some_and(|mentions| !mentions.user_ids.is_empty());
     let in_conversation =
         conversation == Conversation::SmallGroup || joined_thread.as_ref().is_some_and(|root| bot_in_thread(&thread, root));
@@ -981,6 +991,11 @@ numbers. They're things people told you, so weigh them by who said it, and don't
 remember when someone asks you to or tells you something lasting about themselves, and forget when they ask you \
 to or a fact is wrong. Then just reply normally, without announcing it.
 
+When someone asks for help with you, like what you can do, how a feature or command works, how to set something \
+up, or what's changed, use read_bot_docs before answering, and read the changelog for anything about what's new. \
+Answer what they asked from what the docs say, in your own voice, with the exact command or setting they need. \
+Don't paste the docs, and if they don't cover it, say so rather than guessing about yourself.
+
 If a reaction says everything, reply with one emoji and nothing else, and it'll be posted as a reaction.
 
 Write like a chat message: plain text, no headers, a list only if the content really is a list. Examples of \
@@ -1108,7 +1123,10 @@ async fn generate_grounded_reply(ctx: &HandlerContext, room: &Room, input: &Repl
     });
     let prompt = PromptRecord { system: system_prompt.clone(), user: format!("{stable_context}{new_context}") };
 
-    let memory_tools = MemoryTools { memory: &ctx.memory, room_id, told_by: input.sender_name };
+    let chat_tools = ChatTools {
+        memory: MemoryTools { memory: &ctx.memory, room_id, told_by: input.sender_name },
+        docs: &ctx.docs,
+    };
     let base = CompletionRequest {
         model: CHAT_MODEL,
         system: &system_prompt,
@@ -1126,7 +1144,7 @@ async fn generate_grounded_reply(ctx: &HandlerContext, room: &Room, input: &Repl
             web_search_max_uses: Some(CHAT_MAX_SEARCHES),
             web_fetch_max_uses: Some(CHAT_MAX_FETCHES),
             images: input.images,
-            local_tools: Some(&memory_tools as &dyn LocalTools),
+            local_tools: Some(&chat_tools as &dyn LocalTools),
             ..base
         },
         ReplyKind::Greeting => CompletionRequest { max_tokens: GREETING_MAX_TOKENS, effort: Some("low"), ..base },
@@ -1297,7 +1315,7 @@ async fn handle_command(ctx: &HandlerContext, room: &Room, command: &ParsedComma
 /// description, plus the built-in `help` entry itself.
 fn help_reply(skills: &SkillRegistry) -> String {
     let mut reply = String::from(
-        "Available commands:\n- help: List available commands.\n- memories: List what's been saved about this room.\n",
+        "Available commands:\n- help: List available commands, or ask anything about the bot with \"!help <question>\".\n- memories: List what's been saved about this room.\n",
     );
     for skill in skills.list() {
         let usage = skill
@@ -1400,6 +1418,14 @@ mod tests {
     fn parse_command_splits_name_and_args() {
         assert_eq!(parse_command("!strain blue dream "), Some(ParsedCommand { name: "strain", args: "blue dream" }));
         assert_eq!(parse_command("  !vibe"), Some(ParsedCommand { name: "vibe", args: "" }));
+    }
+
+    #[test]
+    fn help_with_a_question_is_not_the_help_command() {
+        assert!(is_help_question(&parse_command("!help how do threads work").unwrap()));
+        assert!(is_help_question(&parse_command("!HELP what changed?").unwrap()));
+        assert!(!is_help_question(&parse_command("!help").unwrap()));
+        assert!(!is_help_question(&parse_command("!history 5").unwrap()));
     }
 
     #[test]

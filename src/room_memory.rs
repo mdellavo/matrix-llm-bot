@@ -1,3 +1,5 @@
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
@@ -286,7 +288,13 @@ impl LocalTools for MemoryTools<'_> {
         ]
     }
 
-    fn run(&self, name: &str, input: &Value) -> Result<String, String> {
+    fn run<'a>(&'a self, name: &'a str, input: &'a Value) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + 'a>> {
+        Box::pin(std::future::ready(self.run_tool(name, input)))
+    }
+}
+
+impl MemoryTools<'_> {
+    fn run_tool(&self, name: &str, input: &Value) -> Result<String, String> {
         match name {
             "remember" => {
                 let fact = input["fact"].as_str().ok_or("fact is required")?;
@@ -372,9 +380,9 @@ mod tests {
         let memory = memory();
         let tools = MemoryTools { memory: &memory, room_id: "!a", told_by: "oshuma" };
 
-        assert_eq!(tools.run("remember", &json!({"fact": "likes tea"})).unwrap(), "Saved as #1.");
+        assert_eq!(tools.run_tool("remember", &json!({"fact": "likes tea"})).unwrap(), "Saved as #1.");
         assert_eq!(memory.facts("!a")[0].told_by, "oshuma");
-        assert_eq!(tools.run("forget", &json!({"id": 1})).unwrap(), "Forgot #1.");
-        assert!(tools.run("forget", &json!({"id": 1})).is_err());
+        assert_eq!(tools.run_tool("forget", &json!({"id": 1})).unwrap(), "Forgot #1.");
+        assert!(tools.run_tool("forget", &json!({"id": 1})).is_err());
     }
 }

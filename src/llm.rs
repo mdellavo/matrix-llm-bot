@@ -7,6 +7,8 @@
 //! `fallbacks`) aren't in the builder.
 
 use std::collections::HashMap;
+use std::future::Future;
+use std::pin::Pin;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -72,7 +74,7 @@ impl ImageInput {
 pub trait LocalTools: Sync {
     fn definitions(&self) -> Vec<Value>;
     /// Runs a tool, returning its result or an error for the model to read.
-    fn run(&self, name: &str, input: &Value) -> Result<String, String>;
+    fn run<'a>(&'a self, name: &'a str, input: &'a Value) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + 'a>>;
 }
 
 #[derive(Default)]
@@ -153,7 +155,7 @@ pub async fn complete(
         let stop_reason = response["stop_reason"].as_str().unwrap_or_default();
 
         let tool_results = match (stop_reason, request.local_tools) {
-            ("tool_use", Some(tools)) => Some(run_local_tools(&content, tools)),
+            ("tool_use", Some(tools)) => Some(run_local_tools(&content, tools).await),
             _ => None,
         };
 
@@ -179,19 +181,17 @@ pub async fn complete(
 }
 
 /// One `tool_result` for every local tool call in `content`, sent back together.
-fn run_local_tools(content: &[Value], tools: &dyn LocalTools) -> Vec<Value> {
-    content
-        .iter()
-        .filter(|block| block["type"] == "tool_use")
-        .map(|block| {
-            let name = block["name"].as_str().unwrap_or_default();
-            let (result, is_error) = match tools.run(name, &block["input"]) {
-                Ok(result) => (result, false),
-                Err(error) => (error, true),
-            };
-            json!({"type": "tool_result", "tool_use_id": block["id"], "content": result, "is_error": is_error})
-        })
-        .collect()
+async fn run_local_tools(content: &[Value], tools: &dyn LocalTools) -> Vec<Value> {
+    let mut results = Vec::new();
+    for block in content.iter().filter(|block| block["type"] == "tool_use") {
+        let name = block["name"].as_str().unwrap_or_default();
+        let (result, is_error) = match tools.run(name, &block["input"]).await {
+            Ok(result) => (result, false),
+            Err(error) => (error, true),
+        };
+        results.push(json!({"type": "tool_result", "tool_use_id": block["id"], "content": result, "is_error": is_error}));
+    }
+    results
 }
 
 fn cache_marker() -> Value {
@@ -526,8 +526,9 @@ mod tests {
                 vec![json!({"name": "echo", "description": "d", "input_schema": {"type": "object"}})]
             }
 
-            fn run(&self, _name: &str, input: &Value) -> Result<String, String> {
-                input["text"].as_str().map(String::from).ok_or_else(|| "text is required".to_string())
+            fn run<'a>(&'a self, _name: &'a str, input: &'a Value) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + 'a>> {
+                let result = input["text"].as_str().map(String::from).ok_or_else(|| "text is required".to_string());
+                Box::pin(std::future::ready(result))
             }
         }
 
