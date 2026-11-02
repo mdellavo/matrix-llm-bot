@@ -2,7 +2,12 @@
 
 A Rust Matrix chat bot built on [`matrix-sdk`](https://github.com/matrix-org/matrix-rust-sdk), with TLS and E2E encryption support out of the box.
 
-It joins a configured set of rooms, records what's said in SQLite, and uses Claude to classify intent and sentiment. `!commands` dispatch to **skills**: prompt files modeled on Claude Code's Skills. Other messages get a Claude-generated reply when the bot is addressed (an `@mention`, a reply, a message starting with its name, or a follow-up in its thread), and greetings to the room get one on a cooldown. Replies can draw on room history, saved memories, web search, links, and images. A small built-in HTTP server exposes a status/debugging page alongside the sync loop.
+It joins configured rooms and any private conversation an allowed user invites it to, records what's said in SQLite, and uses Claude to classify each message and hold a conversation:
+
+- **Chat:** replies when addressed, in threads, with room history, memory, web search, linked pages, and images.
+- **Commands:** `!commands` run **skills**, which are prompt files modeled on Claude Code's Skills.
+- **Private conversations:** one-on-one and small group chats where the bot answers without being addressed.
+- **Status page:** a built-in web page with activity stats, Claude costs, and a message browser.
 
 ## Setup
 
@@ -16,6 +21,8 @@ It joins a configured set of rooms, records what's said in SQLite, and uses Clau
    - `homeserver_url` — your Matrix homeserver
    - `username` / `password` — the bot account's login credentials
    - `rooms` — room IDs (`!abc:example.org`) or aliases (`#room:example.org`) to join and monitor
+
+   See [Configuration](#configuration) for every option.
 
 3. Set `ANTHROPIC_API_KEY` in the environment:
 
@@ -65,6 +72,8 @@ Before the first start:
   reachable from outside the container. The `ports` entry above still limits it to the
   host, which matters because the page shows message content with no login.
 - Set `cost_limit_usd`. Without it, nothing caps Claude API spend.
+- Check `dm_allowed_users`. By default, anyone on the bot's homeserver can start a private
+  conversation, and every message there is a paid Claude call.
 
 **Keep the `data` directory.** It holds the bot's database (`bot.db`) and its Matrix
 device and encryption keys (`store/`), so back it up. If `store/` is lost, the bot logs in
@@ -94,6 +103,9 @@ To roll back, retag the previous image as `latest` and run the `up` command agai
 docker tag matrix-llm-bot-image:previous matrix-llm-bot-image:latest
 docker compose up -d --no-deps matrix-llm-bot
 ```
+
+An older build refuses a database with a newer schema, so if the update migrated it, restore
+a `bot.db` backup taken before the update as well. Anything logged after that backup is lost.
 
 ## Commands (skills)
 
@@ -127,20 +139,20 @@ Frontmatter fields:
 - `name` / `description` (required) — the command name and its one-line description in `help`.
 - `usage` (optional) — a usage hint shown alongside the description in `help`.
 - `aliases` (optional) — other names that resolve to this skill.
-- `model` (optional) — overrides which Claude model runs this skill's prompt; defaults to the classifier's cheaper model. Skills that need judgment (`digest`, `standup`, `topics`, `vibe`, `define`) use `claude-sonnet-5-5`.
+- `model` (optional) — overrides which Claude model runs this skill's prompt; defaults to the classifier's cheaper model. Skills that need judgment (`digest`, `standup`, `topics`, `vibe`, `define`, `search`) use `claude-sonnet-5-5`.
 - `tools` (optional) — capabilities the skill needs; the bot fetches the relevant context and injects it before calling Claude:
-  - `message_log` — that room's recent messages, including the bot's replies.
-  - `message_search` — the best matches for the `query` argument from the room's whole log.
+  - `message_log` — that room's recent messages, including the bot's replies. 5 by default and at most 20.
+  - `message_search` — the best 40 matches for the `query` argument from the room's whole log.
   - `room_info` — the room's ID, name, and topic.
   - `current_time` — the current UTC time.
   - `random_choice` — a true random pick (real Rust randomness, not an LLM guess).
   - `urban_dictionary` / `imdb_lookup` / `leafly_strain` — outbound HTTP calls to Urban Dictionary, OMDb, and Leafly, respectively (see `src/tools.rs`).
   - `web_search` — lets Claude search the web, up to twice per run.
-- `args` (optional) — declares expected arguments (name, type, required/default/bounds). Arguments are validated before Claude is ever called.
+- `args` (optional) — declares expected arguments (name, type, required/default/bounds). Types are `string`, `integer`, `number`, `boolean`, and `array`. Arguments are validated before Claude is ever called.
 
 A `!command`'s args are parsed from the text after its name, without a model: they fill the skill's declared `args` in order, with the last one taking the rest of the line. Lists split on commas or " or ", or on spaces if there are neither.
 
-Twelve skills ship as worked examples under `skills/`, alongside the built-in `!help` and `!memories`:
+Twelve skills ship as worked examples under `skills/`, alongside the built-in `!help`, which lists commands, and `!memories`, which lists saved facts. An unknown command gets a reply pointing to `!help`.
 
 | Skill | Aliases | Tools | Demonstrates |
 | --- | --- | --- | --- |
@@ -161,28 +173,234 @@ Twelve skills ship as worked examples under `skills/`, alongside the built-in `!
 
 A skill file with bad frontmatter or an unrecognized `tools`/`args` entry is skipped with a warning at startup — everything else still loads. Two skills sharing a `name`, or an alias colliding with another skill's name/alias, fails startup instead, since the bot can't resolve that ambiguity on your behalf.
 
-## Notes
+## How the bot behaves
 
-- The bot's own data lives in one SQLite database at `database_path` (`src/db.rs`): messages, reactions, facts, room summaries, and usage totals. On startup, data from older versions (`data/messages/*.jsonl`, `memory.json`, `usage.json`) is imported once and those files are left in place, ignored from then on, so they can be deleted once you're happy with the import. A version from before this can't read the database, and rolling back to one would miss anything logged since.
-- Matrix session and E2E crypto state stays separate, in `./data/store`, which matrix-sdk manages. `config.toml` and `data/` are git-ignored. New options are documented in `config.toml.example`. Device verification/cross-signing isn't implemented — the bot implicitly trusts devices it encounters (see `Bot::new` in `src/bot.rs` before relying on this for rooms you care about).
-- Every message is recorded per room (`src/message_log.rs`), whether or not the bot replies to it — this is what skills like `history`/`digest`/`vibe` read from, and what the status page's room browser shows. The exception is `ignored_users` (`config.toml`): messages from those senders are dropped in `on_room_message` before any of that — no classification, no logging, no reply — so an ignored user never shows up in message history either.
-- Addressing is decided first, in code: a message gets a Claude-generated reply when it @mentions the bot, replies to one of its messages, or starts with its name (`gordy: ...`, `gordy, ...`, `gordy what...`), whatever the classifier thought of it. A bare acknowledgement is the one exception. It gets a 👍 reaction instead. Unaddressed messages get nothing, except a greeting to the room, once per room per 5 minutes (`reply_kind` in `src/handler.rs`), and unprompted comments if those are turned on.
-- Classification (`classify_message` in `src/classify.rs`) records intent, sentiment, and entities, and spots room greetings. It doesn't run for `!commands`, and if it fails the message is still logged and still answered if addressed.
-- Chat replies (`claude-opus-5-5`) see about the last 50 messages with timestamps, display names and reactions, including the bot's own replies, the message being replied to, saved facts, and notes on older chat. They can web search up to 3 times per reply when facts might be wrong or stale, at $0.01 per search, and read up to 3 links from the conversation.
-- Memory (`src/room_memory.rs`): chat replies have `remember` and `forget` tools. Facts stay in the room they were learned in, and `!memories` lists them. Room summaries are saved alongside them.
-- Images: when addressed, the bot can see an attached image, one it's replying to, or one posted in the last 5 minutes. Images are sent to Claude but not kept by the bot, and unaddressed ones cost nothing.
-- Links: pages linked in chat are fetched when posted, with no Claude cost, and the title, description, and start of the text are saved with the message, so the bot knows what was shared without being asked. Replies get the page text for links in the message, in the message it replies to, or posted in the last 5 minutes. Set `fetch_links = false` to turn this off. Only public addresses on ports 80 and 443 are fetched: private addresses are refused in the resolver and on redirects, since anyone in a room can post a URL. Fetching does reveal the bot's IP to the linked site, and links posted in encrypted rooms are fetched and saved too. Direct links to JPEG, PNG, GIF, and WebP images are downloaded when a reply needs them, up to 3.75MB and 3 per reply, and sent to Claude like an attached image. They aren't stored. Other media is only noted by type.
-- Reactions: a lone-emoji reply is sent as a reaction. Reactions from others are saved and shown in history. Removed reactions aren't tracked.
-- Each room's messages are handled one at a time, in order (`src/room_queue.rs`). Quick follow-ups from the same person are answered together, after a 1.5 second wait on addressed messages.
-- Unprompted comments are off by default. Set `interjection_chance` to turn them on; the bot can still decide to pass, and `interjection_cooldown_secs` limits them per room.
-- Replies show a typing indicator while being generated. Replies to commands and conversation go in a thread on the original post, or stay in the thread they were asked in. Greetings and unprompted comments are plain replies outside a thread.
-- Private conversations: invite the bot to a room and it joins, if `dm_allowed_users` allows the inviter (by default, anyone on its own homeserver). Other invites are declined. With one person, every message is answered with a normal message, and a bare acknowledgement gets a 👍. With a few people, up to 10 members counting the bot, it answers everything except messages that mention someone or reply to someone else, and uses replies so it's clear who it's answering. Neither uses threads unless someone starts one. Above 10 members it behaves as in any other room. Memory stays with the room, so nothing crosses between chats. Only the inviter is checked, so they vouch for anyone they add. These rooms are left off the status page, but they are stored in the database like everything else.
-- Status page: bot and Claude usage details, plus activity counted from the database: message, reply, thread, image, link, and reaction totals, per-room and per-person tables, the last 14 days, and breakdowns of reply kinds, intents, and sentiment. Private conversations appear only as a total.
-- Prompt caching: chat replies cache their tools, system prompt, and settled history for 5 minutes. History moves in steps of 25 messages, so a reply sees 37 to 61 messages, because a window sliding one message at a time would never match the cache. Web searches and tool calls within a reply also read from it. Classification, greetings, and skills aren't cached, because they're too small or too rare to pay back the 25% write premium. The status page shows hit rate and net saving. The current time goes in the user turn, never the system prompt, or nothing would ever match.
-- Threads: once the bot has posted in a thread, every message there counts as addressed to it, unless the message mentions someone or replies to someone else. A bare acknowledgement gets no reply. The reply sees the whole thread, up to its last 50 messages, plus any images and links in it, however old. Each follow-up is a full chat reply, so a busy thread costs more than room chat.
-- Claude API token usage and an estimated USD cost are tracked per command/reply type, saved so they survive restarts, and shown on the status page (`src/usage.rs`). Estimates come from a hardcoded pricing table, not fetched live, and leave out cache tokens. Set `cost_limit_usd` to stop Claude calls at a spending cap.
-- The status/debugging server (`src/status_server.rs`) has **no authentication** and binds to `127.0.0.1` by default — only widen `http_listen_addr` deliberately, and put it behind your own auth/reverse proxy if you do.
-- `threatflux-anthropic-sdk` is a third-party community crate, not an Anthropic-maintained SDK — pin/review it accordingly. Claude calls use its raw request method (`src/llm.rs`), since its typed builders don't cover the newer API fields.
+### When it replies
+
+Who a message is for is decided in code first, whatever the classifier made of it. In a
+normal room, the bot replies to:
+
+- A message that @mentions it, replies to one of its messages, or starts with its name
+  (`gordy: ...`, `gordy, ...`, `gordy what...`). The name comes from `username`, and
+  capitalization doesn't matter.
+- A `!command`.
+- A follow-up in a thread it's part of (see [Threads](#threads)).
+- A greeting to the room, once per room every 5 minutes.
+- Other messages, only if unprompted comments are turned on. Set `interjection_chance`
+  to enable them. The bot can still decide to pass, and `interjection_cooldown_secs`
+  limits them per room.
+
+A bare acknowledgement such as "thanks" or "lol" gets no reply. If it was addressed to the
+bot, it gets a 👍 reaction instead.
+
+Each room's messages are handled one at a time, in order. Quick follow-ups from the same
+person are answered together, after a 1.5 second wait on messages getting a chat reply.
+Messages sent while the bot was offline aren't answered.
+
+The bot shows a typing indicator while it works, except for unprompted comments. A reply
+that is only an emoji is sent as a reaction.
+
+### Threads
+
+Replies to commands and conversation go in a thread on the original post, or stay in the
+thread they were asked in. Greetings and unprompted comments are plain replies outside
+a thread, unless the greeting was said inside one.
+
+Once the bot has posted in a thread, every message there counts as addressed to it,
+unless the message mentions someone or replies to someone else. The reply sees up to the
+last 50 messages of the thread, plus any images and links in it, however old. Replying
+to one of its threaded messages from a client without threads still lands in that
+thread. Each follow-up is a full chat reply, so a busy thread costs more than room chat.
+
+`!commands` run in a thread still read room history, not the thread.
+
+### Private conversations
+
+Invite the bot to a room and it joins if `dm_allowed_users` allows the inviter, which by
+default means anyone on its own homeserver. Other invites are declined, including
+invites from `ignored_users`, and invites that arrived while it was offline are answered
+at startup.
+
+| Room | What the bot answers | How |
+|---|---|---|
+| Just you and the bot | Every message, and a bare acknowledgement gets a 👍 | A normal message |
+| Up to 10 members, counting the bot | Everything except messages that mention someone or reply to someone else | A reply, so it's clear who it's answering |
+| More than 10 members | Same as a normal room | Same as a normal room |
+
+Neither kind of private chat uses threads unless someone starts one. Only the inviter is
+checked, so they vouch for anyone they add. Every message is a full chat reply, so set
+`cost_limit_usd`. These rooms are left off the status page, but they are stored in the
+database like everything else.
+
+### Chat replies
+
+Chat replies and greetings use `claude-opus-5-5`. A chat reply sees:
+
+- About the last 50 room messages (37 to 61, see [Prompt caching](#prompt-caching)), with
+  timestamps, display names, reactions, what links turned out to be, and the bot's own
+  replies.
+- The thread, the message being replied to, and the current time.
+- Saved facts and notes on older chat.
+- Linked pages and images, described below.
+
+Chat replies can search the web up to 3 times per reply, at $0.01 per search, and read
+up to 3 links using Claude's web fetch tool. Greetings and unprompted comments see recent
+history, and unprompted comments see facts and notes too, but neither gets web, memory,
+or image access.
+
+If Claude refuses a request, the bot uses Anthropic's fallback models where available,
+and otherwise says it won't answer. A reply that runs out of tokens is posted with a
+note that it was cut off.
+
+### Memory
+
+Chat replies have `remember` and `forget` tools. Ask in chat, for example
+`gordy: remember I'm on US Eastern time`. Facts stay in the room they were learned in,
+up to 200 per room and 300 characters each, and `!memories` lists them.
+
+Messages too old for the history are summarized into notes by `claude-haiku-5-5`. The
+notes start once 15 older messages exist, refresh after 25 more, and survive restarts.
+
+### Images
+
+When replying in chat, the bot can see:
+
+- An attached image, or one in the message it's replying to.
+- The newest image in the thread.
+- An image posted in the room's last message, up to 5 minutes old.
+- Direct links to JPEG, PNG, GIF, and WebP files, up to 3 per reply.
+
+Attached images and linked files are limited to 3.75MB. A larger attachment falls back to
+its thumbnail. Images are sent to Claude but not kept by the bot, and images nobody asks
+about cost nothing.
+
+### Links
+
+Pages linked in chat are fetched when posted, up to 3 per message, with no Claude cost.
+The title, description, and start of the text are saved with the message, so the bot knows
+what was shared without being asked. Replies get the page text for links in the message,
+in the message it replies to, in the thread, or posted in the last 5 minutes, up to 3
+pages. Other media is only noted by type. Set `fetch_links = false` to turn all of this
+off, including image downloads.
+
+Only public addresses on ports 80 and 443 are fetched. Private addresses are refused in the
+resolver and on redirects, since anyone in a room can post a URL. Fetching reveals the
+bot's IP to the linked site, and links posted in encrypted rooms are fetched and saved too.
+
+### Classification
+
+`claude-haiku-5-5` records each message's intent, sentiment, and entities, using the last
+10 messages as context, and spots room greetings. It doesn't run for `!commands` or
+images. If it fails, the message is still logged and still answered if addressed.
+
+### Reactions
+
+Reactions from others are saved and shown in history, including reactions to the bot's own
+replies. Removed reactions aren't tracked.
+
+### Prompt caching
+
+Chat replies cache their tools, system prompt, facts, notes, and settled history for 5
+minutes. Web searches and tool calls within a reply read from it too. Classification,
+greetings, and skills aren't cached, because they're too small or too rare to pay back the
+25% write premium.
+
+History moves in steps of 25 messages, because a window sliding one message at a time
+would never match the cache. Saving a fact, refreshing the notes, or a new reaction in the
+settled history causes a miss on that part. The current time goes in the user turn, never
+the system prompt, or nothing would ever match.
+
+### Limits and failures
+
+- `cost_limit_usd` stops Claude calls at a lifetime spending cap, and the bot says so when
+  asked for something. Unset, nothing caps spend.
+- After a rate limit from Claude, calls pause for `rate_limit_backoff_secs`, and the bot
+  says so.
+- `ignored_users` are dropped before anything else: no classification, logging, reply,
+  or reaction tracking.
+- If a reply fails to generate, the bot posts a short apology. An unprompted comment
+  just stays quiet.
+
+## Configuration
+
+Required in `config.toml`, plus `ANTHROPIC_API_KEY` in the environment:
+
+| Option | Meaning |
+|---|---|
+| `homeserver_url` | The Matrix homeserver, starting with `http://` or `https://` |
+| `username`, `password` | The bot account's login. The name people address it by comes from `username` |
+| `rooms` | At least one room ID or alias to join at startup |
+
+Optional:
+
+| Option | Default | Meaning |
+|---|---|---|
+| `device_name` | `matrix-llm-bot` | Device name shown for this login |
+| `store_path` | `./data/store` | Matrix session and encryption state |
+| `database_path` | `./data/bot.db` | The bot's SQLite database |
+| `http_listen_addr` | `127.0.0.1:8080` | Address of the status page |
+| `skills_dir` | `./skills` | Directory of commands |
+| `omdb_api_key` | none | Enables the `imdb` skill |
+| `ignored_users` | none | Users whose messages are dropped entirely |
+| `dm_allowed_users` | the bot's homeserver | Who may start a private conversation: `@user:example.org` or `:example.org`. Setting it replaces the default |
+| `cost_limit_usd` | none | Lifetime cap on estimated Claude spend |
+| `rate_limit_backoff_secs` | `60` | How long to pause after a rate limit |
+| `interjection_chance` | `0` | Chance, from 0 to 1, of considering an unprompted comment |
+| `interjection_cooldown_secs` | `1800` | Minimum time between unprompted comments in a room |
+| `fetch_links` | `true` | Fetch linked pages and images |
+| `message_log_dir`, `usage_state_path`, `memory_path` | under `./data` | Where older versions kept data, read once for import |
+
+`config.toml.example` has the same options with comments.
+
+## Status page
+
+The status server has **no authentication** and binds to `127.0.0.1` by default. Only widen
+`http_listen_addr` deliberately, and put it behind your own auth or reverse proxy if you do.
+The page shows:
+
+- Bot details, uptime, and whether Claude calls are rate limited.
+- Activity counted from the database: message, reply, thread, image, link, and reaction
+  totals, per-room and per-person tables, the last 14 days, and breakdowns of reply kinds,
+  intents, sentiment, and reactions. Saved facts and database size are shown too.
+- Claude usage per reply type: tokens, requests, estimated cost, web searches, cache hit
+  rate, and net saving from caching.
+- A room browser with each message's classification, reply, and the full prompts sent.
+- The loaded commands.
+
+Private conversations appear only as a total. The same data is available as JSON from
+`/api/status`, `/api/stats`, `/api/usage`, `/api/skills`, and
+`/api/rooms/{room_id}/messages?limit=N`.
+
+Costs are estimates from a hardcoded pricing table in `src/usage.rs`, not fetched live. They
+include cache reads and writes and web search fees, and models missing from the table
+aren't counted.
+
+## Data and security
+
+- **Database:** messages, prompts, reactions, facts, room summaries, private rooms, and usage
+  totals live in one SQLite database (`src/db.rs`). Every message is recorded, whether or
+  not the bot replies, including in private conversations and encrypted rooms, and it's
+  stored unencrypted. The schema migrates automatically at startup.
+- **Older data:** files from older versions (`data/messages/*.jsonl`, `memory.json`,
+  `usage.json`) are imported once at startup and then ignored, so they can be deleted once
+  you're happy with the import.
+- **Matrix state:** the session and encryption keys stay in `store_path`, which matrix-sdk
+  manages. The saved `session.json` and `device_id` keep restarts on the same device.
+- **Device trust:** verification and cross-signing aren't implemented, so the bot trusts
+  every device it encounters. See `Bot::new` in `src/bot.rs` before relying on this for
+  rooms you care about.
+- **Secrets:** `config.toml` and `data/` are git-ignored.
+- **Anthropic SDK:** `threatflux-anthropic-sdk` is a third-party community crate, not
+  maintained by Anthropic, so pin and review it accordingly. Claude calls use its raw
+  request method (`src/llm.rs`), since its typed builders don't cover the newer API fields.
+
+## Known limitations
+
+- An edited message is treated as a new message: it's logged again and answered again if
+  addressed, and the original keeps its text in the log.
+- Message types other than text and images are ignored.
+- Links posted before linked images were supported won't load as images from history.
+- If Claude rejects an image, for example because of its dimensions, the whole reply fails.
 
 ## Roadmap
 
@@ -201,7 +419,7 @@ Ideas for later, not commitments. See [CHANGELOG.md](CHANGELOG.md) for what's sh
 
 ### Reliability
 
-- Handle edited messages, which currently keep their original text in the log
+- Handle edited messages properly, by updating the log rather than treating them as new
 - Automatic backups of the `data` directory
 - Track removed reactions
 

@@ -18,6 +18,7 @@ one day of commits, newest first.
 - Chat replies use prompt caching, and the history they see moves in steps of 25 messages to make that work
 - Usage and cost estimates include cache reads and writes, and the status page shows hit rate and net saving
 - Burst merging also applies to quick follow-ups in the same thread
+- The README now covers every feature and config option, and lists known limitations
 
 ## 0.11.0 - 2026-10-31
 
@@ -30,7 +31,7 @@ one day of commits, newest first.
 - Reactions: lone-emoji replies are posted as reactions, addressed thanks get a 👍, and people's reactions appear in history
 - `!search` over the room's whole log, and a `web_search` tool for skills, used by `!define`
 - Optional unprompted comments, off by default (`interjection_chance`, `interjection_cooldown_secs`)
-- Notes on older chat, which persist across restarts along with saved facts (`memory_path`)
+- Notes on older chat, which persist across restarts along with saved facts
 - Display names in history and logs
 - Web search whenever facts may be wrong or stale, capped at 3 per reply
 
