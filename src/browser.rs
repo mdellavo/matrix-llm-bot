@@ -121,7 +121,7 @@ impl PageBrowser {
             .context("failed to resolve the browser's address")?
             .next()
             .context("the browser's name has no address")?;
-        let (browser, mut handler) = Browser::connect(format!("http://{addr}")).await.context("failed to connect to the browser")?;
+        let (browser, mut handler) = Browser::connect(websocket_url(addr).await?).await.context("failed to connect to the browser")?;
         tokio::spawn(async move {
             while let Some(event) = handler.next().await {
                 if let Err(err) = event {
@@ -137,8 +137,43 @@ impl PageBrowser {
     }
 }
 
+/// The browser's DevTools WebSocket, at the address it was reached on. The URL Chrome
+/// gives names its own view of itself, like `127.0.0.1:9223` behind the image's relay
+/// on 9222, which isn't reachable from here.
+async fn websocket_url(addr: SocketAddr) -> Result<String> {
+    let version: serde_json::Value = reqwest::Client::new()
+        .get(format!("http://{addr}/json/version"))
+        .timeout(Duration::from_secs(10))
+        .send()
+        .await
+        .context("failed to reach the browser")?
+        .json()
+        .await
+        .context("the browser's version reply wasn't JSON")?;
+    let given = version["webSocketDebuggerUrl"].as_str().context("the browser gave no WebSocket URL")?;
+    reachable_websocket_url(given, addr)
+}
+
+fn reachable_websocket_url(given: &str, addr: SocketAddr) -> Result<String> {
+    let mut url = Url::parse(given).context("the browser's WebSocket URL is invalid")?;
+    let host = match addr.ip() {
+        std::net::IpAddr::V4(ip) => ip.to_string(),
+        std::net::IpAddr::V6(ip) => format!("[{ip}]"),
+    };
+    url.set_host(Some(&host))?;
+    url.set_port(Some(addr.port())).map_err(|()| anyhow!("can't set the WebSocket port"))?;
+    Ok(url.to_string())
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_websocket_url_uses_the_address_the_browser_was_reached_on() {
+        let addr: SocketAddr = "172.20.0.3:9222".parse().unwrap();
+        let url = reachable_websocket_url("ws://127.0.0.1:9223/devtools/browser/abc", addr).unwrap();
+        assert_eq!(url, "ws://172.20.0.3:9222/devtools/browser/abc");
+    }
+
     use super::*;
 
     /// Needs a running Chrome, so it's skipped unless asked for:
