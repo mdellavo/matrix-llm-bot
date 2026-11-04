@@ -82,6 +82,49 @@ as a new device and loses access to encrypted history. Back up `bot.db` with
 `sqlite3 bot.db ".backup backup.db"` rather than copying the file while the bot runs, since
 recent writes can be in its `-wal` file.
 
+### Rendering pages with a headless browser
+
+Many sites, Reddit among them, build their pages with JavaScript, so a plain fetch gets an
+empty shell. With a headless Chrome configured, the bot renders `https` pages in it first,
+including pages read with `read_page`, and falls back to the plain fetch if rendering fails.
+Chrome runs in its own container with no internet route of its own. Every connection it
+makes goes through a proxy inside the bot that applies the same public-address checks as
+any other fetch. That matters because Chrome runs whatever scripts a posted page carries,
+and without the proxy those scripts could reach your own network.
+
+Add the browser and an internal network to the Compose file:
+
+```yaml
+services:
+  matrix-llm-bot:
+    # ...as above, plus:
+    networks: [default, browser]
+
+  chrome:
+    image: chromedp/headless-shell:156.0.8078.36
+    restart: unless-stopped
+    networks: [browser]
+    shm_size: 512m
+    mem_limit: 1g
+    security_opt: [no-new-privileges:true]
+
+networks:
+  browser:
+    internal: true
+```
+
+Then set this in `config.toml`:
+
+```toml
+browser_url = "http://chrome:9222"
+browser_proxy_url = "http://matrix-llm-bot:3128"
+```
+
+`internal: true` is what keeps Chrome off the internet, so don't leave it out. The proxy
+only accepts connections from the `browser_url` host, and only tunnels `https` to public
+addresses on ports 80 and 443. Plain `http` pages aren't rendered. Rendering adds a few
+seconds to each linked page, and up to 2 pages render at once.
+
 ### Updating
 
 Build first, so the running bot stays up until the new image is ready. Tag the current
@@ -246,7 +289,8 @@ Chat replies and greetings use `claude-opus-5-5`. A chat reply sees:
 
 Chat replies can search the web up to 3 times per reply, at $0.01 per search. They read
 pages with `read_page`, up to 6 per reply and 20,000 characters each. It runs in the bot
-through the same fetcher and address checks as posted links, using a browser user agent.
+through the same fetcher and address checks as posted links, and renders pages in the
+headless browser when one is set up.
 Claude's own web fetch tool, which Reddit and some other sites block, is kept only for
 what `read_page` can't read, like PDFs, up to 3 per reply. Greetings and unprompted comments see recent
 history, and unprompted comments see facts and notes too, but neither gets web, memory,
@@ -301,7 +345,9 @@ off, including image downloads.
 
 Pages are requested with a desktop Chrome user agent, since some sites, like Reddit, send
 an empty page to anything that doesn't look like a browser. Sites that check more than the
-user agent may still block it.
+user agent may still block it. Pages built with JavaScript only have their text when a
+headless browser is set up, as described under
+[Rendering pages with a headless browser](#rendering-pages-with-a-headless-browser).
 
 Only public addresses on ports 80 and 443 are fetched. Private addresses are refused in the
 resolver and on redirects, since anyone in a room can post a URL. Fetching reveals the

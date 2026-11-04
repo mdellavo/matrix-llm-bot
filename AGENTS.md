@@ -26,6 +26,7 @@ To test Claude calls without the API, use the fake Messages server in `src/llm.r
 | `src/bot_docs.rs` | The chat reply's local tools: the README and changelog for help questions, and `read_page` |
 | `src/classify.rs` | Intent and sentiment classification |
 | `src/links.rs` | Fetching linked pages, limited to public addresses |
+| `src/browser.rs`, `src/browser_proxy.rs` | Rendering pages in headless Chrome, and the proxy that's its only way out |
 | `src/db.rs` | The SQLite database and its schema migrations |
 | `src/direct_rooms.rs` | Private rooms, and who may start one |
 | `src/legacy_import.rs` | One-time import of pre-SQLite data files |
@@ -79,6 +80,9 @@ To test Claude calls without the API, use the fake Messages server in `src/llm.r
 - Keep facts scoped to their room.
 - Never fetch a user-supplied URL outside `LinkFetcher`, or weaken its address checks.
   Anyone in a room can post a URL, and the bot can reach the network it runs on.
+- The headless browser runs untrusted scripts, so it must reach the network only through
+  `browser_proxy`. Don't give its container a network route of its own, and don't add
+  plain-HTTP proxying, which can't be checked per request.
 - Consider per-message cost. Classification runs on nearly every message, and anything
   added there is paid for constantly.
 

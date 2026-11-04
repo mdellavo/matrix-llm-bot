@@ -19,6 +19,7 @@ use crate::greeting::GreetingCooldown;
 use crate::handler::{HandlerContext, answer_pending_invites, on_invite, on_reaction, on_room_message};
 use crate::ignore::IgnoredUsers;
 use crate::legacy_import::import_legacy_data;
+use crate::browser::PageBrowser;
 use crate::links::LinkFetcher;
 use crate::message_log::{MessageLogger, short_name};
 use crate::room_memory::RoomMemory;
@@ -110,7 +111,7 @@ impl Bot {
             direct_rooms: Arc::clone(&direct_rooms),
             memory: Arc::new(RoomMemory::new(Arc::clone(&database))),
             room_queues: Arc::new(RoomQueues::default()),
-            links: Arc::new(LinkFetcher::new(config.fetch_links)?),
+            links: Arc::new(link_fetcher(config).await?),
             docs: Arc::new(BotDocs::new()?),
             interjection_chance: config.interjection_chance,
             interjection_cooldown: Arc::new(GreetingCooldown::new(std::time::Duration::from_secs(
@@ -292,4 +293,22 @@ fn load_or_create_device_id(store_dir: &Path) -> Result<String> {
     std::fs::write(&path, &device_id)
         .with_context(|| format!("failed to write device id file at {}", path.display()))?;
     Ok(device_id)
+}
+
+/// The link fetcher, rendering pages in the headless browser if one is configured.
+/// The proxy that's the browser's only way out starts here too, so the browser can
+/// never be used without it.
+async fn link_fetcher(config: &Config) -> Result<LinkFetcher> {
+    let links = LinkFetcher::new(config.fetch_links)?;
+    let (Some(browser_url), Some(proxy_url)) = (&config.browser_url, &config.browser_proxy_url) else {
+        return Ok(links);
+    };
+
+    let browser = Arc::new(PageBrowser::new(browser_url, proxy_url, crate::links::USER_AGENT)?);
+    let listener = tokio::net::TcpListener::bind(&config.browser_proxy_listen)
+        .await
+        .with_context(|| format!("failed to listen for the browser on {}", config.browser_proxy_listen))?;
+    tokio::spawn(crate::browser_proxy::serve(listener, browser.host().to_string()));
+    tracing::info!(browser = %browser_url, proxy = %config.browser_proxy_listen, "rendering linked pages in a headless browser");
+    Ok(links.with_browser(browser))
 }

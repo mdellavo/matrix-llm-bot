@@ -15,6 +15,7 @@ use reqwest::redirect::Policy;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
 
+use crate::browser::PageBrowser;
 use crate::llm::{ImageInput, MAX_IMAGE_BYTES};
 
 const MAX_LINKS_PER_MESSAGE: usize = 3;
@@ -29,10 +30,12 @@ const READ_TEXT_CHARS: usize = 20_000;
 const FETCH_TIMEOUT: Duration = Duration::from_secs(8);
 /// An image is only downloaded when a reply needs it, and can be much bigger than a page.
 const IMAGE_FETCH_TIMEOUT: Duration = Duration::from_secs(20);
-/// A desktop Chrome user agent. Sites like Reddit serve an empty shell, with no title
-/// or text, to anything that doesn't look like a browser.
-const USER_AGENT: &str =
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36";
+/// A desktop Chrome user agent, sent by both the plain fetch and the headless browser,
+/// whose own says `HeadlessChrome`. Sites like Reddit serve an empty shell, with no
+/// title or text, to anything that doesn't look like a browser. The version matches
+/// the browser image in the README.
+pub const USER_AGENT: &str =
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/156.0.0.0 Safari/537.36";
 
 /// Hosts whose links are Matrix plumbing rather than something people shared.
 const SKIPPED_HOSTS: &[&str] = &["matrix.to"];
@@ -109,7 +112,7 @@ fn is_public_ipv6(ip: Ipv6Addr) -> bool {
         || (first == 0x64 && ip.segments()[1] == 0xFF9B)) // NAT64, which can embed a private IPv4
 }
 
-fn is_public(ip: IpAddr) -> bool {
+pub(crate) fn is_public(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(ip) => is_public_ipv4(ip),
         IpAddr::V6(ip) => is_public_ipv6(ip),
@@ -175,6 +178,8 @@ pub struct LinkFetcher {
     client: reqwest::Client,
     enabled: bool,
     allow_private: bool,
+    /// Renders HTML pages when set, falling back to the plain fetch if it fails.
+    browser: Option<Arc<PageBrowser>>,
 }
 
 /// The headers a browser sends with a page request, to go with `USER_AGENT`.
@@ -204,7 +209,25 @@ impl LinkFetcher {
             .build()
             .context("failed to build link preview client")?;
 
-        Ok(Self { client, enabled, allow_private })
+        Ok(Self { client, enabled, allow_private, browser: None })
+    }
+
+    /// Renders pages in `browser` from now on, so their scripts run first.
+    pub fn with_browser(mut self, browser: Arc<PageBrowser>) -> Self {
+        self.browser = Some(browser);
+        self
+    }
+
+    /// The page's HTML from the browser, if there is one and it managed.
+    async fn render(&self, url: &Url) -> Option<String> {
+        let browser = self.browser.as_ref()?;
+        match browser.render(url).await {
+            Ok(html) => Some(html),
+            Err(err) => {
+                warn!(?err, host = url.host_str(), "browser couldn't render page; using the plain fetch");
+                None
+            }
+        }
     }
 
     /// Previews of the links in `text`, fetched at once, in the order they appear.
@@ -299,7 +322,14 @@ impl LinkFetcher {
     }
 
     async fn try_fetch(&self, url: &Url, text_limit: usize) -> Result<Option<LinkPreview>> {
-        let mut response = self.client.get(url.clone()).send().await?.error_for_status()?;
+        let mut response = match self.client.get(url.clone()).send().await?.error_for_status() {
+            Ok(response) => response,
+            // Some sites refuse anything but a browser outright, so let it try.
+            Err(err) => match self.render(url).await {
+                Some(html) => return Ok(non_empty(parse_html(url.as_str(), &html, text_limit))),
+                None => return Err(err.into()),
+            },
+        };
 
         let content_type = response
             .headers()
@@ -330,8 +360,10 @@ impl LinkFetcher {
         }
         let body = String::from_utf8_lossy(&body);
 
+        // The plain fetch still comes first, for the content type and as the fallback.
         let preview = if is_html {
-            parse_html(url.as_str(), &body, text_limit)
+            let rendered = if url.scheme() == "https" { self.render(url).await } else { None };
+            parse_html(url.as_str(), rendered.as_deref().unwrap_or(&body), text_limit)
         } else {
             LinkPreview {
                 url: url.to_string(),
@@ -341,8 +373,12 @@ impl LinkFetcher {
                 image: false,
             }
         };
-        Ok(Some(preview).filter(|preview| preview.title.is_some() || preview.description.is_some() || preview.text.is_some()))
+        Ok(non_empty(preview))
     }
+}
+
+fn non_empty(preview: LinkPreview) -> Option<LinkPreview> {
+    Some(preview).filter(|preview| preview.title.is_some() || preview.description.is_some() || preview.text.is_some())
 }
 
 /// What went wrong, short enough to tell the model: the HTTP status when there was one.

@@ -64,6 +64,15 @@ rooms = ["#some-room:matrix.org"]
 # being asked. Only public addresses are fetched. Defaults to true.
 # fetch_links = true
 
+# Optional: render linked pages in a headless Chrome, so pages built with JavaScript,
+# like Reddit's, have text to read. Chrome must have no internet access of its own:
+# it reaches sites only through the bot's proxy, which applies the same address checks
+# as any other fetch. See "Rendering pages with a headless browser" in the README.
+# browser_url = "http://chrome:9222"
+# browser_proxy_url = "http://matrix-llm-bot:3128"
+# Where the proxy listens. Defaults to 0.0.0.0:3128.
+# browser_proxy_listen = "0.0.0.0:3128"
+
 # Optional: who may start a private conversation by inviting the bot, as user IDs and
 # whole servers. Invites from anyone else are declined. Each reply there costs a Claude
 # call, so consider setting cost_limit_usd too. Defaults to the bot's own homeserver.

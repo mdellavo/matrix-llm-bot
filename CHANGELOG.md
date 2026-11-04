@@ -7,6 +7,7 @@ one day of commits, newest first.
 
 ### Added
 
+- Headless browser rendering: with `browser_url` set, linked pages and pages read for replies are rendered in a headless Chrome so their JavaScript runs. Chrome reaches the internet only through a proxy in the bot that applies the usual address checks
 - Edited messages: an edit updates the stored message, and if it's for the bot, the bot answers the new version and edits its earlier reply to match
 
 ### Changed

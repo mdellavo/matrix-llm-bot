@@ -1,5 +1,7 @@
 mod bot;
 mod bot_docs;
+mod browser;
+mod browser_proxy;
 mod classify;
 mod config;
 mod db;

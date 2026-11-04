@@ -102,6 +102,26 @@ pub struct Config {
     /// else are declined. Empty (the default) means the bot's own homeserver.
     #[serde(default)]
     pub dm_allowed_users: Vec<String>,
+
+    /// A headless Chrome's DevTools address, like `http://chrome:9222`, for rendering
+    /// linked pages so their scripts run. Unset (the default) fetches pages without
+    /// running scripts. The browser must have no internet access of its own: it reaches
+    /// sites only through the bot's proxy. See the README for the container setup.
+    #[serde(default)]
+    pub browser_url: Option<String>,
+
+    /// Where the bot listens for the browser's connections. Defaults to `0.0.0.0:3128`.
+    #[serde(default = "default_browser_proxy_listen")]
+    pub browser_proxy_listen: String,
+
+    /// The proxy's address as the browser reaches it, like `http://matrix-llm-bot:3128`.
+    /// Required with `browser_url`.
+    #[serde(default)]
+    pub browser_proxy_url: Option<String>,
+}
+
+fn default_browser_proxy_listen() -> String {
+    "0.0.0.0:3128".to_string()
 }
 
 fn default_database_path() -> PathBuf {
@@ -170,6 +190,10 @@ impl Config {
             (0.0..=1.0).contains(&self.interjection_chance),
             "interjection_chance must be between 0 and 1"
         );
+        if self.browser_url.is_some() {
+            anyhow::ensure!(self.browser_proxy_url.is_some(), "browser_proxy_url is required with browser_url");
+            anyhow::ensure!(self.fetch_links, "browser_url needs fetch_links on");
+        }
         for entry in &self.dm_allowed_users {
             anyhow::ensure!(
                 (entry.starts_with('@') || entry.starts_with(':')) && entry.contains(':') && entry.len() > 1,
