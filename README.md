@@ -296,6 +296,10 @@ in the message it replies to, in the thread, or posted in the last 5 minutes, up
 pages. Other media is only noted by type. Set `fetch_links = false` to turn all of this
 off, including image downloads.
 
+Pages are requested with a desktop Chrome user agent, since some sites, like Reddit, send
+an empty page to anything that doesn't look like a browser. Sites that check more than the
+user agent may still block it.
+
 Only public addresses on ports 80 and 443 are fetched. Private addresses are refused in the
 resolver and on redirects, since anyone in a room can post a URL. Fetching reveals the
 bot's IP to the linked site, and links posted in encrypted rooms are fetched and saved too.
@@ -305,6 +309,16 @@ bot's IP to the linked site, and links posted in encrypted rooms are fetched and
 `claude-haiku-5-5` records each message's intent, sentiment, and entities, using the last
 10 messages as context, and spots room greetings. It doesn't run for `!commands` or
 images. If it fails, the message is still logged and still answered if addressed.
+
+### Edited messages
+
+An edit updates the stored message in place, so history shows the new text. If the edited
+message is for the bot, by being addressed, a command, or a follow-up in its thread, the
+bot answers the new version and edits its earlier reply to match, or replies for the first
+time if it hadn't before. The model is told what the message said before. Edits that
+aren't for the bot only update history, without being classified again, and edits that
+don't change the text are ignored. If the new version no longer needs an answer, the
+earlier reply stays as it was.
 
 ### Reactions
 
@@ -409,8 +423,8 @@ aren't counted.
 
 ## Known limitations
 
-- An edited message is treated as a new message: it's logged again and answered again if
-  addressed, and the original keeps its text in the log.
+- Editing a message that was merged into a burst gets it a separate answer, since the
+  burst's reply is stored on its last message.
 - Message types other than text and images are ignored.
 - Links posted before linked images were supported won't load as images from history.
 - If Claude rejects an image, for example because of its dimensions, the whole reply fails.
@@ -432,7 +446,6 @@ Ideas for later, not commitments. See [CHANGELOG.md](CHANGELOG.md) for what's sh
 
 ### Reliability
 
-- Handle edited messages properly, by updating the log rather than treating them as new
 - Automatic backups of the `data` directory
 - Track removed reactions
 

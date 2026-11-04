@@ -3,6 +3,16 @@
 Notable changes to matrix-llm-bot, built from the git history. Each version covers
 one day of commits, newest first.
 
+## 0.14.0 - 2026-11-03
+
+### Added
+
+- Edited messages: an edit updates the stored message, and if it's for the bot, the bot answers the new version and edits its earlier reply to match
+
+### Changed
+
+- Linked pages are fetched with a desktop browser user agent, so sites like Reddit return their real page instead of an empty one
+
 ## 0.13.0 - 2026-11-02
 
 ### Added

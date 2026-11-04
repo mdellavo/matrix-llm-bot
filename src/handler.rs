@@ -9,6 +9,7 @@ use matrix_sdk::{
     ruma::{
         EventId, OwnedEventId, UserId,
         events::{
+            Mentions,
             reaction::{OriginalSyncReactionEvent, ReactionEventContent},
             relation::{Annotation, Thread},
             room::{
@@ -16,7 +17,8 @@ use matrix_sdk::{
                 member::{MembershipState, StrippedRoomMemberEvent},
                 message::{
                     AddMentions, ForwardThread, ImageMessageEventContent, MessageType, OriginalSyncRoomMessageEvent,
-                    Relation, ReplyMetadata, ReplyWithinThread, RoomMessageEventContent,
+                    Relation, ReplacementMetadata, ReplyMetadata, ReplyWithinThread, RoomMessageEventContent,
+                    RoomMessageEventContentWithoutRelation,
                 },
             },
         },
@@ -33,7 +35,7 @@ use crate::ignore::IgnoredUsers;
 use crate::links::{LinkFetcher, LinkPreview};
 use crate::llm::{self, CompletionRequest, ImageInput, LocalTools, MAX_IMAGE_BYTES};
 use crate::message_log::{
-    self, GeneratedReply, LoggedMessage, MessageLogParams, MessageLogger, PromptRecord, short_name,
+    self, EditedMessage, GeneratedReply, LoggedMessage, MessageLogParams, MessageLogger, PromptRecord, short_name,
 };
 use crate::room_memory::{MemoryTools, RoomMemory};
 use crate::room_queue::{Inbox, RoomQueues};
@@ -155,25 +157,67 @@ fn thread_in_content(content: &serde_json::Value) -> Option<OwnedEventId> {
     relation["event_id"].as_str()?.try_into().ok()
 }
 
-/// The thread `event` belongs to: the one it says, the one the message it replies to
-/// is in, or for an edit, the one the edited message is in.
-async fn existing_thread(event: &OriginalSyncRoomMessageEvent, room: &Room, reply_target: Option<&RepliedTo>) -> Option<OwnedEventId> {
+/// The thread `event` belongs to: the one it says, or the one the message it replies
+/// to is in.
+fn existing_thread(event: &OriginalSyncRoomMessageEvent, reply_target: Option<&RepliedTo>) -> Option<OwnedEventId> {
     match &event.content.relates_to {
         Some(Relation::Thread(thread)) => Some(thread.event_id.clone()),
-        Some(Relation::Replacement(edit)) => {
-            let original = room.event(&edit.event_id, None).await.ok()?;
-            thread_in_content(&original.kind.raw().get_field::<serde_json::Value>("content").ok().flatten()?)
-        }
         _ => reply_target.and_then(|target| target.thread_root.clone()),
     }
 }
 
-/// The event a new thread would start from. A thread can't be rooted on an edit, so
-/// that's the message that was edited.
-fn new_thread_root(event: &OriginalSyncRoomMessageEvent) -> &EventId {
-    match &event.content.relates_to {
-        Some(Relation::Replacement(edit)) => &edit.event_id,
-        _ => &event.event_id,
+/// A message someone edited after the bot saw it.
+struct Edit {
+    /// The message as it was logged before this edit.
+    previous: LoggedMessage,
+}
+
+/// The message as it should be handled. An edit becomes the message it edits, with the
+/// new text but the original's ID, thread, and reply, so it's answered as if the
+/// message had been sent that way. `None` means the edit needs nothing: the bot never
+/// saw the original, or someone other than its sender sent the edit.
+async fn resolve_edit(ctx: &HandlerContext, room: &Room, event: OriginalSyncRoomMessageEvent) -> Option<(OriginalSyncRoomMessageEvent, Option<Edit>)> {
+    let Some(Relation::Replacement(replacement)) = &event.content.relates_to else {
+        return Some((event, None));
+    };
+
+    let room_id = room.room_id().as_str();
+    let previous = match ctx.message_log.get(room_id, replacement.event_id.as_str()) {
+        Ok(Some(previous)) if previous.sender == event.sender.as_str() => previous,
+        Ok(_) => {
+            debug!(room = %room_id, "ignoring edit of a message that wasn't logged from this sender");
+            return None;
+        }
+        Err(err) => {
+            warn!(?err, room = %room_id, "failed to look up edited message");
+            return None;
+        }
+    };
+
+    let original = match room.event(&replacement.event_id, None).await {
+        Ok(original) => original,
+        Err(err) => {
+            warn!(?err, room = %room_id, "failed to fetch edited message");
+            return None;
+        }
+    };
+    let mut edited: OriginalSyncRoomMessageEvent = match serde_json::from_str(original.kind.raw().json().get()) {
+        Ok(edited) => edited,
+        Err(err) => {
+            warn!(?err, room = %room_id, "edited event isn't a readable message");
+            return None;
+        }
+    };
+    apply_edit(&mut edited, &replacement.new_content);
+    Some((edited, Some(Edit { previous })))
+}
+
+/// Gives the original message the edit's content. The edit's mentions are the full
+/// set for the new version, so they replace the original's when present.
+fn apply_edit(original: &mut OriginalSyncRoomMessageEvent, new_content: &RoomMessageEventContentWithoutRelation) {
+    original.content.msgtype = new_content.msgtype.clone();
+    if new_content.mentions.is_some() {
+        original.content.mentions = new_content.mentions.clone();
     }
 }
 
@@ -599,6 +643,9 @@ const BURST_WINDOW: Duration = Duration::from_millis(1500);
 
 async fn process_message(ctx: &HandlerContext, inbox: &mut Inbox<QueuedMessage>, message: QueuedMessage) {
     let QueuedMessage { event, room, client } = message;
+    let Some((event, edit)) = resolve_edit(ctx, &room, event).await else {
+        return;
+    };
 
     let (text, own_image) = match &event.content.msgtype {
         MessageType::Text(content) => (content.body.as_str(), None),
@@ -606,13 +653,23 @@ async fn process_message(ctx: &HandlerContext, inbox: &mut Inbox<QueuedMessage>,
         _ => return,
     };
 
-    info!(room = %room.room_id(), sender = %event.sender, "received message");
+    info!(room = %room.room_id(), sender = %event.sender, edited = edit.is_some(), "received message");
 
     let sender_name = display_name(&room, &event.sender).await;
     let reply_target = replied_to(&event, &room).await;
     let body = if reply_target.is_some() { strip_reply_fallback(text) } else { text };
 
-    let joined_thread = existing_thread(&event, &room, reply_target.as_ref()).await;
+    let log_body = match own_image {
+        Some(_) if body.is_empty() => "[image]".to_string(),
+        Some(_) => format!("[image] {body}"),
+        None => body.to_string(),
+    };
+    // Clients send an edit for formatting-only changes too, and those change nothing here.
+    if edit.as_ref().is_some_and(|edit| edit.previous.body == log_body) {
+        return;
+    }
+
+    let joined_thread = existing_thread(&event, reply_target.as_ref());
     let thread = match &joined_thread {
         Some(root) => ctx.message_log.thread(room.room_id().as_str(), root.as_str(), CHAT_HISTORY_LIMIT).unwrap_or_else(|err| {
             warn!(?err, room = %room.room_id(), "failed to load thread; replying without it");
@@ -643,6 +700,26 @@ async fn process_message(ctx: &HandlerContext, inbox: &mut Inbox<QueuedMessage>,
         conversation == Conversation::SmallGroup || joined_thread.as_ref().is_some_and(|root| bot_in_thread(&thread, root));
     let follow_up = is_follow_up(in_conversation, mentions_someone, reply_target.is_some() && !replied_to_bot);
     let directed_at_bot = addressed || follow_up;
+
+    // An edit only gets an answer when the bot would answer it anyway. Anything else,
+    // like a greeting, was already handled when the message was first sent, so the
+    // edit just updates history, without paying for a classification.
+    if edit.is_some() && command.is_none() && !directed_at_bot {
+        let links = ctx.links.fetch_all(body).await;
+        save_edit(ctx, EditedMessage {
+            room_id: room.room_id().as_str(),
+            event_id: event.event_id.as_str(),
+            body: &log_body,
+            links: &links,
+            analysis: None,
+            classify_prompt: None,
+            classify_raw_json: None,
+            response: None,
+            response_event_id: None,
+            thread_root_id: None,
+        });
+        return;
+    }
 
     // Started before classification when a reply is already certain, so the wait for
     // the classifier shows as typing too.
@@ -695,7 +772,7 @@ async fn process_message(ctx: &HandlerContext, inbox: &mut Inbox<QueuedMessage>,
 
     // Follow-ups from the same person in the same place become part of the one message
     // being answered.
-    let burst = if kind == Some(ReplyKind::Chat) && own_image.is_none() {
+    let burst = if kind == Some(ReplyKind::Chat) && own_image.is_none() && edit.is_none() {
         let sender = event.sender.clone();
         let same_thread = stated_thread(&event).map(ToOwned::to_owned);
         inbox
@@ -752,6 +829,10 @@ async fn process_message(ctx: &HandlerContext, inbox: &mut Inbox<QueuedMessage>,
                 image_failed,
                 images: &images,
                 pages: &pages,
+                edit: edit.as_ref().map(|edit| EditNote {
+                    previous: &edit.previous.body,
+                    replaces_reply: edit.previous.response_event_id.is_some(),
+                }),
             };
             generate_grounded_reply(ctx, &room, &input).await
         }
@@ -770,7 +851,7 @@ async fn process_message(ctx: &HandlerContext, inbox: &mut Inbox<QueuedMessage>,
     // unprompted comments stay where they were said, since a thread would hide them,
     // and a private conversation already is one thread.
     let starts_thread = conversation == Conversation::Room && (command.is_some() || kind == Some(ReplyKind::Chat));
-    let thread_root = joined_thread.clone().or_else(|| starts_thread.then(|| new_thread_root(&event).to_owned()));
+    let thread_root = joined_thread.clone().or_else(|| starts_thread.then(|| event.event_id.clone()));
     let reply_to = match &thread_root {
         Some(root) if stated_thread(&event).is_none() => root,
         _ => last_event_id,
@@ -781,9 +862,16 @@ async fn process_message(ctx: &HandlerContext, inbox: &mut Inbox<QueuedMessage>,
         (None, _) => Placement::Reply,
     };
 
-    let response_event_id = match &response {
-        Some(response) => deliver(&room, reply_to, placement, &event.sender, &response.text).await,
-        None => {
+    // An answer to an edited message replaces the bot's answer to the old version, so
+    // the conversation reads as if the message had been sent that way.
+    let previous_reply = edit
+        .as_ref()
+        .and_then(|edit| edit.previous.response_event_id.as_deref())
+        .and_then(|id| EventId::parse(id).ok());
+    let response_event_id = match (&response, previous_reply) {
+        (Some(response), Some(previous_reply)) => replace_reply(&room, previous_reply, &event.sender, &response.text).await,
+        (Some(response), None) => deliver(&room, reply_to, placement, &event.sender, &response.text).await,
+        (None, _) => {
             // "gordy: thanks" doesn't need an answer, but it shouldn't get silence.
             if addressed && command.is_none() && analysis.intent == Intent::Acknowledgement {
                 send_reaction(&room, last_event_id, "👍").await;
@@ -792,11 +880,23 @@ async fn process_message(ctx: &HandlerContext, inbox: &mut Inbox<QueuedMessage>,
         }
     };
 
-    let log_body = match own_image {
-        Some(_) if body.is_empty() => "[image]".to_string(),
-        Some(_) => format!("[image] {body}"),
-        None => body.to_string(),
-    };
+    let logged_thread = joined_thread.as_ref().or(thread_root.as_ref().filter(|_| response_event_id.is_some()));
+
+    if edit.is_some() {
+        save_edit(ctx, EditedMessage {
+            room_id: room.room_id().as_str(),
+            event_id: event.event_id.as_str(),
+            body: &log_body,
+            links: &links,
+            analysis: Some(&analysis),
+            classify_prompt: classification.as_ref().map(|outcome| &outcome.prompt),
+            classify_raw_json: classification.as_ref().map(|outcome| &outcome.raw_json),
+            response: response.as_ref(),
+            response_event_id: response_event_id.as_ref().map(|id| id.as_str()),
+            thread_root_id: logged_thread.map(|root| root.as_str()),
+        });
+        return;
+    }
 
     let follow_up_analysis = MessageAnalysis::unclassified(Intent::Chitchat, "Part of a burst of messages.");
     let mut lines = vec![(&event, log_body.as_str(), links.as_slice(), classification.as_ref(), &analysis)];
@@ -804,7 +904,6 @@ async fn process_message(ctx: &HandlerContext, inbox: &mut Inbox<QueuedMessage>,
         lines.push((&follow_up.event, follow_up.burst_text().unwrap_or_default(), follow_up_links.as_slice(), None, &follow_up_analysis));
     }
 
-    let logged_thread = joined_thread.as_ref().or(thread_root.as_ref().filter(|_| response_event_id.is_some()));
     let last_line = lines.len() - 1;
     for (index, (line_event, line_body, line_links, outcome, line_analysis)) in lines.into_iter().enumerate() {
         let is_last = index == last_line;
@@ -828,6 +927,33 @@ async fn process_message(ctx: &HandlerContext, inbox: &mut Inbox<QueuedMessage>,
             warn!(?err, room = %room.room_id(), "failed to write message log entry");
         }
     }
+}
+
+fn save_edit(ctx: &HandlerContext, edited: EditedMessage<'_>) {
+    let room_id = edited.room_id;
+    if let Err(err) = ctx.message_log.record_edit(edited) {
+        warn!(?err, room = %room_id, "failed to record edited message");
+    }
+}
+
+/// Edits the bot's earlier reply to say `text` instead, returning its event ID.
+async fn replace_reply(room: &Room, reply_id: OwnedEventId, sender: &UserId, text: &str) -> Option<OwnedEventId> {
+    match room.send(replacement_content(reply_id.clone(), sender, text)).await {
+        Ok(_) => Some(reply_id),
+        Err(err) => {
+            warn!(?err, room = %room.room_id(), "failed to edit reply");
+            None
+        }
+    }
+}
+
+/// An edit of the bot's reply. The reply already mentioned `sender`, so the edit
+/// keeps that mention without notifying them again.
+fn replacement_content(reply_id: OwnedEventId, sender: &UserId, text: &str) -> RoomMessageEventContent {
+    let mentions = Mentions::with_user_ids([sender.to_owned()]);
+    RoomMessageEventContentWithoutRelation::text_markdown(text)
+        .add_mentions(mentions.clone())
+        .make_replacement(ReplacementMetadata::new(reply_id, Some(mentions)))
 }
 
 /// Rolls for an unprompted comment. Only considers conversation the classifier
@@ -1056,6 +1182,17 @@ struct ReplyInput<'a> {
     pages: &'a [LinkPreview],
     /// An image was involved, but couldn't be loaded.
     image_failed: bool,
+    /// Set when the message is an edit.
+    edit: Option<EditNote<'a>>,
+}
+
+/// What the model is told about an edited message.
+#[derive(Debug, Clone, Copy)]
+struct EditNote<'a> {
+    /// The message as it read before, which is what the history shows.
+    previous: &'a str,
+    /// The bot answered the old version, and this answer replaces that one.
+    replaces_reply: bool,
 }
 
 /// Generates a reply grounded in the room's recent history and the message it's
@@ -1120,6 +1257,7 @@ async fn generate_grounded_reply(ctx: &HandlerContext, room: &Room, input: &Repl
         bot_name: &ctx.bot_name,
         image_failed: input.image_failed,
         pages: input.pages,
+        edit: input.edit,
     });
     let prompt = PromptRecord { system: system_prompt.clone(), user: format!("{stable_context}{new_context}") };
 
@@ -1187,6 +1325,7 @@ struct ChatTurn<'a> {
     bot_name: &'a str,
     image_failed: bool,
     pages: &'a [LinkPreview],
+    edit: Option<EditNote<'a>>,
 }
 
 /// Renders the user turn in two parts. First what changes rarely, and so can be
@@ -1236,6 +1375,18 @@ fn chat_turn_parts(chat: &ChatTurn<'_>) -> (String, String) {
 
     if let Some(now) = chat.now {
         turn.push_str(&format!("The current time is {now} UTC.\n\n"));
+    }
+
+    if let Some(edit) = chat.edit {
+        turn.push_str(&format!(
+            "[{}] just edited a message they sent earlier. The history shows the old version, which said: {}\n",
+            chat.sender_name,
+            message_log::single_line(edit.previous)
+        ));
+        if edit.replaces_reply {
+            turn.push_str("Your reply to the old version will be replaced with this one, so answer the new version on its own terms.\n");
+        }
+        turn.push('\n');
     }
 
     turn.push_str(&format!("Message to reply to, from [{}]:\n{}", chat.sender_name, chat.message_text.trim()));
@@ -1502,7 +1653,70 @@ mod tests {
             bot_name: "gordy",
             image_failed: false,
             pages: &[],
+            edit: None,
         }
+    }
+
+    #[test]
+    fn an_edit_is_explained_just_before_the_message() {
+        let edit = EditNote { previous: "gordy whats teh capital of autralia", replaces_reply: true };
+        let turn = format_chat_turn(&ChatTurn { edit: Some(edit), ..chat_turn("bob", "gordy what's the capital of austria") });
+
+        let note = turn.find("[bob] just edited a message").expect("edit noted");
+        let old = turn.find("which said: gordy whats teh capital of autralia").expect("old version shown");
+        let replaced = turn.find("Your reply to the old version will be replaced").expect("replacement explained");
+        let current = turn.find("Message to reply to, from [bob]:\ngordy what's the capital of austria").expect("message present");
+        assert!(note < old && old < replaced && replaced < current, "{turn}");
+
+        let unanswered = EditNote { replaces_reply: false, ..edit };
+        let turn = format_chat_turn(&ChatTurn { edit: Some(unanswered), ..chat_turn("bob", "gordy hi") });
+        assert!(turn.contains("just edited") && !turn.contains("will be replaced"), "{turn}");
+
+        assert!(!format_chat_turn(&chat_turn("bob", "hi")).contains("edited"));
+    }
+
+    #[test]
+    fn an_edit_takes_the_new_text_but_keeps_the_original_thread() {
+        let mut original: OriginalSyncRoomMessageEvent = serde_json::from_value(serde_json::json!({
+            "type": "m.room.message",
+            "event_id": "$original",
+            "sender": "@bob:example.org",
+            "origin_server_ts": 1,
+            "content": {
+                "msgtype": "m.text",
+                "body": "whats teh capital of autralia",
+                "m.relates_to": {"rel_type": "m.thread", "event_id": "$root", "is_falling_back": true,
+                                 "m.in_reply_to": {"event_id": "$root"}},
+            },
+        }))
+        .unwrap();
+        let new_content: RoomMessageEventContentWithoutRelation = serde_json::from_value(serde_json::json!({
+            "msgtype": "m.text",
+            "body": "gordy what's the capital of austria",
+            "m.mentions": {"user_ids": ["@gordy:example.org"]},
+        }))
+        .unwrap();
+
+        apply_edit(&mut original, &new_content);
+
+        assert_eq!(original.event_id, "$original");
+        assert!(matches!(&original.content.msgtype, MessageType::Text(text) if text.body == "gordy what's the capital of austria"));
+        assert_eq!(stated_thread(&original).map(EventId::as_str), Some("$root"));
+        let mentions = original.content.mentions.expect("mentions from the edit");
+        assert!(mentions.user_ids.iter().any(|user| user == "@gordy:example.org"));
+    }
+
+    #[test]
+    fn a_replaced_reply_keeps_its_mention_without_pinging_again() {
+        let sender = UserId::parse("@bob:example.org").unwrap();
+        let content = replacement_content(OwnedEventId::try_from("$reply").unwrap(), &sender, "**Canberra**");
+        let json = serde_json::to_value(&content).unwrap();
+
+        assert_eq!(json["m.relates_to"]["rel_type"], "m.replace");
+        assert_eq!(json["m.relates_to"]["event_id"], "$reply");
+        assert_eq!(json["m.new_content"]["body"], "**Canberra**");
+        assert_eq!(json["m.new_content"]["m.mentions"]["user_ids"][0], "@bob:example.org");
+        assert!(json["m.mentions"]["user_ids"].as_array().is_none_or(Vec::is_empty), "{json}");
     }
 
     #[test]

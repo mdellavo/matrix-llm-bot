@@ -26,7 +26,10 @@ const MAX_TEXT_CHARS: usize = 4000;
 const FETCH_TIMEOUT: Duration = Duration::from_secs(8);
 /// An image is only downloaded when a reply needs it, and can be much bigger than a page.
 const IMAGE_FETCH_TIMEOUT: Duration = Duration::from_secs(20);
-const USER_AGENT: &str = concat!("matrix-llm-bot/", env!("CARGO_PKG_VERSION"), " (link preview)");
+/// A desktop Chrome user agent. Sites like Reddit serve an empty shell, with no title
+/// or text, to anything that doesn't look like a browser.
+const USER_AGENT: &str =
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36";
 
 /// Hosts whose links are Matrix plumbing rather than something people shared.
 const SKIPPED_HOSTS: &[&str] = &["matrix.to"];
@@ -171,6 +174,15 @@ pub struct LinkFetcher {
     allow_private: bool,
 }
 
+/// The headers a browser sends with a page request, to go with `USER_AGENT`.
+fn browser_headers() -> reqwest::header::HeaderMap {
+    use reqwest::header::{ACCEPT, ACCEPT_LANGUAGE, HeaderMap, HeaderValue};
+    let mut headers = HeaderMap::new();
+    headers.insert(ACCEPT, HeaderValue::from_static("text/html,application/xhtml+xml,application/xml;q=0.9,image/*;q=0.8,*/*;q=0.7"));
+    headers.insert(ACCEPT_LANGUAGE, HeaderValue::from_static("en-US,en;q=0.9"));
+    headers
+}
+
 impl LinkFetcher {
     pub fn new(enabled: bool) -> Result<Self> {
         Self::build(enabled, false)
@@ -180,6 +192,7 @@ impl LinkFetcher {
         let client = reqwest::Client::builder()
             .timeout(FETCH_TIMEOUT)
             .user_agent(USER_AGENT)
+            .default_headers(browser_headers())
             .redirect(redirect_policy(allow_private))
             .dns_resolver(Arc::new(PublicOnlyResolver { allow_private }))
             // A proxy would make the connections the resolver can't see.

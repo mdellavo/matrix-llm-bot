@@ -84,6 +84,22 @@ pub struct MessageLogParams<'a> {
     pub thread_root_id: Option<&'a str>,
 }
 
+/// The new version of an edited message, for `MessageLogger::record_edit`. `None`
+/// fields keep what was stored.
+pub struct EditedMessage<'a> {
+    pub room_id: &'a str,
+    /// The message that was edited, not the edit event.
+    pub event_id: &'a str,
+    pub body: &'a str,
+    pub links: &'a [LinkPreview],
+    pub analysis: Option<&'a MessageAnalysis>,
+    pub classify_prompt: Option<&'a PromptRecord>,
+    pub classify_raw_json: Option<&'a serde_json::Value>,
+    pub response: Option<&'a GeneratedReply>,
+    pub response_event_id: Option<&'a str>,
+    pub thread_root_id: Option<&'a str>,
+}
+
 /// A logged message as read back. Also serialized directly as the JSON response of
 /// the status server's message API (`src/status_server.rs`), and deserialized from
 /// the JSONL logs older versions wrote, so newer fields must have `#[serde(default)]`.
@@ -350,6 +366,56 @@ impl MessageLogger {
             thread_root_id,
         };
         self.database.with(|connection| insert_message(connection, &message))?;
+        Ok(())
+    }
+
+    /// The stored message with this event ID, without its prompts.
+    pub fn get(&self, room_id: &str, event_id: &str) -> Result<Option<LoggedMessage>> {
+        let sql = format!("SELECT {MESSAGE_COLUMNS} FROM messages WHERE room_id = ?1 AND event_id = ?2");
+        let entry = self.database.with(|connection| {
+            let mut statement = connection.prepare_cached(&sql)?;
+            let mut rows = statement.query_map([room_id, event_id], |row| read_message(row, false))?;
+            rows.next().transpose().map(Option::flatten)
+        })?;
+        Ok(entry)
+    }
+
+    /// Rewrites a message after its sender edited it, keeping its place in history.
+    /// Whatever the edit didn't produce, like a reply when the bot stayed quiet, keeps
+    /// its earlier value.
+    pub fn record_edit(&self, edit: EditedMessage<'_>) -> Result<()> {
+        let analysis_json = edit.analysis.map(to_json).transpose()?;
+        let classify_prompt_json = optional_json(edit.classify_prompt)?;
+        let classify_raw_json = optional_json(edit.classify_raw_json)?;
+        let response_prompt_json = optional_json(edit.response.and_then(|response| response.prompt.as_ref()))?;
+        let links_json = links_json(edit.links)?;
+        self.database.with(|connection| {
+            connection
+                .prepare_cached(
+                    "UPDATE messages SET body = ?3, links_json = ?4, analysis_json = COALESCE(?5, analysis_json), \
+                     classify_prompt_json = COALESCE(?6, classify_prompt_json), \
+                     classify_raw_json = COALESCE(?7, classify_raw_json), \
+                     response_prompt_json = COALESCE(?8, response_prompt_json), response = COALESCE(?9, response), \
+                     response_label = COALESCE(?10, response_label), \
+                     response_event_id = COALESCE(?11, response_event_id), \
+                     thread_root_id = COALESCE(thread_root_id, ?12) \
+                     WHERE room_id = ?1 AND event_id = ?2",
+                )?
+                .execute(params![
+                    edit.room_id,
+                    edit.event_id,
+                    edit.body,
+                    links_json,
+                    analysis_json,
+                    classify_prompt_json,
+                    classify_raw_json,
+                    response_prompt_json,
+                    edit.response.map(|response| response.text.as_str()),
+                    edit.response.map(|response| response.label.as_str()),
+                    edit.response_event_id,
+                    edit.thread_root_id,
+                ])
+        })?;
         Ok(())
     }
 
@@ -755,6 +821,56 @@ mod tests {
                 thread_root_id: None,
             })
             .unwrap();
+    }
+
+    fn edited<'a>(event_id: &'a str, body: &'a str) -> EditedMessage<'a> {
+        EditedMessage {
+            room_id: "!r",
+            event_id,
+            body,
+            links: &[],
+            analysis: None,
+            classify_prompt: None,
+            classify_raw_json: None,
+            response: None,
+            response_event_id: None,
+            thread_root_id: None,
+        }
+    }
+
+    #[test]
+    fn an_edit_rewrites_the_message_in_place() {
+        let logger = test_logger("edits");
+        log_line(&logger, "$1", "@bob:x", "gordy whats teh capital of autralia", 1, Some(("Canberra", "$reply")));
+        log_line(&logger, "$2", "@alice:x", "later", 2, None);
+
+        // Answered again: the reply text changes, and it's still the same reply event.
+        let answer = GeneratedReply::plain("Vienna", "chat");
+        logger
+            .record_edit(EditedMessage {
+                response: Some(&answer),
+                response_event_id: Some("$reply"),
+                thread_root_id: Some("$1"),
+                ..edited("$1", "gordy what's the capital of austria")
+            })
+            .unwrap();
+
+        let entry = logger.get("!r", "$1").unwrap().expect("still logged");
+        assert_eq!(entry.body, "gordy what's the capital of austria");
+        assert_eq!(entry.response.as_deref(), Some("Vienna"));
+        assert_eq!(entry.response_event_id.as_deref(), Some("$reply"));
+        assert_eq!(entry.thread_root_id.as_deref(), Some("$1"));
+        let order: Vec<String> = logger.recent("!r", 10).unwrap().into_iter().map(|entry| entry.event_id).collect();
+        assert_eq!(order, ["$1", "$2"]);
+
+        // Not answered this time: the earlier answer stays.
+        logger.record_edit(edited("$1", "gordy nvm")).unwrap();
+        let entry = logger.get("!r", "$1").unwrap().unwrap();
+        assert_eq!(entry.body, "gordy nvm");
+        assert_eq!(entry.response.as_deref(), Some("Vienna"));
+        assert_eq!(entry.thread_root_id.as_deref(), Some("$1"));
+
+        assert!(logger.get("!r", "$missing").unwrap().is_none());
     }
 
     #[test]
