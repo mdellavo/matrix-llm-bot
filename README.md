@@ -244,8 +244,11 @@ Chat replies and greetings use `claude-opus-5-5`. A chat reply sees:
 - Saved facts and notes on older chat.
 - Linked pages and images, described below.
 
-Chat replies can search the web up to 3 times per reply, at $0.01 per search, and read
-up to 3 links using Claude's web fetch tool. Greetings and unprompted comments see recent
+Chat replies can search the web up to 3 times per reply, at $0.01 per search. They read
+pages with `read_page`, up to 6 per reply and 20,000 characters each. It runs in the bot
+through the same fetcher and address checks as posted links, using a browser user agent.
+Claude's own web fetch tool, which Reddit and some other sites block, is kept only for
+what `read_page` can't read, like PDFs, up to 3 per reply. Greetings and unprompted comments see recent
 history, and unprompted comments see facts and notes too, but neither gets web, memory,
 or image access.
 

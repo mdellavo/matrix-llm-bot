@@ -1,10 +1,12 @@
 //! The bot's own README and changelog, read from GitHub so that answers about what it
-//! can do stay current without shipping the docs in the image. The URLs are fixed, so
-//! nothing here fetches anything a user supplied.
+//! can do stay current without shipping the docs in the image. The docs URLs are fixed.
+//! Also the chat reply's local tools, whose `read_page` fetches whatever URL the model
+//! picks, so it goes through `LinkFetcher` and its address checks.
 
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -12,6 +14,7 @@ use serde_json::{Value, json};
 use tokio::sync::Mutex;
 use tracing::warn;
 
+use crate::links::{LinkFetcher, LinkPreview};
 use crate::llm::LocalTools;
 use crate::room_memory::MemoryTools;
 
@@ -23,6 +26,11 @@ const USER_AGENT: &str = concat!("matrix-llm-bot/", env!("CARGO_PKG_VERSION"));
 const CACHE_TTL: Duration = Duration::from_secs(60 * 60);
 
 pub const READ_DOCS_TOOL: &str = "read_bot_docs";
+pub const READ_PAGE_TOOL: &str = "read_page";
+
+/// Pages one reply can read. Enough to sample a few threads, and each page is up to
+/// 20,000 characters of input.
+const MAX_PAGE_READS: usize = 6;
 
 pub struct BotDocs {
     client: reqwest::Client,
@@ -76,13 +84,23 @@ impl BotDocs {
     }
 }
 
-/// The local tools offered to chat replies.
+/// The local tools offered to chat replies, made fresh for each reply.
 pub struct ChatTools<'a> {
     pub memory: MemoryTools<'a>,
     pub docs: &'a BotDocs,
+    pub links: &'a LinkFetcher,
+    pub pages_read: AtomicUsize,
 }
 
 impl ChatTools<'_> {
+    async fn read_page(&self, input: &Value) -> Result<String, String> {
+        let url = input["url"].as_str().ok_or("url is required")?;
+        if self.pages_read.fetch_add(1, Ordering::SeqCst) >= MAX_PAGE_READS {
+            return Err(format!("You've read {MAX_PAGE_READS} pages for this reply, which is the limit."));
+        }
+        self.links.read(url).await.map(|page| format_read_page(&page))
+    }
+
     async fn read_docs(&self, input: &Value) -> Result<String, String> {
         let file = match input["document"].as_str() {
             Some("readme") => "README.md",
@@ -109,16 +127,43 @@ impl LocalTools for ChatTools<'_> {
                 "required": ["document"]
             }
         }));
+        tools.push(json!({
+            "name": READ_PAGE_TOOL,
+            "description": "Read a web page: its title, description, and up to 20,000 characters of its text. \
+                Use it for pages people linked, and pages found by search, when you need what they say. \
+                Works for most sites, including Reddit, and can't read PDFs.",
+            "input_schema": {
+                "type": "object",
+                "properties": {"url": {"type": "string", "description": "The full http or https URL."}},
+                "required": ["url"]
+            }
+        }));
         tools
     }
 
     fn run<'a>(&'a self, name: &'a str, input: &'a Value) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + 'a>> {
         if name == READ_DOCS_TOOL {
             Box::pin(self.read_docs(input))
+        } else if name == READ_PAGE_TOOL {
+            Box::pin(self.read_page(input))
         } else {
             self.memory.run(name, input)
         }
     }
+}
+
+/// A page as the model reads it.
+fn format_read_page(page: &LinkPreview) -> String {
+    let mut text = format!("URL: {}\n", page.url);
+    for (label, value) in [("Title", &page.title), ("Description", &page.description)] {
+        if let Some(value) = value {
+            text.push_str(&format!("{label}: {value}\n"));
+        }
+    }
+    if let Some(body) = &page.text {
+        text.push_str(&format!("\n{body}"));
+    }
+    text
 }
 
 #[cfg(test)]
@@ -171,8 +216,44 @@ mod tests {
         assert!(docs.read("CHANGELOG.md").await.is_err());
     }
 
-    fn chat_tools<'a>(memory: &'a crate::room_memory::RoomMemory, docs: &'a BotDocs) -> ChatTools<'a> {
-        ChatTools { memory: MemoryTools { memory, room_id: "!a", told_by: "alice" }, docs }
+    fn chat_tools<'a>(memory: &'a crate::room_memory::RoomMemory, docs: &'a BotDocs, links: &'a LinkFetcher) -> ChatTools<'a> {
+        ChatTools { memory: MemoryTools { memory, room_id: "!a", told_by: "alice" }, docs, links, pages_read: AtomicUsize::new(0) }
+    }
+
+    #[tokio::test]
+    async fn read_page_returns_the_page_up_to_a_limit_per_reply() {
+        let app = Router::new().route(
+            "/thread",
+            get(|| async {
+                axum::response::Html("<title>Election thread</title><p>top comment: we wuz robbed</p>")
+            }),
+        );
+        let base = serve(app).await;
+        let memory = crate::room_memory::RoomMemory::new(Arc::new(crate::db::Database::open_in_memory()));
+        let docs = BotDocs::with_base_url(base.clone()).unwrap();
+        let links = LinkFetcher::build(true, true).unwrap();
+        let tools = chat_tools(&memory, &docs, &links);
+
+        let page = tools.run(READ_PAGE_TOOL, &json!({"url": format!("{base}/thread")})).await.unwrap();
+        assert!(page.contains("Title: Election thread") && page.contains("we wuz robbed"), "{page}");
+
+        for _ in 1..MAX_PAGE_READS {
+            tools.run(READ_PAGE_TOOL, &json!({"url": format!("{base}/thread")})).await.unwrap();
+        }
+        let over = tools.run(READ_PAGE_TOOL, &json!({"url": format!("{base}/thread")})).await.unwrap_err();
+        assert!(over.contains("limit"), "{over}");
+    }
+
+    #[tokio::test]
+    async fn read_page_keeps_the_address_checks() {
+        let memory = crate::room_memory::RoomMemory::new(Arc::new(crate::db::Database::open_in_memory()));
+        let docs = BotDocs::with_base_url("http://127.0.0.1:1".to_string()).unwrap();
+        let links = LinkFetcher::new(true).unwrap();
+        let tools = chat_tools(&memory, &docs, &links);
+
+        assert!(tools.run(READ_PAGE_TOOL, &json!({"url": "http://127.0.0.1/admin"})).await.is_err());
+        assert!(tools.run(READ_PAGE_TOOL, &json!({"url": "file:///etc/passwd"})).await.is_err());
+        assert!(tools.run(READ_PAGE_TOOL, &json!({})).await.is_err());
     }
 
     #[tokio::test]
@@ -180,7 +261,8 @@ mod tests {
         let app = Router::new().route("/CHANGELOG.md", get(|| async { "## 1.0" }));
         let docs = BotDocs::with_base_url(serve(app).await).unwrap();
         let memory = crate::room_memory::RoomMemory::new(Arc::new(crate::db::Database::open_in_memory()));
-        let tools = chat_tools(&memory, &docs);
+        let links = LinkFetcher::new(true).unwrap();
+        let tools = chat_tools(&memory, &docs, &links);
 
         assert_eq!(tools.run(READ_DOCS_TOOL, &json!({"document": "changelog"})).await.unwrap(), "## 1.0");
         assert!(tools.run(READ_DOCS_TOOL, &json!({"document": "../secrets"})).await.is_err());
@@ -191,10 +273,11 @@ mod tests {
     async fn memory_tools_still_work_alongside_it() {
         let docs = BotDocs::with_base_url("http://127.0.0.1:1".to_string()).unwrap();
         let memory = crate::room_memory::RoomMemory::new(Arc::new(crate::db::Database::open_in_memory()));
-        let tools = chat_tools(&memory, &docs);
+        let links = LinkFetcher::new(true).unwrap();
+        let tools = chat_tools(&memory, &docs, &links);
 
         let names: Vec<String> = tools.definitions().iter().map(|tool| tool["name"].as_str().unwrap().to_string()).collect();
-        assert_eq!(names, ["remember", "forget", READ_DOCS_TOOL]);
+        assert_eq!(names, ["remember", "forget", READ_DOCS_TOOL, READ_PAGE_TOOL]);
         assert!(tools.run("remember", &json!({"fact": "likes tea"})).await.is_ok());
     }
 }

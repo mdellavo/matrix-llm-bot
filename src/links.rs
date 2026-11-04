@@ -23,6 +23,9 @@ const MAX_BODY_BYTES: usize = 2_000_000;
 const MAX_TITLE_CHARS: usize = 200;
 const MAX_DESCRIPTION_CHARS: usize = 300;
 const MAX_TEXT_CHARS: usize = 4000;
+/// Text returned when the model reads a page itself. Much more than a preview keeps,
+/// since it asked because it needs the detail, like the comments in a thread.
+const READ_TEXT_CHARS: usize = 20_000;
 const FETCH_TIMEOUT: Duration = Duration::from_secs(8);
 /// An image is only downloaded when a reply needs it, and can be much bigger than a page.
 const IMAGE_FETCH_TIMEOUT: Duration = Duration::from_secs(20);
@@ -188,7 +191,8 @@ impl LinkFetcher {
         Self::build(enabled, false)
     }
 
-    fn build(enabled: bool, allow_private: bool) -> Result<Self> {
+    /// `allow_private` is only for tests, which serve pages on localhost.
+    pub(crate) fn build(enabled: bool, allow_private: bool) -> Result<Self> {
         let client = reqwest::Client::builder()
             .timeout(FETCH_TIMEOUT)
             .user_agent(USER_AGENT)
@@ -265,7 +269,7 @@ impl LinkFetcher {
             return None;
         }
 
-        match self.try_fetch(&url).await {
+        match self.try_fetch(&url, MAX_TEXT_CHARS).await {
             Ok(preview) => preview,
             Err(err) => {
                 debug!(?err, %url, "failed to fetch link");
@@ -274,7 +278,27 @@ impl LinkFetcher {
         }
     }
 
-    async fn try_fetch(&self, url: &Url) -> Result<Option<LinkPreview>> {
+    /// Reads a page the model asked for, under the same address checks as a posted
+    /// link, with more of its text than a preview. The error is said to the model.
+    pub async fn read(&self, url: &str) -> Result<LinkPreview, String> {
+        let url = Url::parse(url).map_err(|_| "That isn't a valid URL.".to_string())?;
+        if !self.enabled {
+            return Err("Reading pages is turned off.".to_string());
+        }
+        if !is_allowed_url(&url, self.allow_private) {
+            return Err("Only public http and https addresses can be read.".to_string());
+        }
+        match self.try_fetch(&url, READ_TEXT_CHARS).await {
+            Ok(Some(page)) => Ok(page),
+            Ok(None) => Err("The page had no readable text.".to_string()),
+            Err(err) => {
+                warn!(?err, host = url.host_str(), "failed to read page for the model");
+                Err(format!("The page couldn't be read: {}", fetch_error_summary(&err)))
+            }
+        }
+    }
+
+    async fn try_fetch(&self, url: &Url, text_limit: usize) -> Result<Option<LinkPreview>> {
         let mut response = self.client.get(url.clone()).send().await?.error_for_status()?;
 
         let content_type = response
@@ -307,13 +331,13 @@ impl LinkFetcher {
         let body = String::from_utf8_lossy(&body);
 
         let preview = if is_html {
-            parse_html(url.as_str(), &body)
+            parse_html(url.as_str(), &body, text_limit)
         } else {
             LinkPreview {
                 url: url.to_string(),
                 title: None,
                 description: None,
-                text: Some(clip(&collapse_whitespace(&body), MAX_TEXT_CHARS)).filter(|text| !text.is_empty()),
+                text: Some(clip(&collapse_whitespace(&body), text_limit)).filter(|text| !text.is_empty()),
                 image: false,
             }
         };
@@ -321,7 +345,16 @@ impl LinkFetcher {
     }
 }
 
-fn parse_html(url: &str, html: &str) -> LinkPreview {
+/// What went wrong, short enough to tell the model: the HTTP status when there was one.
+fn fetch_error_summary(err: &anyhow::Error) -> String {
+    match err.downcast_ref::<reqwest::Error>().and_then(reqwest::Error::status) {
+        Some(status) => format!("the site answered {status}"),
+        None if err.downcast_ref::<reqwest::Error>().is_some_and(reqwest::Error::is_timeout) => "it timed out".to_string(),
+        None => "the request failed".to_string(),
+    }
+}
+
+fn parse_html(url: &str, html: &str, text_limit: usize) -> LinkPreview {
     // Same byte offsets as `html`, so positions found here can slice the original.
     let lower = html.to_ascii_lowercase();
 
@@ -333,7 +366,7 @@ fn parse_html(url: &str, html: &str) -> LinkPreview {
         title: meta(&["og:title", "twitter:title"]).or_else(|| title_tag(html, &lower)).and_then(|title| tidy(title, MAX_TITLE_CHARS)),
         description: meta(&["og:description", "description", "twitter:description"])
             .and_then(|description| tidy(description, MAX_DESCRIPTION_CHARS)),
-        text: tidy(visible_text(html, &lower), MAX_TEXT_CHARS),
+        text: tidy(visible_text(html, &lower), text_limit),
         image: false,
     }
 }
@@ -550,7 +583,7 @@ mod tests {
             <style>.a { color: red }</style><script>var hidden = 1;</script></head>
             <body><nav>Menu</nav><h1>Heading</h1><p>Body  text</p><!-- secret --></body></html>"#;
 
-        let preview = parse_html("https://example.com/", html);
+        let preview = parse_html("https://example.com/", html, MAX_TEXT_CHARS);
         assert_eq!(preview.title.as_deref(), Some("Tom & Jerry"));
         assert_eq!(preview.description.as_deref(), Some("It's a cartoon"));
         assert_eq!(preview.text.as_deref(), Some("Heading Body text"));
@@ -558,12 +591,12 @@ mod tests {
 
     #[test]
     fn parse_html_falls_back_to_the_title_tag() {
-        assert_eq!(parse_html("u", "<title>Just this</title>").title.as_deref(), Some("Just this"));
+        assert_eq!(parse_html("u", "<title>Just this</title>", MAX_TEXT_CHARS).title.as_deref(), Some("Just this"));
     }
 
     #[test]
     fn parse_html_survives_broken_markup_and_multibyte_text() {
-        let preview = parse_html("u", "<title>Ünïcödé</title><p>café <b unclosed");
+        let preview = parse_html("u", "<title>Ünïcödé</title><p>café <b unclosed", MAX_TEXT_CHARS);
         assert_eq!(preview.title.as_deref(), Some("Ünïcödé"));
         assert_eq!(preview.text.as_deref(), Some("café"));
     }

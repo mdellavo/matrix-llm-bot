@@ -3,7 +3,7 @@
 Notable changes to matrix-llm-bot, built from the git history. Each version covers
 one day of commits, newest first.
 
-## 0.14.0 - 2026-11-03
+## 0.14.0 - 2026-11-04
 
 ### Added
 
@@ -11,6 +11,7 @@ one day of commits, newest first.
 
 ### Changed
 
+- Chat replies read pages with their own `read_page` tool, which uses the bot's fetcher and browser user agent, instead of Claude's web fetch, which Reddit blocks. Web fetch is kept for PDFs
 - Linked pages are fetched with a desktop browser user agent, so sites like Reddit return their real page instead of an empty one
 
 ## 0.13.0 - 2026-11-02

@@ -23,7 +23,7 @@ To test Claude calls without the API, use the fake Messages server in `src/llm.r
 |---|---|
 | `src/handler.rs` | Message flow: addressing, commands, replies, and the chat prompts |
 | `src/llm.rs` | Every plain completion, plus tool loops, pauses, and refusals |
-| `src/bot_docs.rs` | Reading the README and changelog to answer help questions |
+| `src/bot_docs.rs` | The chat reply's local tools: the README and changelog for help questions, and `read_page` |
 | `src/classify.rs` | Intent and sentiment classification |
 | `src/links.rs` | Fetching linked pages, limited to public addresses |
 | `src/db.rs` | The SQLite database and its schema migrations |
