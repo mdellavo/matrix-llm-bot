@@ -26,6 +26,7 @@ const KNOWN_TOOLS: &[&str] =
     "urban_dictionary",
     "imdb_lookup",
     "leafly_strain",
+    "rotten_tomatoes",
     "web_search",
 ];
 const RESERVED_NAME: &str = "help";
@@ -445,7 +446,7 @@ fn resolve_args(
 /// command arguments, and any context its declared `tools` ask for (recent room
 /// history for `message_log`, room name/topic for `room_info`, the current UTC time
 /// for `current_time`, or a live lookup for `random_choice`/`urban_dictionary`/
-/// `imdb_lookup`/`leafly_strain`) — and returns the generated reply.
+/// `imdb_lookup`/`leafly_strain`/`rotten_tomatoes`) — and returns the generated reply.
 ///
 /// Never propagates an error up into the message-send path — on any failure this
 /// logs a `tracing::warn!` and returns a friendly fallback string instead, matching
@@ -601,6 +602,20 @@ pub async fn execute(
                 warn!(?err, room_id, skill = %skill.name, "leafly lookup failed");
                 user_turn.push_str(
                     "(Leafly lookup failed due to a technical error — apologize and don't invent details.)\n\n",
+                );
+            }
+        }
+    }
+
+    if skill.tools.iter().any(|tool| tool == "rotten_tomatoes")
+        && let Some(title) = resolved_args.get("title").and_then(|value| value.as_str())
+    {
+        match crate::rotten_tomatoes::lookup(tool_clients.http(), title).await {
+            Ok(context) => user_turn.push_str(&context),
+            Err(err) => {
+                warn!(?err, room_id, skill = %skill.name, "rotten tomatoes lookup failed");
+                user_turn.push_str(
+                    "(The Rotten Tomatoes lookup failed due to a technical error. Apologize, and don't invent scores.)\n\n",
                 );
             }
         }
@@ -1033,7 +1048,11 @@ Say a friendly hello to the user.\n";
         let strain = registry.get("strain").expect("strain skill should be present");
         assert!(strain.tools.iter().any(|tool| tool == "leafly_strain"));
 
-        assert_eq!(registry.list().len(), 12, "expected all twelve shipped skills to load");
+        let rt = registry.get("rt").expect("rt skill should be present");
+        assert!(rt.tools.iter().any(|tool| tool == "rotten_tomatoes"));
+        assert!(registry.get("tomatoes").is_some(), "rt's `tomatoes` alias should resolve");
+
+        assert_eq!(registry.list().len(), 13, "expected all thirteen shipped skills to load");
     }
 
     fn spec(name: &str, kind: ArgType) -> ArgSpec {

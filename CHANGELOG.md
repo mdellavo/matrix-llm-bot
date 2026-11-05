@@ -8,6 +8,7 @@ one day of commits, newest first.
 ### Added
 
 - `!pp`, carried over from the old bot: an animated GIF of a randomly sized pp, drawn by the bot and posted as an image
+- `!rt <title> [year]`: a movie's or show's Rotten Tomatoes scores and critics consensus. When titles share a name, the most-reviewed one is chosen, and a year picks another
 
 ### Changed
 

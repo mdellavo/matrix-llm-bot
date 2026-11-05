@@ -15,6 +15,7 @@ mod llm;
 mod message_log;
 mod pp;
 mod room_memory;
+mod rotten_tomatoes;
 mod room_queue;
 mod skills;
 mod stats;

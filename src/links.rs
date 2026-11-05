@@ -434,7 +434,7 @@ fn meta_content(html: &str, lower: &str, key: &str) -> Option<String> {
     None
 }
 
-fn attribute<'a>(tag: &'a str, tag_lower: &str, name: &str) -> Option<&'a str> {
+pub(crate) fn attribute<'a>(tag: &'a str, tag_lower: &str, name: &str) -> Option<&'a str> {
     let needle = format!("{name}=");
     let mut position = 0;
     while let Some(found) = tag_lower[position..].find(&needle) {
@@ -493,7 +493,7 @@ fn visible_text(html: &str, lower: &str) -> String {
     text
 }
 
-fn decode_entities(text: &str) -> String {
+pub(crate) fn decode_entities(text: &str) -> String {
     let mut decoded = String::with_capacity(text.len());
     let mut rest = text;
 
@@ -537,7 +537,7 @@ fn decode_entity(entity: &str) -> Option<char> {
     }
 }
 
-fn collapse_whitespace(text: &str) -> String {
+pub(crate) fn collapse_whitespace(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 

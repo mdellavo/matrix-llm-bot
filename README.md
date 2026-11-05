@@ -205,12 +205,13 @@ Frontmatter fields:
   - `current_time` — the current UTC time.
   - `random_choice` — a true random pick (real Rust randomness, not an LLM guess).
   - `urban_dictionary` / `imdb_lookup` / `leafly_strain` — outbound HTTP calls to Urban Dictionary, OMDb, and Leafly, respectively (see `src/tools.rs`).
+  - `rotten_tomatoes` — a title's Tomatometer, Popcornmeter, and critics consensus, read from Rotten Tomatoes' own search and title pages, since it has no public API (see `src/rotten_tomatoes.rs`).
   - `web_search` — lets Claude search the web, up to twice per run.
 - `args` (optional) — declares expected arguments (name, type, required/default/bounds). Types are `string`, `integer`, `number`, `boolean`, and `array`. Arguments are validated before Claude is ever called.
 
 A `!command`'s args are parsed from the text after its name, without a model: they fill the skill's declared `args` in order, with the last one taking the rest of the line. Lists split on commas or " or ", or on spaces if there are neither.
 
-Twelve skills ship as worked examples under `skills/`. There are three built-ins too:
+Thirteen skills ship as worked examples under `skills/`. There are three built-ins too:
 
 - `!help` lists commands, or answers `!help <question>` (see [Help](#help)).
 - `!memories` lists saved facts.
@@ -233,6 +234,7 @@ An unknown command gets a reply pointing to `!help`.
 | `ud` | `urban` | `urban_dictionary` | an optional arg with no default, so omitting it falls through to Urban Dictionary's own random-word behavior |
 | `imdb` | — | `imdb_lookup` | a third-party API call requiring a configured key |
 | `strain` | — | `leafly_strain` | an API call plus real disambiguation logic |
+| `rt` | `tomatoes`, `rottentomatoes` | `rotten_tomatoes` | reading a site with no API, and a trailing year to pick between titles of the same name |
 
 `random`, `ud`, `imdb`, and `strain` are ported from *gordy*, a separate Matrix bot referenced read-only during development; `imdb` was re-pointed from gordy's scraping approach to the documented OMDb API.
 
