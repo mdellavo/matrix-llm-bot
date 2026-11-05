@@ -8,6 +8,7 @@ one day of commits, newest first.
 ### Changed
 
 - Pages read for replies are scrolled to the bottom before being read, so comments and other content that load on scroll are included
+- `docker-compose.example.yaml` with the bot and the headless browser, and the browser options in the README's configuration table
 - Each page read for a reply is logged, and the headless browser's protocol warnings are quiet by default
 
 ## 0.14.0 - 2026-11-04

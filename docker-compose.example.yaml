@@ -1,0 +1,44 @@
+# Example Compose setup: the bot, plus an optional headless Chrome for rendering pages
+# built with JavaScript. See "Deployment" in the README.
+#
+# Copy this next to your other Compose files, then:
+#   - put config.toml at ./matrix-llm-bot/config.toml
+#   - put ANTHROPIC_API_KEY=... in a .env file next to this one, never in this file
+#
+# Without the browser, delete the chrome service, the bot's networks line, and the
+# networks section at the bottom, and leave browser_url unset in config.toml.
+
+services:
+  matrix-llm-bot:
+    container_name: matrix-llm-bot
+    build: https://github.com/mdellavo/matrix-llm-bot.git#main
+    restart: unless-stopped
+    environment:
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
+    volumes:
+      - ./matrix-llm-bot/config.toml:/app/config.toml:ro
+      # The database and the bot's Matrix device keys. Keep and back this up.
+      - ./matrix-llm-bot/data:/app/data
+    ports:
+      # The status page has no login, so it's only published to the host.
+      - "127.0.0.1:8081:8080"
+    # default for Matrix and Claude; browser to reach Chrome and serve its proxy.
+    networks: [default, browser]
+
+  # Set in config.toml to use it:
+  #   browser_url = "http://chrome:9222"
+  #   browser_proxy_url = "http://matrix-llm-bot:3128"
+  chrome:
+    image: chromedp/headless-shell:156.0.8078.36
+    restart: unless-stopped
+    # Only the internal network: Chrome reaches websites solely through the bot's
+    # proxy, which refuses private addresses. Never add it to another network.
+    networks: [browser]
+    shm_size: 512m
+    mem_limit: 1g
+    security_opt: [no-new-privileges:true]
+
+networks:
+  browser:
+    # No route to the internet or your LAN. This is what keeps Chrome contained.
+    internal: true

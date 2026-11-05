@@ -47,8 +47,10 @@ It joins configured rooms and any private conversation an allowed user invites i
 
 ## Deployment
 
-The bot runs as a single container built from the `Dockerfile`. This Compose service
-builds straight from GitHub, with the config and state kept on the host:
+The bot runs as a container built from the `Dockerfile`, with an optional second
+container for a headless browser. [`docker-compose.example.yaml`](docker-compose.example.yaml)
+has both. Without the browser, this Compose service is all you need. It builds straight
+from GitHub, with the config and state kept on the host:
 
 ```yaml
 services:
@@ -92,7 +94,8 @@ makes goes through a proxy inside the bot that applies the same public-address c
 any other fetch. That matters because Chrome runs whatever scripts a posted page carries,
 and without the proxy those scripts could reach your own network.
 
-Add the browser and an internal network to the Compose file:
+Add the browser and an internal network to the Compose file, as in
+[`docker-compose.example.yaml`](docker-compose.example.yaml):
 
 ```yaml
 services:
@@ -113,7 +116,8 @@ networks:
     internal: true
 ```
 
-Then set this in `config.toml`:
+Then set this in `config.toml`, and start Chrome before restarting the bot with
+`docker compose up -d chrome`:
 
 ```toml
 browser_url = "http://chrome:9222"
@@ -122,10 +126,14 @@ browser_proxy_url = "http://matrix-llm-bot:3128"
 
 `internal: true` is what keeps Chrome off the internet, so don't leave it out. The proxy
 only accepts connections from the `browser_url` host, and only tunnels `https` to public
-addresses on ports 80 and 443. Plain `http` pages aren't rendered. Pages read with
-`read_page` are scrolled to the bottom three times before being read, since sites like
-Reddit only load comments as they come into view. Previews aren't, to keep them quick. Rendering adds a few
-seconds to each linked page, and up to 2 pages render at once.
+addresses on ports 80 and 443. Plain `http` pages aren't rendered.
+
+Pages read with `read_page` are scrolled to the bottom three times before being read,
+since sites like Reddit only load comments as they come into view. Previews aren't, to
+keep them quick. Rendering adds a few seconds to each linked page, and up to 2 pages
+render at once. The bot connects to Chrome on its first render, so the two can be
+restarted separately. After Chrome restarts, the next page falls back to the plain fetch
+and the one after that reconnects.
 
 ### Updating
 
@@ -149,6 +157,10 @@ To roll back, retag the previous image as `latest` and run the `up` command agai
 docker tag matrix-llm-bot-image:previous matrix-llm-bot-image:latest
 docker compose up -d --no-deps matrix-llm-bot
 ```
+
+Chrome is a prebuilt image pinned to a version. To update it, change the tag and run
+`docker compose pull chrome && docker compose up -d chrome`. Keep `USER_AGENT` in
+`src/links.rs` on the same major version, so the user agent matches the browser sending it.
 
 An older build refuses a database with a newer schema, so if the update migrated it, restore
 a `bot.db` backup taken before the update as well. Anything logged after that backup is lost.
@@ -426,6 +438,9 @@ Optional:
 | `interjection_chance` | `0` | Chance, from 0 to 1, of considering an unprompted comment |
 | `interjection_cooldown_secs` | `1800` | Minimum time between unprompted comments in a room |
 | `fetch_links` | `true` | Fetch linked pages and images |
+| `browser_url` | none | A headless Chrome's DevTools address, like `http://chrome:9222`, for rendering pages. See [Rendering pages with a headless browser](#rendering-pages-with-a-headless-browser) |
+| `browser_proxy_url` | none | The bot's proxy as Chrome reaches it, like `http://matrix-llm-bot:3128`. Required with `browser_url` |
+| `browser_proxy_listen` | `0.0.0.0:3128` | Where the proxy listens for Chrome |
 | `message_log_dir`, `usage_state_path`, `memory_path` | under `./data` | Where older versions kept data, read once for import |
 
 `config.toml.example` has the same options with comments.
