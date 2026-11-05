@@ -3,11 +3,15 @@ use std::time::Duration;
 
 use matrix_sdk::{
     Client, RoomState,
+    attachment::{AttachmentConfig, AttachmentInfo, BaseImageInfo},
     event_handler::Ctx,
     media::{MediaFormat, MediaRequestParameters},
-    room::Room,
+    room::{
+        Room,
+        reply::{EnforceThread, Reply},
+    },
     ruma::{
-        EventId, OwnedEventId, UserId,
+        EventId, OwnedEventId, UInt, UserId,
         events::{
             Mentions,
             reaction::{OriginalSyncReactionEvent, ReactionEventContent},
@@ -35,7 +39,8 @@ use crate::ignore::IgnoredUsers;
 use crate::links::{LinkFetcher, LinkPreview};
 use crate::llm::{self, CompletionRequest, ImageInput, LocalTools, MAX_IMAGE_BYTES};
 use crate::message_log::{
-    self, EditedMessage, GeneratedReply, LoggedMessage, MessageLogParams, MessageLogger, PromptRecord, short_name,
+    self, EditedMessage, GeneratedReply, LoggedMessage, MessageLogParams, MessageLogger, PromptRecord, ReplyImage,
+    short_name,
 };
 use crate::room_memory::{MemoryTools, RoomMemory};
 use crate::room_queue::{Inbox, RoomQueues};
@@ -869,8 +874,11 @@ async fn process_message(ctx: &HandlerContext, inbox: &mut Inbox<QueuedMessage>,
         .and_then(|edit| edit.previous.response_event_id.as_deref())
         .and_then(|id| EventId::parse(id).ok());
     let response_event_id = match (&response, previous_reply) {
-        (Some(response), Some(previous_reply)) => replace_reply(&room, previous_reply, &event.sender, &response.text).await,
-        (Some(response), None) => deliver(&room, reply_to, placement, &event.sender, &response.text).await,
+        // An image can't be swapped in by editing a text reply, so it's posted fresh.
+        (Some(response), Some(previous_reply)) if response.image.is_none() => {
+            replace_reply(&room, previous_reply, &event.sender, &response.text).await
+        }
+        (Some(response), _) => deliver(&room, reply_to, placement, &event.sender, response).await,
         (None, _) => {
             // "gordy: thanks" doesn't need an answer, but it shouldn't get silence.
             if addressed && command.is_none() && analysis.intent == Intent::Acknowledgement {
@@ -977,8 +985,18 @@ async fn deliver(
     event_id: &OwnedEventId,
     placement: Placement<'_>,
     sender: &UserId,
-    text: &str,
+    response: &GeneratedReply,
 ) -> Option<OwnedEventId> {
+    let text = response.text.as_str();
+    if let Some(image) = &response.image {
+        return match send_image(room, event_id, placement, image).await {
+            Ok(reply_id) => Some(reply_id),
+            Err(err) => {
+                warn!(?err, room = %room.room_id(), "failed to send image");
+                None
+            }
+        };
+    }
     if is_lone_emoji(text) {
         send_reaction(room, event_id, text.trim()).await;
         return None;
@@ -989,6 +1007,54 @@ async fn deliver(
         Err(err) => {
             warn!(?err, room = %room.room_id(), "failed to send response");
             None
+        }
+    }
+}
+
+/// Uploads an image and posts it where a text reply would go. matrix-sdk encrypts it
+/// first in an encrypted room.
+async fn send_image(room: &Room, event_id: &EventId, placement: Placement<'_>, image: &ReplyImage) -> anyhow::Result<OwnedEventId> {
+    let reply = |enforce_thread| Reply { event_id: event_id.to_owned(), enforce_thread, add_mentions: AddMentions::Yes };
+    let reply = match placement {
+        Placement::Thread(_) => Some(reply(EnforceThread::Threaded(ReplyWithinThread::Yes))),
+        Placement::Reply => Some(reply(EnforceThread::Unthreaded)),
+        Placement::Plain => None,
+    };
+    let info = AttachmentInfo::Image(BaseImageInfo {
+        width: Some(UInt::from(image.width)),
+        height: Some(UInt::from(image.height)),
+        size: UInt::try_from(image.data.len()).ok(),
+        is_animated: Some(image.animated),
+        blurhash: None,
+    });
+    let config = AttachmentConfig::new().info(info).reply(reply);
+    let response = room.send_attachment(image.filename.clone(), &image.mime, image.data.clone(), config).await?;
+    Ok(response.event_id)
+}
+
+/// `!pp`. Drawing and encoding the GIF is CPU work, so it's kept off the async threads.
+async fn pp_reply() -> GeneratedReply {
+    match tokio::task::spawn_blocking(crate::pp::random).await {
+        Ok(Ok(gif)) => GeneratedReply {
+            text: format!("[gif] {}", gif.text),
+            prompt: None,
+            label: "pp".to_string(),
+            image: Some(ReplyImage {
+                filename: "pp.gif".to_string(),
+                mime: mime::IMAGE_GIF,
+                data: gif.data,
+                width: gif.width,
+                height: gif.height,
+                animated: true,
+            }),
+        },
+        Ok(Err(err)) => {
+            warn!(?err, "failed to draw pp");
+            GeneratedReply::plain("Couldn't draw that one.", "pp")
+        }
+        Err(err) => {
+            warn!(?err, "pp drawing task failed");
+            GeneratedReply::plain("Couldn't draw that one.", "pp")
         }
     }
 }
@@ -1308,7 +1374,7 @@ async fn generate_grounded_reply(ctx: &HandlerContext, room: &Room, input: &Repl
     }
 
     debug!(label, trigger_message = input.message_text, response = %text, "generated grounded reply");
-    Some(GeneratedReply { text, prompt: Some(prompt), label: label.to_string() })
+    Some(GeneratedReply { text, prompt: Some(prompt), label: label.to_string(), image: None })
 }
 
 /// What the model reads as the user turn.
@@ -1440,6 +1506,10 @@ async fn handle_command(ctx: &HandlerContext, room: &Room, command: &ParsedComma
         return GeneratedReply::plain(help_reply(&ctx.skills), "help");
     }
 
+    if command.name.eq_ignore_ascii_case("pp") {
+        return pp_reply().await;
+    }
+
     if command.name.eq_ignore_ascii_case("memories") {
         let reply = ctx.memory.describe_facts(room.room_id().as_str()).unwrap_or_else(|| "Nothing saved yet.".to_string());
         return GeneratedReply::plain(reply, "help");
@@ -1469,7 +1539,7 @@ async fn handle_command(ctx: &HandlerContext, room: &Room, command: &ParsedComma
 /// description, plus the built-in `help` entry itself.
 fn help_reply(skills: &SkillRegistry) -> String {
     let mut reply = String::from(
-        "Available commands:\n- help: List available commands, or ask anything about the bot with \"!help <question>\".\n- memories: List what's been saved about this room.\n",
+        "Available commands:\n- help: List available commands, or ask anything about the bot with \"!help <question>\".\n- memories: List what's been saved about this room.\n- pp: A celebration of pp's, as an animated GIF.\n",
     );
     for skill in skills.list() {
         let usage = skill

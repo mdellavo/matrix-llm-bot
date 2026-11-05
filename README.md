@@ -210,7 +210,14 @@ Frontmatter fields:
 
 A `!command`'s args are parsed from the text after its name, without a model: they fill the skill's declared `args` in order, with the last one taking the rest of the line. Lists split on commas or " or ", or on spaces if there are neither.
 
-Twelve skills ship as worked examples under `skills/`, alongside the built-in `!help`, which lists commands or answers `!help <question>` (see [Help](#help)), and `!memories`, which lists saved facts. An unknown command gets a reply pointing to `!help`.
+Twelve skills ship as worked examples under `skills/`. There are three built-ins too:
+
+- `!help` lists commands, or answers `!help <question>` (see [Help](#help)).
+- `!memories` lists saved facts.
+- `!pp` posts an animated GIF of a randomly sized pp, drawn by the bot with no Claude call.
+  Its font and emoji images are credited in `assets/pp/README.md`.
+
+An unknown command gets a reply pointing to `!help`.
 
 | Skill | Aliases | Tools | Demonstrates |
 | --- | --- | --- | --- |

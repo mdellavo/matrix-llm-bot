@@ -13,6 +13,7 @@ mod legacy_import;
 mod links;
 mod llm;
 mod message_log;
+mod pp;
 mod room_memory;
 mod room_queue;
 mod skills;

@@ -638,6 +638,7 @@ pub async fn execute(
                 text: reply,
                 prompt: Some(PromptRecord { system: skill.prompt.clone(), user: user_turn }),
                 label: skill.name.clone(),
+                image: None,
             }
         }
         Err(err) => {
@@ -646,6 +647,7 @@ pub async fn execute(
                 text: "Sorry, that command failed.".to_string(),
                 prompt: Some(PromptRecord { system: skill.prompt.clone(), user: user_turn }),
                 label: skill.name.clone(),
+                image: None,
             }
         }
     }

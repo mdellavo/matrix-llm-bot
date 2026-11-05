@@ -16,6 +16,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
+# Fonts and images compiled into the binary with include_bytes!.
+COPY assets ./assets
 RUN cargo build --release
 
 FROM debian:bookworm-slim

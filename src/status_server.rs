@@ -743,6 +743,7 @@ mod tests {
             text: "hi alice!".to_string(),
             prompt: Some(PromptRecord { system: "chat system".to_string(), user: "chat user".to_string() }),
             label: "chat".to_string(),
+            image: None,
         };
         message_log
             .log(MessageLogParams {

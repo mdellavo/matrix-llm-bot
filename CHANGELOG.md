@@ -5,6 +5,10 @@ one day of commits, newest first.
 
 ## 0.15.0 - 2026-11-05
 
+### Added
+
+- `!pp`, carried over from the old bot: an animated GIF of a randomly sized pp, drawn by the bot and posted as an image
+
 ### Changed
 
 - Pages read for replies are scrolled to the bottom before being read, so comments and other content that load on scroll are included

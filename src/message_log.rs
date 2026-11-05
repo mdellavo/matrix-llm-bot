@@ -26,16 +26,30 @@ pub struct PromptRecord {
 /// kind of reply (`"chat"`, `"greeting"`, or a skill name) for display.
 #[derive(Debug, Clone)]
 pub struct GeneratedReply {
+    /// What the reply says, or for an image, what's logged in its place.
     pub text: String,
     pub prompt: Option<PromptRecord>,
     pub label: String,
+    /// Sent as an image instead of `text` when set.
+    pub image: Option<ReplyImage>,
+}
+
+/// An image the bot posts as its reply.
+#[derive(Debug, Clone)]
+pub struct ReplyImage {
+    pub filename: String,
+    pub mime: mime::Mime,
+    pub data: Vec<u8>,
+    pub width: u32,
+    pub height: u32,
+    pub animated: bool,
 }
 
 impl GeneratedReply {
     /// A reply with no backing Claude call — a canned/fallback string, e.g.
     /// "unknown command" or a skill's own "invalid arguments" message.
     pub fn plain(text: impl Into<String>, label: impl Into<String>) -> Self {
-        Self { text: text.into(), prompt: None, label: label.into() }
+        Self { text: text.into(), prompt: None, label: label.into(), image: None }
     }
 }
 
