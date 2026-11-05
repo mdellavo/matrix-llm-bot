@@ -19,6 +19,10 @@ use url::Url;
 const RENDER_TIMEOUT: Duration = Duration::from_secs(20);
 /// How long after the load event to wait for scripts to fill the page in.
 const SETTLE_TIME: Duration = Duration::from_millis(1500);
+/// Scrolls to the bottom of a page read in full, each followed by a wait. Sites like
+/// Reddit only load comments as they're scrolled into view.
+const SCROLL_PASSES: usize = 3;
+const SCROLL_WAIT: Duration = Duration::from_millis(1000);
 /// Pages rendered at once. Each is a browser tab, which costs real memory.
 const MAX_CONCURRENT_RENDERS: usize = 2;
 
@@ -55,8 +59,10 @@ impl PageBrowser {
         &self.host
     }
 
-    /// The page's HTML after its scripts have run.
-    pub async fn render(&self, url: &Url) -> Result<String> {
+    /// The page's HTML after its scripts have run. A `full` render scrolls to the bottom
+    /// a few times first, so content that loads as it's scrolled to is there too. It
+    /// takes a few seconds more, so previews don't.
+    pub async fn render(&self, url: &Url, full: bool) -> Result<String> {
         let _slot = self.slots.acquire().await?;
         let browser = self.connected().await?;
 
@@ -89,6 +95,12 @@ impl PageBrowser {
             let html = async {
                 page.goto(url.as_str()).await?;
                 tokio::time::sleep(SETTLE_TIME).await;
+                if full {
+                    for _ in 0..SCROLL_PASSES {
+                        page.evaluate("window.scrollTo(0, document.body.scrollHeight)").await?;
+                        tokio::time::sleep(SCROLL_WAIT).await;
+                    }
+                }
                 page.content().await
             }
             .await;
@@ -187,17 +199,17 @@ mod tests {
         let browser = PageBrowser::new(&browser_url, &proxy_url, crate::links::USER_AGENT).unwrap();
         tokio::spawn(crate::browser_proxy::serve(listener, browser.host().to_string()));
 
-        let html = browser.render(&Url::parse("https://example.com/").unwrap()).await.unwrap();
+        let html = browser.render(&Url::parse("https://example.com/").unwrap(), true).await.unwrap();
         assert!(html.contains("Example Domain"), "{html}");
 
         // A page can't reach the bot's own network through the browser.
-        let local = browser.render(&Url::parse("https://127.0.0.1:9/").unwrap()).await;
+        let local = browser.render(&Url::parse("https://127.0.0.1:9/").unwrap(), false).await;
         assert!(local.is_err() || !local.unwrap().contains("Example"), "loopback went through");
 
         // With the proxy gone, nothing loads: the page really did come through it.
         let closed = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap().local_addr().unwrap();
         let unproxied = PageBrowser::new(&browser_url, &format!("http://{closed}"), crate::links::USER_AGENT).unwrap();
-        let html = unproxied.render(&Url::parse("https://example.com/").unwrap()).await;
+        let html = unproxied.render(&Url::parse("https://example.com/").unwrap(), false).await;
         assert!(html.is_err() || !html.unwrap().contains("Example Domain"), "loaded without the proxy");
     }
 }

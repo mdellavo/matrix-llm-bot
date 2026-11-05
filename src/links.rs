@@ -13,7 +13,7 @@ use reqwest::Url;
 use reqwest::dns::{Addrs, Name, Resolve, Resolving};
 use reqwest::redirect::Policy;
 use serde::{Deserialize, Serialize};
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use crate::browser::PageBrowser;
 use crate::llm::{ImageInput, MAX_IMAGE_BYTES};
@@ -219,9 +219,9 @@ impl LinkFetcher {
     }
 
     /// The page's HTML from the browser, if there is one and it managed.
-    async fn render(&self, url: &Url) -> Option<String> {
+    async fn render(&self, url: &Url, full: bool) -> Option<String> {
         let browser = self.browser.as_ref()?;
-        match browser.render(url).await {
+        match browser.render(url, full).await {
             Ok(html) => Some(html),
             Err(err) => {
                 warn!(?err, host = url.host_str(), "browser couldn't render page; using the plain fetch");
@@ -292,7 +292,7 @@ impl LinkFetcher {
             return None;
         }
 
-        match self.try_fetch(&url, MAX_TEXT_CHARS).await {
+        match self.try_fetch(&url, MAX_TEXT_CHARS, false).await {
             Ok(preview) => preview,
             Err(err) => {
                 debug!(?err, %url, "failed to fetch link");
@@ -311,7 +311,8 @@ impl LinkFetcher {
         if !is_allowed_url(&url, self.allow_private) {
             return Err("Only public http and https addresses can be read.".to_string());
         }
-        match self.try_fetch(&url, READ_TEXT_CHARS).await {
+        info!(%url, "reading page for a reply");
+        match self.try_fetch(&url, READ_TEXT_CHARS, true).await {
             Ok(Some(page)) => Ok(page),
             Ok(None) => Err("The page had no readable text.".to_string()),
             Err(err) => {
@@ -321,11 +322,12 @@ impl LinkFetcher {
         }
     }
 
-    async fn try_fetch(&self, url: &Url, text_limit: usize) -> Result<Option<LinkPreview>> {
+    /// `full` is for pages read for a reply rather than previewed: see `PageBrowser::render`.
+    async fn try_fetch(&self, url: &Url, text_limit: usize, full: bool) -> Result<Option<LinkPreview>> {
         let mut response = match self.client.get(url.clone()).send().await?.error_for_status() {
             Ok(response) => response,
             // Some sites refuse anything but a browser outright, so let it try.
-            Err(err) => match self.render(url).await {
+            Err(err) => match self.render(url, full).await {
                 Some(html) => return Ok(non_empty(parse_html(url.as_str(), &html, text_limit))),
                 None => return Err(err.into()),
             },
@@ -362,7 +364,7 @@ impl LinkFetcher {
 
         // The plain fetch still comes first, for the content type and as the fallback.
         let preview = if is_html {
-            let rendered = if url.scheme() == "https" { self.render(url).await } else { None };
+            let rendered = if url.scheme() == "https" { self.render(url, full).await } else { None };
             parse_html(url.as_str(), rendered.as_deref().unwrap_or(&body), text_limit)
         } else {
             LinkPreview {

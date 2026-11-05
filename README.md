@@ -122,7 +122,9 @@ browser_proxy_url = "http://matrix-llm-bot:3128"
 
 `internal: true` is what keeps Chrome off the internet, so don't leave it out. The proxy
 only accepts connections from the `browser_url` host, and only tunnels `https` to public
-addresses on ports 80 and 443. Plain `http` pages aren't rendered. Rendering adds a few
+addresses on ports 80 and 443. Plain `http` pages aren't rendered. Pages read with
+`read_page` are scrolled to the bottom three times before being read, since sites like
+Reddit only load comments as they come into view. Previews aren't, to keep them quick. Rendering adds a few
 seconds to each linked page, and up to 2 pages render at once.
 
 ### Updating

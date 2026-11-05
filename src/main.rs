@@ -39,9 +39,11 @@ use status_server::AppState;
 /// every ~30s sync (this bot's own `sync_once`/`receive_sync_response` spans
 /// already show that timing), and `matrix_sdk_crypto::backups` warns "no backup
 /// key was found" on every attempted key backup — expected and permanent, since
-/// this bot doesn't set up server-side key backup. Explicitly set `RUST_LOG` to
-/// see either again.
-const DEFAULT_LOG_FILTER: &str = "info,matrix_sdk_base::client=warn,matrix_sdk_crypto::backups=error";
+/// this bot doesn't set up server-side key backup. `chromiumoxide::handler` warns on
+/// every DevTools event newer than the crate knows, which is most of them on a current
+/// Chrome, and those events aren't ones it uses. Explicitly set `RUST_LOG` to see any
+/// of these again.
+const DEFAULT_LOG_FILTER: &str = "info,matrix_sdk_base::client=warn,matrix_sdk_crypto::backups=error,chromiumoxide::handler=error";
 
 #[tokio::main]
 async fn main() -> Result<()> {

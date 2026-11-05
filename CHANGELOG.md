@@ -3,6 +3,13 @@
 Notable changes to matrix-llm-bot, built from the git history. Each version covers
 one day of commits, newest first.
 
+## 0.15.0 - 2026-11-05
+
+### Changed
+
+- Pages read for replies are scrolled to the bottom before being read, so comments and other content that load on scroll are included
+- Each page read for a reply is logged, and the headless browser's protocol warnings are quiet by default
+
 ## 0.14.0 - 2026-11-04
 
 ### Added
