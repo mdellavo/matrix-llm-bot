@@ -14,6 +14,7 @@ mod legacy_import;
 mod links;
 mod llm;
 mod message_log;
+mod photo_sheet;
 mod pp;
 mod room_memory;
 mod rotten_tomatoes;

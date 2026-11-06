@@ -204,7 +204,7 @@ Frontmatter fields:
   - `room_info` — the room's ID, name, and topic.
   - `current_time` — the current UTC time.
   - `random_choice` — a true random pick (real Rust randomness, not an LLM guess).
-  - `urban_dictionary` / `imdb_lookup` / `leafly_strain` — outbound HTTP calls to Urban Dictionary, OMDb, and Leafly, respectively (see `src/tools.rs`).
+  - `urban_dictionary` / `imdb_lookup` / `leafly_strain` — outbound HTTP calls to Urban Dictionary, OMDb, and Leafly, respectively (see `src/tools.rs`). `leafly_strain` also reads the strain's Leafly rating and a few of the user reviews Leafly highlights, and posts a sheet of up to six photos of the strain just before the reply: Leafly's product shot, if it has a real one, then the user photos it highlights (see `src/photo_sheet.rs`).
   - `rotten_tomatoes` — a title's Tomatometer, Popcornmeter, critics consensus, director, cast, and trailer, read from Rotten Tomatoes' own search and title pages, since it has no public API. Its poster and a sheet of cast and crew photos, with names and roles, are posted as images just before the reply (see `src/rotten_tomatoes.rs` and `src/cast_sheet.rs`).
   - `web_search` — lets Claude search the web, up to twice per run.
 - `args` (optional) — declares expected arguments (name, type, required/default/bounds). Types are `string`, `integer`, `number`, `boolean`, and `array`. Arguments are validated before Claude is ever called.

@@ -8,6 +8,8 @@ one day of commits, newest first.
 ### Changed
 
 - `!rt` also gives the rating, runtime or seasons, genres, director, cast with their characters, and a trailer link, and posts the poster and a sheet of cast and crew photos with names and roles before its reply
+- `!strain` posts a grid of photos of the strain from Leafly before its reply, in place of a link to one image
+- `!strain` also gives the strain's Leafly rating and quotes from its highlighted user reviews
 
 ## 0.15.0 - 2026-11-05
 
