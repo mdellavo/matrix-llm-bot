@@ -3,6 +3,7 @@ mod bot_docs;
 mod browser;
 mod browser_proxy;
 mod cast_sheet;
+mod changelog;
 mod classify;
 mod config;
 mod db;

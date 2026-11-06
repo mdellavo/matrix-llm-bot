@@ -1,0 +1,31 @@
+#!/bin/sh
+# Refuses a commit that doesn't add to CHANGELOG.md, so every commit is described
+# there. Each version covers one day of commits, so the newest one must be dated
+# today and match the version in Cargo.toml. Turned on with:
+#
+#     git config core.hooksPath .githooks
+#
+# For a commit with nothing user-facing to describe, skip it with `git commit --no-verify`.
+
+fail() {
+    echo "pre-commit: $1" >&2
+    echo "pre-commit: see \"Docs and git\" in AGENTS.md, or skip with git commit --no-verify" >&2
+    exit 1
+}
+
+if git diff --cached --quiet -- CHANGELOG.md; then
+    fail "CHANGELOG.md isn't part of this commit. Add this commit's changes to it."
+fi
+
+today=$(date +%Y-%m-%d)
+heading=$(git show :CHANGELOG.md | grep -m 1 '^## ')
+version=$(printf '%s\n' "$heading" | sed -n 's/^## \([^ ]*\) - .*/\1/p')
+date=$(printf '%s\n' "$heading" | sed -n 's/^## [^ ]* - \(.*\)$/\1/p')
+cargo_version=$(git show :Cargo.toml | sed -n 's/^version = "\(.*\)"$/\1/p' | head -n 1)
+
+if [ "$date" != "$today" ]; then
+    fail "the newest CHANGELOG.md version is dated ${date:-(none)}. Start a version for today, $today."
+fi
+if [ "$version" != "$cargo_version" ]; then
+    fail "the newest CHANGELOG.md version is ${version:-(none)}, but Cargo.toml says $cargo_version. Make them match."
+fi

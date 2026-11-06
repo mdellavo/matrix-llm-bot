@@ -36,6 +36,7 @@ To test Claude calls without the API, use the fake Messages server in `src/llm.r
 | `src/skills.rs`, `skills/*/SKILL.md` | Command loading, arguments, and prompts |
 | `src/tools.rs`, `src/rotten_tomatoes.rs` | The skills' outside lookups: Urban Dictionary, OMDb, Leafly, and Rotten Tomatoes |
 | `src/cast_sheet.rs`, `src/photo_sheet.rs` | The `!rt` sheet of cast and crew photos, and the `!strain` photo grid |
+| `src/changelog.rs` | `!changelog`, from the `CHANGELOG.md` compiled into the build |
 | `src/pp.rs`, `assets/pp/` | The `!pp` GIF and the font and emoji it's drawn with, which the cast sheet also uses |
 | `src/stats.rs`, `src/status_server.rs` | Status page and the activity counts behind it |
 | `src/usage.rs` | Token counts, prices, and the cost limit |
@@ -108,7 +109,12 @@ To test Claude calls without the API, use the fake Messages server in `src/llm.r
 
 - Update `README.md` and `config.toml.example` when behavior or options change.
 - Add user-facing changes to `CHANGELOG.md`. Each version covers one day of commits,
-  and the newest version must match `version` in `Cargo.toml`.
+  and the newest version must match `version` in `Cargo.toml`. `!changelog` posts it
+  in chat, so write entries for the people using the bot.
+- Every commit adds to `CHANGELOG.md`. The pre-commit hook in `.githooks/` refuses one
+  that doesn't, or whose newest version isn't today's or doesn't match `Cargo.toml`.
+  Turn it on in a fresh clone with `git config core.hooksPath .githooks`. Use
+  `--no-verify` only for a commit with nothing user-facing, like a test or doc fix.
 - Move finished items out of the README roadmap.
 - Commit, push, or deploy only when asked, and work on a branch rather than directly
   on `main`.
