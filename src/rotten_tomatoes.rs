@@ -1,13 +1,18 @@
 //! The `rotten_tomatoes` skill tool: a movie's or show's Tomatometer and Popcornmeter.
 //! Rotten Tomatoes has no public API, so this reads its search page, then the chosen
-//! title's page, whose scorecard is embedded as JSON. Both are its own server-rendered
-//! pages, so no browser is needed. Only Rotten Tomatoes URLs are ever fetched: the
-//! title page's address comes from the search page, and is checked before it's used.
+//! title's page, whose scores and credits are embedded as JSON. Both are its own
+//! server-rendered pages, so no browser is needed. Only Rotten Tomatoes pages and its
+//! image server are ever fetched: the title page's and poster's addresses come from
+//! the pages, and are checked before they're used.
 
-use anyhow::{Context, Result};
+use std::io::Cursor;
+
+use anyhow::{Context, Result, bail};
+use image::codecs::jpeg::JpegEncoder;
 use tracing::warn;
 
 use crate::links::{attribute, collapse_whitespace, decode_entities};
+use crate::message_log::ReplyImage;
 
 const SITE: &str = "https://www.rottentomatoes.com";
 /// Other matches listed after the chosen one, so the reply can point out a remake or a
@@ -15,6 +20,18 @@ const SITE: &str = "https://www.rottentomatoes.com";
 const MAX_OTHER_MATCHES: usize = 4;
 /// Title pages read to choose between titles with the same name.
 const MAX_COMPARED: usize = 3;
+/// People listed from the cast and crew, and producers from the credits.
+const MAX_CAST: usize = 8;
+const MAX_PRODUCERS: usize = 4;
+/// Posters are served as large as 2000x3000, far more than a chat needs.
+const POSTER_MAX_WIDTH: u32 = 400;
+const POSTER_MAX_HEIGHT: u32 = 600;
+const POSTER_MAX_BYTES: usize = 8 * 1024 * 1024;
+const POSTER_QUALITY: u8 = 85;
+/// People on the cast sheet, which is two rows of three.
+const MAX_PEOPLE: usize = 6;
+/// Headshots are served at 100x120, a few kilobytes each.
+const PHOTO_MAX_BYTES: usize = 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Kind {
@@ -44,13 +61,43 @@ struct SearchResult {
 }
 
 #[derive(Debug, Default, PartialEq)]
-struct Scorecard {
+struct TitlePage {
     critic_reviews: Option<u64>,
     critics: Option<String>,
     top_critics: Option<String>,
     audience: Option<String>,
     consensus: Option<String>,
     description: Option<String>,
+    /// Like `PG-13`, `In Theaters Nov 13`, and `2h 46m`, or a show's seasons.
+    facts: Vec<String>,
+    genres: Vec<String>,
+    directors: Vec<String>,
+    producers: Vec<String>,
+    /// `Name as Role`, from the page's cast and crew section.
+    cast: Vec<String>,
+    /// The cast and crew section's people, with their photos.
+    people: Vec<CastMember>,
+    /// The trailer's name, length, and Rotten Tomatoes page.
+    trailer: Option<String>,
+    poster: Option<String>,
+}
+
+/// What a lookup found: the context for the skill's prompt, and the poster's address
+/// if there's one to post.
+pub struct Lookup {
+    pub context: String,
+    pub poster: Option<String>,
+    pub people: Vec<CastMember>,
+}
+
+/// Someone from a title page's cast and crew section.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CastMember {
+    pub name: String,
+    /// The character they play, or their job.
+    pub role: Option<String>,
+    /// Their headshot's address, already checked to be on the image server.
+    pub photo: Option<String>,
 }
 
 /// What a search found for a query.
@@ -65,7 +112,7 @@ struct Matches {
 
 /// Looks `query` up and returns the context for the skill's prompt. A trailing year,
 /// like `dune 1984` or `dune (1984)`, picks between titles of the same name.
-pub async fn lookup(http: &reqwest::Client, query: &str) -> Result<String> {
+pub async fn lookup(http: &reqwest::Client, query: &str) -> Result<Lookup> {
     let query = query.trim();
     let mut found = None;
     if let Some((title, year)) = split_year(query) {
@@ -86,7 +133,11 @@ pub async fn lookup(http: &reqwest::Client, query: &str) -> Result<String> {
         }
     };
     if matched.candidates.is_empty() {
-        return Ok(format!("No Rotten Tomatoes match was found for \"{query}\".\n\n"));
+        return Ok(Lookup {
+            context: format!("No Rotten Tomatoes match was found for \"{query}\".\n\n"),
+            poster: None,
+            people: Vec::new(),
+        });
     }
 
     // Several titles share the name, like a show and its remakes. The one with the most
@@ -97,7 +148,7 @@ pub async fn lookup(http: &reqwest::Client, query: &str) -> Result<String> {
         .into_iter()
         .zip(pages)
         .map(|(index, page)| match page {
-            Ok(html) => (index, Some(scorecard(&html))),
+            Ok(html) => (index, Some(parse_title_page(&html))),
             Err(err) => {
                 warn!(?err, url = %results[index].url, "failed to read a Rotten Tomatoes title page");
                 (index, None)
@@ -109,7 +160,81 @@ pub async fn lookup(http: &reqwest::Client, query: &str) -> Result<String> {
         .map(|(_, chosen)| chosen)
         .expect("candidates isn't empty");
 
-    Ok(format_context(query, &results, chosen, matched.exact, scorecard.as_ref()))
+    let poster = scorecard.as_ref().and_then(|page| page.poster.clone());
+    let people = scorecard.as_ref().map(|page| page.people.clone()).unwrap_or_default();
+    Ok(Lookup { context: format_context(query, &results, chosen, matched.exact, scorecard.as_ref()), poster, people })
+}
+
+/// The images posted with a lookup's reply: its poster, then a sheet of its cast and
+/// crew photos. Either is left out if it can't be made.
+pub async fn pictures(http: &reqwest::Client, found: &Lookup) -> Vec<ReplyImage> {
+    let mut pictures = Vec::new();
+    if let Some(url) = &found.poster {
+        match poster(http, url).await {
+            Ok(poster) => pictures.push(poster),
+            Err(err) => warn!(?err, "failed to fetch a poster"),
+        }
+    }
+    if found.people.iter().any(|person| person.photo.is_some()) {
+        match cast_sheet(http, &found.people).await {
+            Ok(sheet) => pictures.push(sheet),
+            Err(err) => warn!(?err, "failed to make a cast sheet"),
+        }
+    }
+    pictures
+}
+
+async fn cast_sheet(http: &reqwest::Client, people: &[CastMember]) -> Result<ReplyImage> {
+    let photos = futures_util::future::join_all(people.iter().map(|person| async move {
+        let url = person.photo.as_deref()?;
+        fetch_image(http, url, PHOTO_MAX_BYTES).await.inspect_err(|err| warn!(?err, %url, "failed to fetch a cast photo")).ok()
+    }))
+    .await;
+    let people: Vec<crate::cast_sheet::Person> = people
+        .iter()
+        .zip(photos)
+        .map(|(person, photo)| crate::cast_sheet::Person { name: person.name.clone(), role: person.role.clone(), photo })
+        .collect();
+    // Drawing and encoding are CPU work, so they're kept off the async threads.
+    tokio::task::spawn_blocking(move || crate::cast_sheet::render(&people)).await.context("cast sheet task failed")?
+}
+
+/// An image from Rotten Tomatoes' image server, refused if it's larger than `max_bytes`.
+async fn fetch_image(http: &reqwest::Client, url: &str, max_bytes: usize) -> Result<Vec<u8>> {
+    if !is_poster_url(url) {
+        bail!("not a Rotten Tomatoes image address");
+    }
+    let response = http.get(url).send().await.context("image request failed")?.error_for_status().context("image request returned an error status")?;
+    if response.content_length().is_some_and(|length| length > max_bytes as u64) {
+        bail!("image is too large");
+    }
+    let data = response.bytes().await.context("failed to read the image")?;
+    if data.len() > max_bytes {
+        bail!("image is too large");
+    }
+    Ok(data.to_vec())
+}
+
+/// Downloads a poster and shrinks it to chat size.
+async fn poster(http: &reqwest::Client, url: &str) -> Result<ReplyImage> {
+    let data = fetch_image(http, url, POSTER_MAX_BYTES).await?;
+    // Decoding and encoding are CPU work, so they're kept off the async threads.
+    tokio::task::spawn_blocking(move || shrink_poster(&data)).await.context("poster task failed")?
+}
+
+fn shrink_poster(data: &[u8]) -> Result<ReplyImage> {
+    let image = image::load_from_memory(data).context("the poster isn't an image")?;
+    let image = image.thumbnail(POSTER_MAX_WIDTH, POSTER_MAX_HEIGHT).to_rgb8();
+    let mut jpeg = Vec::new();
+    JpegEncoder::new_with_quality(Cursor::new(&mut jpeg), POSTER_QUALITY).encode_image(&image).context("failed to encode the poster")?;
+    Ok(ReplyImage {
+        filename: "poster.jpg".to_string(),
+        mime: mime::IMAGE_JPEG,
+        data: jpeg,
+        width: image.width(),
+        height: image.height(),
+        animated: false,
+    })
 }
 
 async fn search(http: &reqwest::Client, title: &str) -> Result<Vec<SearchResult>> {
@@ -225,13 +350,19 @@ fn search_row(html: &str, lower: &str, start: usize, end: usize, kind: Kind) -> 
     })
 }
 
-/// A movie or show page on Rotten Tomatoes, the only kind of address this fetches.
+/// A movie or show page on Rotten Tomatoes, the only kind of page this fetches.
 fn is_title_url(href: &str) -> bool {
-    let Ok(url) = url::Url::parse(href) else { return false };
-    url.scheme() == "https"
-        && url.host_str() == Some("www.rottentomatoes.com")
-        && url.port().is_none()
-        && (url.path().starts_with("/m/") || url.path().starts_with("/tv/"))
+    is_https_on(href, "www.rottentomatoes.com").is_some_and(|url| url.path().starts_with("/m/") || url.path().starts_with("/tv/"))
+}
+
+/// An image on Rotten Tomatoes' image server, the only images this fetches.
+fn is_poster_url(href: &str) -> bool {
+    is_https_on(href, "resizing.flixster.com").is_some()
+}
+
+fn is_https_on(href: &str, host: &str) -> Option<url::Url> {
+    let url = url::Url::parse(href).ok()?;
+    (url.scheme() == "https" && url.host_str() == Some(host) && url.port().is_none()).then_some(url)
 }
 
 /// Every result with exactly the query's title. Failing that, the search page's top
@@ -261,8 +392,8 @@ fn normalize(title: &str) -> String {
         .join(" ")
 }
 
-/// The scores and critics consensus from a title page.
-fn scorecard(html: &str) -> Scorecard {
+/// The scores, consensus, and credits from a title page.
+fn parse_title_page(html: &str) -> TitlePage {
     let lower = html.to_ascii_lowercase();
     let json = script_json(html, &lower, "id=\"media-scorecard-json\"");
     let field = |value: &serde_json::Value, key: &str| value[key].as_str().map(str::trim).filter(|text| !text.is_empty()).map(String::from);
@@ -298,14 +429,107 @@ fn scorecard(html: &str) -> Scorecard {
         Some(format!("{percent}{ratings}{verdict}"))
     });
 
-    Scorecard {
+    // The page's schema.org description, which carries the credits, poster, and trailer.
+    let schema = script_json(html, &lower, "type=\"application/ld+json\"").unwrap_or_default();
+    let hero = script_json(html, &lower, "id=\"media-hero-json\"").unwrap_or_default();
+    let strings = |value: &serde_json::Value| -> Vec<String> {
+        value.as_array().into_iter().flatten().filter_map(|item| item.as_str()).map(str::trim).filter(|text| !text.is_empty()).map(String::from).collect()
+    };
+    let names = |value: &serde_json::Value| -> Vec<String> {
+        let people = match value {
+            serde_json::Value::Array(people) => people.as_slice(),
+            person => std::slice::from_ref(person),
+        };
+        people.iter().filter_map(|person| field(person, "name")).collect()
+    };
+
+    let directors = names(&schema["director"]);
+    let producers: Vec<String> = names(&schema["producer"]).into_iter().take(MAX_PRODUCERS).collect();
+    let people: Vec<CastMember> = cast_and_crew(html, &lower).into_iter().take(MAX_PEOPLE).collect();
+    let mut cast: Vec<String> = people
+        .iter()
+        // Directors are listed on their own line.
+        .filter(|person| !directors.contains(&person.name))
+        .map(|person| match &person.role {
+            Some(role) => format!("{} as {role}", person.name),
+            None => person.name.clone(),
+        })
+        .take(MAX_CAST)
+        .collect();
+    if cast.is_empty() {
+        cast = names(&schema["actor"]).into_iter().take(MAX_CAST).collect();
+    }
+    let trailer = field(&schema["video"], "contentUrl").filter(|url| is_https_on(url, "www.rottentomatoes.com").is_some()).map(|url| {
+        let name = field(&schema["video"], "name").unwrap_or_else(|| "Trailer".to_string());
+        match field(&schema["video"], "duration") {
+            Some(length) => format!("{name} ({length}): {url}"),
+            None => format!("{name}: {url}"),
+        }
+    });
+    let mut genres = strings(&hero["content"]["metadataGenres"]);
+    if genres.is_empty() {
+        genres = strings(&schema["genre"]);
+    }
+
+    TitlePage {
         critic_reviews: json.as_ref().and_then(|json| json["criticsScore"]["reviewCount"].as_u64()),
         critics,
         top_critics,
         audience,
         consensus: consensus(html, &lower),
         description: json.as_ref().and_then(|json| field(json, "description")),
+        facts: strings(&hero["content"]["metadataProps"]),
+        genres,
+        directors,
+        producers,
+        cast,
+        people,
+        trailer,
+        poster: field(&schema, "image").filter(|url| is_poster_url(url)),
     }
+}
+
+/// Each person in the cast and crew section, with their character or job and their
+/// photo. Someone listed twice, like a show's creator who also directs, is listed once
+/// with both jobs.
+fn cast_and_crew(html: &str, lower: &str) -> Vec<CastMember> {
+    const ITEM: &str = "data-qa=\"person-item\"";
+    let Some(section) = lower.find("data-qa=\"section:cast-and-crew\"") else { return Vec::new() };
+    let end = lower[section..].find("</section>").map_or(lower.len(), |offset| section + offset);
+    let text_of = |marker: &str, from: usize, to: usize| -> Option<String> {
+        let found = from + lower[from..to].find(marker)?;
+        let start = found + lower[found..to].find('>')? + 1;
+        let close = start + lower[start..to].find("</p>")?;
+        Some(tidy(&html[start..close])).filter(|text| !text.is_empty())
+    };
+
+    let mut items: Vec<usize> = lower[section..end].match_indices(ITEM).map(|(offset, _)| section + offset).collect();
+    items.push(end);
+    let mut people: Vec<CastMember> = Vec::new();
+    for bounds in items.windows(2) {
+        let (from, to) = (bounds[0], bounds[1]);
+        let Some(name) = text_of("data-qa=\"person-name\"", from, to) else { continue };
+        let role = text_of("data-qa=\"person-role\"", from, to);
+        let photo = lower[from..to].find("<rt-img").and_then(|offset| {
+            let tag_start = from + offset;
+            let tag_end = tag_start + lower[tag_start..to].find('>')?;
+            attribute(&html[tag_start..tag_end], &lower[tag_start..tag_end], "src").map(decode_entities).filter(|url| is_poster_url(url))
+        });
+
+        match people.iter_mut().find(|person| person.name == name) {
+            Some(listed) => {
+                if let Some(role) = role {
+                    listed.role = Some(match listed.role.take() {
+                        Some(roles) => format!("{roles}, {role}"),
+                        None => role,
+                    });
+                }
+                listed.photo = listed.photo.take().or(photo);
+            }
+            None => people.push(CastMember { name, role, photo }),
+        }
+    }
+    people
 }
 
 /// The JSON in the `<script>` whose opening tag contains `marker`.
@@ -338,7 +562,7 @@ fn tidy(html: &str) -> String {
     collapse_whitespace(&decode_entities(&text))
 }
 
-fn format_context(query: &str, results: &[SearchResult], chosen: usize, exact: bool, scorecard: Option<&Scorecard>) -> String {
+fn format_context(query: &str, results: &[SearchResult], chosen: usize, exact: bool, scorecard: Option<&TitlePage>) -> String {
     let result = &results[chosen];
     let not_available = "(not available yet)";
     let years = result.years.as_deref().map(|years| format!("{years}, ")).unwrap_or_default();
@@ -364,6 +588,21 @@ fn format_context(query: &str, results: &[SearchResult], chosen: usize, exact: b
             }
             if let Some(description) = &card.description {
                 context.push_str(&format!("Synopsis: {description}\n"));
+            }
+            let lists = [
+                ("Details", &card.facts, " · "),
+                ("Genres", &card.genres, ", "),
+                ("Directed by", &card.directors, ", "),
+                ("Produced by", &card.producers, ", "),
+                ("Cast and crew", &card.cast, "; "),
+            ];
+            for (label, items, separator) in lists {
+                if !items.is_empty() {
+                    context.push_str(&format!("{label}: {}\n", items.join(separator)));
+                }
+            }
+            if let Some(trailer) = &card.trailer {
+                context.push_str(&format!("Trailer: {trailer}\n"));
             }
         }
         None => {
@@ -430,7 +669,30 @@ mod tests {
         </search-page-result></search-page-results>"#;
 
     /// Trimmed from the real Dune: Part Two page.
-    const TITLE_PAGE: &str = r#"<script id="media-hero-json" data-json="mediaHero" type="application/json">{"content":{}}</script>
+    const TITLE_PAGE: &str = r#"<script type="application/ld+json">{"@context":"http://schema.org","@type":"Movie",
+          "actor":[{"@type":"Person","name":"Timothée Chalamet"},{"@type":"Person","name":"Zendaya"}],
+          "contentRating":"PG-13","director":[{"@type":"Person","name":"Denis Villeneuve"}],
+          "genre":["Sci-Fi","Adventure"],
+          "image":"https://resizing.flixster.com/PgHhmCKS3hR6GUsVNlC-vZ9d90I=/ems.cHJkLWVtcy1hc3NldHMvbW92aWVz",
+          "producer":[{"name":"Joshua Grode"},{"name":"Jon Spaihts"},{"name":"Thomas Tull"},{"name":"Herb Gains"},{"name":"Brian Herbert"}],
+          "video":{"@type":"VideoObject","name":"Dune: Part Two: Trailer 3","duration":"2:40","contentUrl":"https://www.rottentomatoes.com/m/dune_part_two/videos/3uVjDzzml2kM"}}</script>
+        <script id="media-hero-json" data-json="mediaHero" type="application/json">{"content":{"metadataGenres":["Sci-Fi","Adventure","Action"],"metadataProps":["PG-13","In Theaters Nov 13","2h 46m"]}}</script>
+        <section aria-labelledby="cast-and-crew-label" class="cast-and-crew" data-qa="section:cast-and-crew">
+          <a href="/celebrity/denis-villeneuve" data-qa="person-item"><tile-dynamic skeleton="panel">
+            <div slot="inset-text" aria-label="Denis Villeneuve, Director">
+            <p class="name" data-qa="person-name">Denis Villeneuve</p> <p class="role" data-qa="person-role">Director</p></div></tile-dynamic></a>
+          <a href="/celebrity/timothee_chalamet" data-qa="person-item"><tile-dynamic skeleton="panel">
+            <rt-img alt="Timothée Chalamet thumbnail image" loading="lazy" slot="image"
+              src="https://resizing.flixster.com/4IBwYVIQ=/100x120/v2/https://resizing.flixster.com/x/v3/t/assets/535891_v9_bc.jpg"></rt-img>
+            <p class="name" data-qa="person-name">Timothée Chalamet</p> <p class="role" data-qa="person-role">Paul Atreides</p></tile-dynamic></a>
+          <a href="/celebrity/someone" data-qa="person-item"><rt-img src="https://evil.example/face.jpg"></rt-img>
+            <p class="name" data-qa="person-name">No Role</p></a>
+          <a href="/celebrity/denis-villeneuve" data-qa="person-item"><p class="name" data-qa="person-name">Denis Villeneuve</p>
+            <p class="role" data-qa="person-role">Screenwriter</p></a>
+          <a href="/celebrity/zendaya" data-qa="person-item"><p class="name" data-qa="person-name">Zendaya</p>
+            <p class="role" data-qa="person-role">Chani</p></a>
+        </section>
+        <p data-qa="person-name">Outside The Section</p>
         <div id="critics-consensus" class="consensus">
           <rt-text context="heading"><score-icon-critics certified="true"></score-icon-critics>Critics Consensus</rt-text>
           <p>Visually thrilling and narratively epic, <em>Dune: Part Two</em> continues Denis Villeneuve&#39;s adaptation.</p>
@@ -475,6 +737,9 @@ mod tests {
         assert!(!is_title_url("https://www.rottentomatoes.com:8443/m/x"));
         assert!(!is_title_url("https://www.rottentomatoes.com/celebrity/a"));
         assert!(!is_title_url("/m/relative"));
+        assert!(is_poster_url("https://resizing.flixster.com/abc=/ems.xyz"));
+        assert!(!is_poster_url("https://resizing.flixster.com.evil.example/abc"));
+        assert!(!is_poster_url("http://resizing.flixster.com/abc"));
     }
 
     #[test]
@@ -503,7 +768,7 @@ mod tests {
 
     #[test]
     fn reads_the_scorecard_and_consensus() {
-        let card = scorecard(TITLE_PAGE);
+        let card = parse_title_page(TITLE_PAGE);
         assert_eq!(card.critics.as_deref(), Some("92% from 466 critic reviews (Certified Fresh)"));
         assert_eq!(card.top_critics.as_deref(), Some("87% from 78 reviews"));
         assert_eq!(card.audience.as_deref(), Some("95% from 5,000+ Verified Ratings (Verified Hot)"));
@@ -515,9 +780,70 @@ mod tests {
     }
 
     #[test]
+    fn reads_the_credits_trailer_and_poster() {
+        let card = parse_title_page(TITLE_PAGE);
+        assert_eq!(card.facts, ["PG-13", "In Theaters Nov 13", "2h 46m"]);
+        assert_eq!(card.genres, ["Sci-Fi", "Adventure", "Action"]);
+        assert_eq!(card.directors, ["Denis Villeneuve"]);
+        assert_eq!(card.producers, ["Joshua Grode", "Jon Spaihts", "Thomas Tull", "Herb Gains"]);
+        // The director has their own line, and a role belongs only to the person before it.
+        assert_eq!(card.cast, ["Timothée Chalamet as Paul Atreides", "No Role", "Zendaya as Chani"]);
+        assert_eq!(
+            card.trailer.as_deref(),
+            Some("Dune: Part Two: Trailer 3 (2:40): https://www.rottentomatoes.com/m/dune_part_two/videos/3uVjDzzml2kM")
+        );
+        assert!(card.poster.as_deref().is_some_and(|url| url.starts_with("https://resizing.flixster.com/")));
+
+        // Everyone, crew included, for the photo sheet: someone listed twice is listed
+        // once with both jobs, and only the image server's photos are kept.
+        let people: Vec<(&str, Option<&str>, bool)> =
+            card.people.iter().map(|person| (person.name.as_str(), person.role.as_deref(), person.photo.is_some())).collect();
+        assert_eq!(
+            people,
+            [
+                ("Denis Villeneuve", Some("Director, Screenwriter"), false),
+                ("Timothée Chalamet", Some("Paul Atreides"), true),
+                ("No Role", None, false),
+                ("Zendaya", Some("Chani"), false),
+            ]
+        );
+
+        let context = format_context("dune part two", &search_results(SEARCH), 0, true, Some(&card));
+        assert!(context.contains("Details: PG-13 · In Theaters Nov 13 · 2h 46m\n"), "{context}");
+        assert!(context.contains("Directed by: Denis Villeneuve\n"), "{context}");
+        assert!(context.contains("Cast and crew: Timothée Chalamet as Paul Atreides; No Role; Zendaya as Chani\n"), "{context}");
+        assert!(context.contains("Trailer: Dune: Part Two: Trailer 3 (2:40): https://"), "{context}");
+    }
+
+    #[test]
+    fn falls_back_to_the_schema_for_cast_and_genres() {
+        let page = r#"<script type="application/ld+json">{"actor":{"name":"Solo Actor"},"genre":["Drama"],
+            "image":"https://evil.example/poster.jpg","video":{"contentUrl":"https://evil.example/trailer"}}</script>"#;
+        let card = parse_title_page(page);
+        assert_eq!(card.cast, ["Solo Actor"]);
+        assert_eq!(card.genres, ["Drama"]);
+        assert_eq!(card.poster, None);
+        assert_eq!(card.trailer, None);
+    }
+
+    #[test]
+    fn shrinks_a_poster_to_chat_size() {
+        let mut jpeg = Vec::new();
+        let big = image::RgbImage::from_pixel(1296, 1920, image::Rgb([200, 30, 30]));
+        JpegEncoder::new(Cursor::new(&mut jpeg)).encode_image(&big).unwrap();
+
+        let poster = shrink_poster(&jpeg).unwrap();
+        assert!(poster.width <= POSTER_MAX_WIDTH && poster.height <= POSTER_MAX_HEIGHT);
+        assert_eq!((poster.width, poster.height), (400, 593));
+        assert_eq!(poster.mime, mime::IMAGE_JPEG);
+        assert!(image::load_from_memory(&poster.data).is_ok());
+        assert!(shrink_poster(b"not an image").is_err());
+    }
+
+    #[test]
     fn a_page_without_scores_says_so() {
-        let card = scorecard(r#"<script id="media-scorecard-json" type="application/json">{"criticsScore":{"scorePercent":""},"audienceScore":{}}</script>"#);
-        assert_eq!(card, Scorecard::default());
+        let card = parse_title_page(r#"<script id="media-scorecard-json" type="application/json">{"criticsScore":{"scorePercent":""},"audienceScore":{}}</script>"#);
+        assert_eq!(card, TitlePage::default());
 
         let results = search_results(SEARCH);
         let context = format_context("wojtek", &results, 2, false, Some(&card));
@@ -540,9 +866,17 @@ mod tests {
     #[tokio::test]
     #[ignore]
     async fn looks_up_a_live_title() {
-        let context = lookup(&reqwest::Client::new(), "dune part two").await.unwrap();
+        let http = reqwest::Client::new();
+        let found = lookup(&http, "dune part two").await.unwrap();
+        let context = found.context.clone();
         assert!(context.contains("https://www.rottentomatoes.com/m/dune_part_two"), "{context}");
         assert!(context.contains("Tomatometer: 9"), "{context}");
         assert!(context.contains("Critics consensus:"), "{context}");
+        assert!(context.contains("Cast and crew: Timothée Chalamet as Paul Atreides"), "{context}");
+        assert!(context.contains("Trailer: "), "{context}");
+        let pictures = pictures(&http, &found).await;
+        let names: Vec<&str> = pictures.iter().map(|picture| picture.filename.as_str()).collect();
+        assert_eq!(names, ["poster.jpg", "cast.jpg"]);
+        assert!(pictures[0].width <= POSTER_MAX_WIDTH && pictures[0].height <= POSTER_MAX_HEIGHT && pictures[0].data.len() > 1000);
     }
 }

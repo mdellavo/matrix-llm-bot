@@ -482,6 +482,8 @@ pub async fn execute(
 
     let room_id = room.room_id().as_str();
     let mut user_turn = String::new();
+    // Images posted with the reply, like a movie's poster.
+    let mut illustrations = Vec::new();
 
     if skill.tools.iter().any(|tool| tool == "message_log") {
         let count = resolved_args
@@ -611,7 +613,13 @@ pub async fn execute(
         && let Some(title) = resolved_args.get("title").and_then(|value| value.as_str())
     {
         match crate::rotten_tomatoes::lookup(tool_clients.http(), title).await {
-            Ok(context) => user_turn.push_str(&context),
+            Ok(found) => {
+                user_turn.push_str(&found.context);
+                illustrations = crate::rotten_tomatoes::pictures(tool_clients.http(), &found).await;
+                if !illustrations.is_empty() {
+                    user_turn.push_str("(Pictures of the poster and cast are posted just above your reply, so don't link them.)\n\n");
+                }
+            }
             Err(err) => {
                 warn!(?err, room_id, skill = %skill.name, "rotten tomatoes lookup failed");
                 user_turn.push_str(
@@ -654,6 +662,7 @@ pub async fn execute(
                 prompt: Some(PromptRecord { system: skill.prompt.clone(), user: user_turn }),
                 label: skill.name.clone(),
                 image: None,
+                illustrations,
             }
         }
         Err(err) => {
@@ -663,6 +672,7 @@ pub async fn execute(
                 prompt: Some(PromptRecord { system: skill.prompt.clone(), user: user_turn }),
                 label: skill.name.clone(),
                 image: None,
+                illustrations: Vec::new(),
             }
         }
     }

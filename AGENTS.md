@@ -35,7 +35,8 @@ To test Claude calls without the API, use the fake Messages server in `src/llm.r
 | `src/room_queue.rs` | Per-room ordering and message bursts |
 | `src/skills.rs`, `skills/*/SKILL.md` | Command loading, arguments, and prompts |
 | `src/tools.rs`, `src/rotten_tomatoes.rs` | The skills' outside lookups: Urban Dictionary, OMDb, Leafly, and Rotten Tomatoes |
-| `src/pp.rs`, `assets/pp/` | The `!pp` GIF and the font and emoji it's drawn with |
+| `src/cast_sheet.rs` | The `!rt` sheet of cast and crew photos |
+| `src/pp.rs`, `assets/pp/` | The `!pp` GIF and the font and emoji it's drawn with, which the cast sheet also uses |
 | `src/stats.rs`, `src/status_server.rs` | Status page and the activity counts behind it |
 | `src/usage.rs` | Token counts, prices, and the cost limit |
 
