@@ -874,8 +874,9 @@ async fn process_message(ctx: &HandlerContext, inbox: &mut Inbox<QueuedMessage>,
         .and_then(|edit| edit.previous.response_event_id.as_deref())
         .and_then(|id| EventId::parse(id).ok());
     let response_event_id = match (&response, previous_reply) {
-        // An image can't be swapped in by editing a text reply, so it's posted fresh.
-        (Some(response), Some(previous_reply)) if response.image.is_none() => {
+        // An image can't be swapped in by editing a text reply, so it's posted fresh,
+        // and so is a reply with pictures, so the old ones aren't left beside it.
+        (Some(response), Some(previous_reply)) if response.image.is_none() && response.illustrations.is_empty() => {
             replace_reply(&room, previous_reply, &event.sender, &response.text).await
         }
         (Some(response), _) => deliver(&room, reply_to, placement, &event.sender, response).await,
@@ -1001,6 +1002,12 @@ async fn deliver(
         send_reaction(room, event_id, text.trim()).await;
         return None;
     }
+    // The text still goes out without them, since it's the actual answer.
+    for illustration in &response.illustrations {
+        if let Err(err) = send_image(room, event_id, placement, illustration).await {
+            warn!(?err, room = %room.room_id(), "failed to send a reply's image");
+        }
+    }
 
     match send_message(room, event_id, placement, sender, text).await {
         Ok(reply_id) => Some(reply_id),
@@ -1047,6 +1054,7 @@ async fn pp_reply() -> GeneratedReply {
                 height: gif.height,
                 animated: true,
             }),
+            illustrations: Vec::new(),
         },
         Ok(Err(err)) => {
             warn!(?err, "failed to draw pp");
@@ -1374,7 +1382,7 @@ async fn generate_grounded_reply(ctx: &HandlerContext, room: &Room, input: &Repl
     }
 
     debug!(label, trigger_message = input.message_text, response = %text, "generated grounded reply");
-    Some(GeneratedReply { text, prompt: Some(prompt), label: label.to_string(), image: None })
+    Some(GeneratedReply { text, prompt: Some(prompt), label: label.to_string(), image: None, illustrations: Vec::new() })
 }
 
 /// What the model reads as the user turn.

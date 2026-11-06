@@ -3,6 +3,12 @@
 Notable changes to matrix-llm-bot, built from the git history. Each version covers
 one day of commits, newest first.
 
+## 0.16.0 - 2026-11-06
+
+### Changed
+
+- `!rt` also gives the rating, runtime or seasons, genres, director, cast with their characters, and a trailer link, and posts the poster and a sheet of cast and crew photos with names and roles before its reply
+
 ## 0.15.0 - 2026-11-05
 
 ### Added

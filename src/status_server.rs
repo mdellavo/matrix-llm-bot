@@ -744,6 +744,7 @@ mod tests {
             prompt: Some(PromptRecord { system: "chat system".to_string(), user: "chat user".to_string() }),
             label: "chat".to_string(),
             image: None,
+            illustrations: Vec::new(),
         };
         message_log
             .log(MessageLogParams {

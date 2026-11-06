@@ -32,6 +32,8 @@ pub struct GeneratedReply {
     pub label: String,
     /// Sent as an image instead of `text` when set.
     pub image: Option<ReplyImage>,
+    /// Posted in order just before `text`, like a movie's poster.
+    pub illustrations: Vec<ReplyImage>,
 }
 
 /// An image the bot posts as its reply.
@@ -49,7 +51,7 @@ impl GeneratedReply {
     /// A reply with no backing Claude call — a canned/fallback string, e.g.
     /// "unknown command" or a skill's own "invalid arguments" message.
     pub fn plain(text: impl Into<String>, label: impl Into<String>) -> Self {
-        Self { text: text.into(), prompt: None, label: label.into(), image: None }
+        Self { text: text.into(), prompt: None, label: label.into(), image: None, illustrations: Vec::new() }
     }
 }
 

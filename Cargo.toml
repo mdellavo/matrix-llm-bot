@@ -1,6 +1,6 @@
 [package]
 name = "matrix-llm-bot"
-version = "0.15.0"
+version = "0.16.0"
 edition = "2024"
 
 [dependencies]
@@ -33,6 +33,6 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 url = "2"
 chromiumoxide = "0.9.1"
 futures-util = { version = "0.3", default-features = false }
-image = { version = "0.25.10", default-features = false, features = ["gif", "png"] }
+image = { version = "0.25.10", default-features = false, features = ["gif", "jpeg", "png"] }
 ab_glyph = "0.2.32"
 mime = "0.3.17"

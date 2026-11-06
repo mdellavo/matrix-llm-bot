@@ -11,7 +11,8 @@ use image::codecs::gif::{GifEncoder, Repeat};
 use image::imageops::{self, FilterType};
 use image::{Delay, Frame, Rgba, RgbaImage};
 
-const FONT: &[u8] = include_bytes!("../assets/pp/Inconsolata.ttf");
+/// Also used for the `!rt` cast sheet.
+pub(crate) const FONT: &[u8] = include_bytes!("../assets/pp/Inconsolata.ttf");
 const FIST: &[u8] = include_bytes!("../assets/pp/270a.png");
 const DROPS: &[u8] = include_bytes!("../assets/pp/1f4a6.png");
 
