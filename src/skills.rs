@@ -642,10 +642,11 @@ pub async fn execute(
     }
 
     let model = skill.model.as_deref().unwrap_or(classify::MODEL);
+    let system = skill_system_prompt(&skill.prompt, bot_name);
 
     let request = CompletionRequest {
         model,
-        system: &skill.prompt,
+        system: &system,
         user: &user_turn,
         max_tokens: SKILL_MAX_TOKENS,
         web_search_max_uses: skill.tools.iter().any(|tool| tool == "web_search").then_some(SKILL_MAX_SEARCHES),
@@ -658,14 +659,14 @@ pub async fn execute(
             debug!(
                 skill = %skill.name,
                 trigger_message = message_text,
-                system_prompt = %skill.prompt,
+                system_prompt = %system,
                 user_turn = %user_turn,
                 response = %reply,
                 "generated skill reply"
             );
             GeneratedReply {
                 text: reply,
-                prompt: Some(PromptRecord { system: skill.prompt.clone(), user: user_turn }),
+                prompt: Some(PromptRecord { system: system.clone(), user: user_turn }),
                 label: skill.name.clone(),
                 image: None,
                 illustrations,
@@ -675,13 +676,19 @@ pub async fn execute(
             warn!(?err, skill = %skill.name, "skill prompt failed");
             GeneratedReply {
                 text: "Sorry, that command failed.".to_string(),
-                prompt: Some(PromptRecord { system: skill.prompt.clone(), user: user_turn }),
+                prompt: Some(PromptRecord { system: system.clone(), user: user_turn }),
                 label: skill.name.clone(),
                 image: None,
                 illustrations: Vec::new(),
             }
         }
     }
+}
+
+/// A skill's prompt, followed by who the bot is, so a command's reply can speak for
+/// the bot as well as its chat replies do.
+fn skill_system_prompt(prompt: &str, bot_name: &str) -> String {
+    format!("{prompt}\n\n{} Your name in this room is {bot_name}.", crate::bot_docs::ABOUT_BOT)
 }
 
 /// Formats a logged message's sentiment and any tagged entities (already computed by
@@ -1106,5 +1113,13 @@ Say a friendly hello to the user.\n";
     fn parse_args_gives_the_last_argument_the_remainder() {
         let specs = [spec("count", ArgType::Integer), spec("topic", ArgType::String)];
         assert_eq!(parse_args(&specs, "5 the world cup"), serde_json::json!({"count": 5, "topic": "the world cup"}));
+    }
+
+    #[test]
+    fn skill_prompts_say_who_the_bot_is() {
+        let system = skill_system_prompt("You are replying to a Matrix chat command.", "gordy");
+        assert!(system.starts_with("You are replying to a Matrix chat command.\n\nAbout you: "), "{system}");
+        assert!(system.contains("https://github.com/mdellavo/matrix-llm-bot"), "{system}");
+        assert!(system.ends_with("Your name in this room is gordy."), "{system}");
     }
 }
