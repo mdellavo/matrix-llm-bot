@@ -22,6 +22,7 @@ mod rotten_tomatoes;
 mod room_queue;
 mod skills;
 mod stats;
+mod stats_command;
 mod status_server;
 mod throttle;
 mod tools;
