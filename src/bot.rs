@@ -118,6 +118,8 @@ impl Bot {
                 config.interjection_cooldown_secs,
             ))),
             bot_name: short_name(&config.username).to_string(),
+            database: Arc::clone(&database),
+            start_time: std::time::Instant::now(),
         }));
 
         Ok(Self { client, message_log, skills, tool_clients, usage_tracker, greeting_cooldown, ignored_users, rate_limit, direct_rooms, database })

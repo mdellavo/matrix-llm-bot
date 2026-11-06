@@ -502,6 +502,10 @@ pub struct HandlerContext {
     /// The bot's short name (`gordy`): what it's called in prompts and transcripts,
     /// and what people type to address it.
     pub bot_name: String,
+    /// For `!stats`.
+    pub database: Arc<crate::db::Database>,
+    /// When the bot started, for `!stats`.
+    pub start_time: std::time::Instant,
 }
 
 /// A message waiting its turn in its room's inbox.
@@ -1039,6 +1043,41 @@ async fn send_image(room: &Room, event_id: &EventId, placement: Placement<'_>, i
     Ok(response.event_id)
 }
 
+/// `!stats`. Counting reads the whole message table, so it's kept off the async threads.
+async fn stats_reply(ctx: &HandlerContext, room: &Room) -> GeneratedReply {
+    let database = Arc::clone(&ctx.database);
+    let room_id = room.room_id().to_string();
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    let counted = tokio::task::spawn_blocking(move || {
+        Ok::<_, anyhow::Error>((crate::stats::collect(&database, now_ms)?, crate::stats::room(&database, &room_id, now_ms)?))
+    })
+    .await;
+    match counted {
+        Ok(Ok((all, this_room))) => {
+            let usage = ctx.usage_tracker.snapshot();
+            GeneratedReply::plain(
+                crate::stats_command::reply(&crate::stats_command::StatsInput {
+                    bot_name: &ctx.bot_name,
+                    uptime: ctx.start_time.elapsed(),
+                    rate_limited: ctx.rate_limit.remaining(),
+                    all: &all,
+                    room: &this_room,
+                    usage: &usage,
+                }),
+                "stats",
+            )
+        }
+        Ok(Err(err)) => {
+            warn!(?err, "failed to count stats");
+            GeneratedReply::plain("Couldn't count the stats.", "stats")
+        }
+        Err(err) => {
+            warn!(?err, "stats task failed");
+            GeneratedReply::plain("Couldn't count the stats.", "stats")
+        }
+    }
+}
+
 /// `!pp`. Drawing and encoding the GIF is CPU work, so it's kept off the async threads.
 async fn pp_reply() -> GeneratedReply {
     match tokio::task::spawn_blocking(crate::pp::random).await {
@@ -1529,6 +1568,10 @@ async fn handle_command(ctx: &HandlerContext, room: &Room, command: &ParsedComma
         return pp_reply().await;
     }
 
+    if command.name.eq_ignore_ascii_case("stats") {
+        return stats_reply(ctx, room).await;
+    }
+
     if command.name.eq_ignore_ascii_case("changelog") {
         return GeneratedReply::plain(crate::changelog::reply(command.args), "changelog");
     }
@@ -1562,7 +1605,7 @@ async fn handle_command(ctx: &HandlerContext, room: &Room, command: &ParsedComma
 /// description, plus the built-in `help` entry itself.
 fn help_reply(skills: &SkillRegistry) -> String {
     let mut reply = String::from(
-        "Available commands:\n- help: List available commands, or ask anything about the bot with \"!help <question>\".\n- changelog [version]: What changed in the running version, or in another version or on a day.\n- memories: List what's been saved about this room.\n- pp: A celebration of pp's, as an animated GIF.\n",
+        "Available commands:\n- help: List available commands, or ask anything about the bot with \"!help <question>\".\n- stats: Activity and Claude usage, from the status page.\n- changelog [version]: What changed in the running version, or in another version or on a day.\n- memories: List what's been saved about this room.\n- pp: A celebration of pp's, as an animated GIF.\n",
     );
     for skill in skills.list() {
         let usage = skill

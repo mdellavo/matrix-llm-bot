@@ -188,6 +188,63 @@ fn people(connection: &Connection) -> rusqlite::Result<Vec<PersonActivity>> {
         .collect()
 }
 
+/// One room's activity, for `!stats` in that room.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct RoomStats {
+    pub messages: u64,
+    pub messages_24h: u64,
+    pub messages_7d: u64,
+    pub replies: u64,
+    pub people: u64,
+    pub threads: u64,
+    pub first_message_ms: Option<i64>,
+    /// Who talks most here, most first.
+    pub top_people: Vec<PersonActivity>,
+}
+
+/// Rows in `RoomStats::top_people`.
+const ROOM_TOP_PEOPLE: i64 = 5;
+
+/// Counts one room's messages. Unlike `collect`, this includes a private
+/// conversation, since it's only asked for from inside the room.
+pub fn room(database: &Database, room_id: &str, now_ms: i64) -> Result<RoomStats> {
+    database.with(|connection| {
+        let mut stats = connection.query_row(
+            "SELECT COUNT(*), COALESCE(SUM(origin_server_ts_ms >= ?2), 0), COALESCE(SUM(origin_server_ts_ms >= ?3), 0), \
+             COUNT(response), COUNT(DISTINCT sender), COUNT(DISTINCT thread_root_id), MIN(origin_server_ts_ms) \
+             FROM messages WHERE room_id = ?1",
+            params![room_id, now_ms - DAY_MS, now_ms - 7 * DAY_MS],
+            |row| {
+                let number = |index| row.get::<_, i64>(index).map(|value| value.max(0).cast_unsigned());
+                Ok(RoomStats {
+                    messages: number(0)?,
+                    messages_24h: number(1)?,
+                    messages_7d: number(2)?,
+                    replies: number(3)?,
+                    people: number(4)?,
+                    threads: number(5)?,
+                    first_message_ms: row.get(6)?,
+                    top_people: Vec::new(),
+                })
+            },
+        )?;
+        stats.top_people = connection
+            .prepare(
+                "SELECT COALESCE(MAX(sender_name), sender), COUNT(*), COUNT(response) \
+                 FROM messages WHERE room_id = ?1 GROUP BY sender ORDER BY COUNT(*) DESC, sender LIMIT ?2",
+            )?
+            .query_map(params![room_id, ROOM_TOP_PEOPLE], |row| {
+                Ok(PersonActivity {
+                    name: row.get(0)?,
+                    messages: row.get::<_, i64>(1)?.max(0).cast_unsigned(),
+                    replies: row.get::<_, i64>(2)?.max(0).cast_unsigned(),
+                })
+            })?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(stats)
+    })
+}
+
 /// Counts everything shown on the status page's stats section.
 pub fn collect(database: &Database, now_ms: i64) -> Result<BotStats> {
     database.with(|connection| {
@@ -367,5 +424,33 @@ mod tests {
 
         let json = serde_json::to_string(&stats).unwrap();
         assert!(!json.contains("secret") && !json.contains("!private"), "{json}");
+    }
+
+    #[test]
+    fn counts_one_room_including_a_private_one() {
+        let (database, logger) = setup();
+        let direct_rooms = DirectRooms::new(Arc::clone(&database), Vec::new());
+        direct_rooms.add("!private:x", "@alice:x").unwrap();
+
+        log(&logger, &Line { reply: Some("$r1"), thread_root_id: Some("$a"), ..line("!r", "$a", "@alice:x") });
+        log(&logger, &Line { age_ms: 3 * DAY_MS, ..line("!r", "$b", "@bob:x") });
+        log(&logger, &Line { age_ms: 30 * DAY_MS, ..line("!r", "$c", "@alice:x") });
+        log(&logger, &line("!other", "$d", "@carol:x"));
+        log(&logger, &line("!private:x", "$e", "@alice:x"));
+
+        let stats = room(&database, "!r", NOW).unwrap();
+        assert_eq!((stats.messages, stats.messages_24h, stats.messages_7d), (3, 1, 2));
+        assert_eq!((stats.replies, stats.people, stats.threads), (1, 2, 1));
+        assert_eq!(stats.first_message_ms, Some(NOW - 30 * DAY_MS));
+        assert_eq!(
+            stats.top_people,
+            [
+                PersonActivity { name: "@alice:x".to_string(), messages: 2, replies: 1 },
+                PersonActivity { name: "@bob:x".to_string(), messages: 1, replies: 0 },
+            ]
+        );
+
+        assert_eq!(room(&database, "!private:x", NOW).unwrap().messages, 1);
+        assert_eq!(room(&database, "!empty", NOW).unwrap(), RoomStats::default());
     }
 }

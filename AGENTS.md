@@ -38,7 +38,7 @@ To test Claude calls without the API, use the fake Messages server in `src/llm.r
 | `src/cast_sheet.rs`, `src/photo_sheet.rs` | The `!rt` sheet of cast and crew photos, and the `!strain` photo grid |
 | `src/changelog.rs` | `!changelog`, from the `CHANGELOG.md` compiled into the build |
 | `src/pp.rs`, `assets/pp/` | The `!pp` GIF and the font and emoji it's drawn with, which the cast sheet also uses |
-| `src/stats.rs`, `src/status_server.rs` | Status page and the activity counts behind it |
+| `src/stats.rs`, `src/status_server.rs`, `src/stats_command.rs` | Status page, the activity counts behind it, and `!stats` |
 | `src/usage.rs` | Token counts, prices, and the cost limit |
 
 ## Protect runtime state

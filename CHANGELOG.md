@@ -8,6 +8,7 @@ one day of commits, newest first.
 ### Added
 
 - `!changelog [version]`: what changed in the running version, or in another version or on a day
+- `!stats`: the status page's numbers in chat, with this room's activity and the bot's Claude usage and cost
 
 ### Changed
 
