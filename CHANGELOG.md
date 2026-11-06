@@ -5,6 +5,10 @@ one day of commits, newest first.
 
 ## 0.16.0 - 2026-11-06
 
+### Added
+
+- `!changelog [version]`: what changed in the running version, or in another version or on a day
+
 ### Changed
 
 - `!rt` also gives the rating, runtime or seasons, genres, director, cast with their characters, and a trailer link, and posts the poster and a sheet of cast and crew photos with names and roles before its reply

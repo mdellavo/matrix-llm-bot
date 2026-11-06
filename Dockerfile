@@ -18,6 +18,8 @@ COPY Cargo.toml Cargo.lock ./
 COPY src ./src
 # Fonts and images compiled into the binary with include_bytes!.
 COPY assets ./assets
+# Compiled in with include_str! for !changelog.
+COPY CHANGELOG.md ./
 RUN cargo build --release
 
 FROM debian:bookworm-slim

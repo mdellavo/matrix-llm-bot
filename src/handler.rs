@@ -1518,6 +1518,10 @@ async fn handle_command(ctx: &HandlerContext, room: &Room, command: &ParsedComma
         return pp_reply().await;
     }
 
+    if command.name.eq_ignore_ascii_case("changelog") {
+        return GeneratedReply::plain(crate::changelog::reply(command.args), "changelog");
+    }
+
     if command.name.eq_ignore_ascii_case("memories") {
         let reply = ctx.memory.describe_facts(room.room_id().as_str()).unwrap_or_else(|| "Nothing saved yet.".to_string());
         return GeneratedReply::plain(reply, "help");
@@ -1547,7 +1551,7 @@ async fn handle_command(ctx: &HandlerContext, room: &Room, command: &ParsedComma
 /// description, plus the built-in `help` entry itself.
 fn help_reply(skills: &SkillRegistry) -> String {
     let mut reply = String::from(
-        "Available commands:\n- help: List available commands, or ask anything about the bot with \"!help <question>\".\n- memories: List what's been saved about this room.\n- pp: A celebration of pp's, as an animated GIF.\n",
+        "Available commands:\n- help: List available commands, or ask anything about the bot with \"!help <question>\".\n- changelog [version]: What changed in the running version, or in another version or on a day.\n- memories: List what's been saved about this room.\n- pp: A celebration of pp's, as an animated GIF.\n",
     );
     for skill in skills.list() {
         let usage = skill
