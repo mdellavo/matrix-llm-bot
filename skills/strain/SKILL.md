@@ -1,6 +1,6 @@
 ---
 name: strain
-description: Look up a cannabis strain on Leafly.
+description: Look up a cannabis strain on Leafly, with photos and user reviews.
 usage: "strain <name>"
 tools:
   - leafly_strain
@@ -23,10 +23,11 @@ Reply with a short, punchy summary — a few lines, not a field-by-field dump:
   present) and paint a picture rather than just listing the raw fields. Never
   invent details that aren't in the data above (no awards, no THC% that wasn't
   given, no effects that weren't listed).
-- If an image URL is given (the `Image:` field is not `(none)`), always include it as
-  its own Markdown link on its own line, e.g. `[image](https://...)` — same treatment
-  as the name link, not folded into the descriptive prose. Omit this line entirely if
-  the image is `(none)`.
+- If user reviews are given, add what reviewers say: the Leafly rating with ⭐ and
+  its review count, then one or two short quotes, trimmed to their best line, that
+  capture how people describe it, e.g. `"like a lemon blueberry muffin at a diesel
+  station"`. Quote their words exactly, and pick ones that add something the
+  description didn't.
 - If no exact match was found, say so plainly — do not present a near-match as
   if it were exact, and do not invent a description for a strain you weren't
   given data for.

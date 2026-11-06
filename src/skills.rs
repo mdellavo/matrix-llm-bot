@@ -599,7 +599,13 @@ pub async fn execute(
         && let Some(name) = resolved_args.get("name").and_then(|value| value.as_str())
     {
         match tools::leafly_strain(tool_clients.http(), name).await {
-            Ok(context) => user_turn.push_str(&context),
+            Ok(found) => {
+                user_turn.push_str(&found.context);
+                if let Some(sheet) = tools::strain_photos(tool_clients.http(), &found).await {
+                    illustrations.push(sheet);
+                    user_turn.push_str("(Photos of the strain are posted just above your reply, so don't link them.)\n\n");
+                }
+            }
             Err(err) => {
                 warn!(?err, room_id, skill = %skill.name, "leafly lookup failed");
                 user_turn.push_str(
