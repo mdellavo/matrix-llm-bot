@@ -1192,6 +1192,8 @@ numbers. They're things people told you, so weigh them by who said it, and don't
 remember when someone asks you to or tells you something lasting about themselves, and forget when they ask you \
 to or a fact is wrong. Then just reply normally, without announcing it.
 
+{about_bot}
+
 When someone asks for help with you, like what you can do, how a feature or command works, how to set something \
 up, or what's changed, use read_bot_docs before answering, and read the changelog for anything about what's new. \
 Answer what they asked from what the docs say, in your own voice, with the exact command or setting they need. \
@@ -1226,7 +1228,9 @@ in the recent history is worth mentioning. Don't echo their greeting back flatly
 points like a greeter at a store.
 
 The user turn has recent history as `[UTC time] [name] message` lines, then the greeting. Each tag says exactly \
-who wrote that line, and lines tagged [{bot_name}] are things you said.";
+who wrote that line, and lines tagged [{bot_name}] are things you said.
+
+{about_bot}";
 
 /// System prompt for joining a conversation nobody asked the bot into.
 /// `{bot_name}` and `{room_context}` are substituted as in `CHAT_SYSTEM_PROMPT`.
@@ -1240,7 +1244,14 @@ exactly PASS and nothing else. Any other reply gets posted to the room.
 
 If you do speak, keep it to a line or two, no greeting, no explaining why you jumped in. The user turn has \
 recent history as `[UTC time] [name] message` lines and any saved facts, then the latest message. Lines tagged \
-[{bot_name}] are things you said.";
+[{bot_name}] are things you said.
+
+{about_bot}";
+
+/// Fills in a reply prompt's placeholders.
+fn system_prompt(template: &str, bot_name: &str, room_context: &str) -> String {
+    template.replace("{bot_name}", bot_name).replace("{room_context}", room_context).replace("{about_bot}", crate::bot_docs::ABOUT_BOT)
+}
 
 /// Everything `generate_grounded_reply` needs to know about the message.
 struct ReplyInput<'a> {
@@ -1289,7 +1300,7 @@ async fn generate_grounded_reply(ctx: &HandlerContext, room: &Room, input: &Repl
         return Some(GeneratedReply::plain(RATE_LIMITED_REPLY, label));
     }
 
-    let system_prompt = template.replace("{bot_name}", &ctx.bot_name).replace("{room_context}", &room_context_line(room, input.conversation, input.sender_name));
+    let system_prompt = system_prompt(template, &ctx.bot_name, &room_context_line(room, input.conversation, input.sender_name));
 
     // `on_room_message` logs the current message only after this call returns, so
     // the log never includes it.
@@ -2031,11 +2042,12 @@ mod tests {
     #[test]
     fn system_prompt_placeholders_are_substituted() {
         for template in [CHAT_SYSTEM_PROMPT, GREETING_SYSTEM_PROMPT, INTERJECTION_SYSTEM_PROMPT] {
-            let prompt = template.replace("{bot_name}", "gordy").replace("{room_context}", "This room is \"general\".");
+            let prompt = system_prompt(template, "gordy", "This room is \"general\".");
             assert!(prompt.contains("You are gordy"), "{prompt}");
             assert!(prompt.contains("This room is \"general\"."), "{prompt}");
-            assert!(!prompt.contains("{bot_name}"), "{prompt}");
-            assert!(!prompt.contains("{room_context}"), "{prompt}");
+            assert!(prompt.contains(&format!("matrix-llm-bot {}", env!("CARGO_PKG_VERSION"))), "{prompt}");
+            assert!(prompt.contains("https://github.com/mdellavo/matrix-llm-bot/blob/main/CHANGELOG.md"), "{prompt}");
+            assert!(!prompt.contains('{'), "{prompt}");
         }
     }
 }

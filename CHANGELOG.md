@@ -14,6 +14,7 @@ one day of commits, newest first.
 - `!rt` also gives the rating, runtime or seasons, genres, director, cast with their characters, and a trailer link, and posts the poster and a sheet of cast and crew photos with names and roles before its reply
 - `!strain` posts a grid of photos of the strain from Leafly before its reply, in place of a link to one image
 - `!strain` also gives the strain's Leafly rating and quotes from its highlighted user reviews
+- The bot knows which version it's running and where its code and changelog are, in chat replies and commands alike, so it can answer what it is and what's new
 
 ## 0.15.0 - 2026-11-05
 

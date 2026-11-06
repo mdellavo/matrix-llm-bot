@@ -25,6 +25,22 @@ const USER_AGENT: &str = concat!("matrix-llm-bot/", env!("CARGO_PKG_VERSION"));
 /// How long a copy is used before checking GitHub again.
 const CACHE_TTL: Duration = Duration::from_secs(60 * 60);
 
+/// What the bot is told about itself in every prompt, so it can say what it is, which
+/// version is running, and where its code and changelog are. It only changes with a
+/// new build, so it doesn't stop prompt caching.
+pub const ABOUT_BOT: &str = concat!(
+    "About you: you're a bot running matrix-llm-bot ",
+    env!("CARGO_PKG_VERSION"),
+    ", which is open source at ",
+    env!("CARGO_PKG_REPOSITORY"),
+    ". Its changelog, at ",
+    env!("CARGO_PKG_REPOSITORY"),
+    "/blob/main/CHANGELOG.md, says what changed in each version, and !changelog posts the running version's \
+     notes in chat. !help lists your commands, and !help <question> answers questions about you. When someone \
+     asks what you are, which version you're on, where your code is, or what's new, answer plainly and give \
+     the link.",
+);
+
 pub const READ_DOCS_TOOL: &str = "read_bot_docs";
 pub const READ_PAGE_TOOL: &str = "read_page";
 

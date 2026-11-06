@@ -331,6 +331,11 @@ changelog from the `main` branch on GitHub and answers from them. It decides whe
 them, using a `read_bot_docs` tool, so `!help <question>` is a normal chat reply. Plain
 `!help` still just lists commands.
 
+Every prompt, for chat replies and commands alike, also tells the bot the version it's
+running and links to this repository and its changelog, from `version` and `repository` in
+`Cargo.toml`. So it can say what it is, where its code is, and what's new without reading
+the docs first.
+
 Copies are kept in memory for an hour. If GitHub can't be reached, an expired copy is used,
 and with no copy at all the bot says it can't load the docs. Because the docs come from
 `main`, a merged change can be described before it's deployed. A question that reads the
