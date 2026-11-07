@@ -44,8 +44,8 @@ pub struct AppState {
     pub fetch_links: bool,
     /// Whether a headless browser is set up (`Config::browser_url`).
     pub browser_rendering: bool,
-    /// See `Config::notify_on_start`.
-    pub notify_on_start: Vec<String>,
+    /// See `Config::notify_users`.
+    pub notify_users: Vec<String>,
 }
 
 fn router(state: Arc<AppState>) -> Router {
@@ -83,7 +83,7 @@ struct StatusResponse {
     classifier_model: &'static str,
     fetch_links: bool,
     browser_rendering: bool,
-    notify_on_start: Vec<String>,
+    notify_users: Vec<String>,
     uptime_seconds: u64,
     /// Whether an OMDb API key is configured — the `imdb` skill needs one to work.
     omdb_configured: bool,
@@ -126,7 +126,7 @@ async fn api_status(State(state): State<Arc<AppState>>) -> Json<StatusResponse> 
         classifier_model: crate::classify::MODEL,
         fetch_links: state.fetch_links,
         browser_rendering: state.browser_rendering,
-        notify_on_start: state.notify_on_start.clone(),
+        notify_users: state.notify_users.clone(),
         uptime_seconds: state.start_time.elapsed().as_secs(),
         omdb_configured: state.tool_clients.has_omdb_key(),
         rate_limited_seconds_remaining: state.rate_limit.remaining().map(|remaining| remaining.as_secs()),
@@ -257,7 +257,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
     <dt>OMDb configured</dt><dd id="omdb-configured">…</dd>
     <dt>Link fetching</dt><dd id="fetch-links">…</dd>
     <dt>Page rendering</dt><dd id="browser-rendering">…</dd>
-    <dt>Start notices</dt><dd id="notify-on-start">…</dd>
+    <dt>Notices and alerts</dt><dd id="notify-users">…</dd>
     <dt>Claude API rate limit</dt><dd id="rate-limited">…</dd>
   </dl>
 
@@ -656,7 +656,7 @@ async function loadStatus(selectFirstRoom) {
   document.getElementById('model').textContent = data.classifier_model;
   document.getElementById('fetch-links').textContent = data.fetch_links ? 'on' : 'off';
   document.getElementById('browser-rendering').textContent = data.browser_rendering ? 'headless browser' : 'off (plain fetch only)';
-  document.getElementById('notify-on-start').textContent = data.notify_on_start.length ? data.notify_on_start.join(', ') : 'nobody';
+  document.getElementById('notify-users').textContent = data.notify_users.length ? data.notify_users.join(', ') : 'nobody';
   document.getElementById('uptime').textContent = formatUptime(data.uptime_seconds);
   document.getElementById('omdb-configured').textContent = data.omdb_configured ? 'yes' : 'no';
   document.getElementById('rate-limited').textContent = data.rate_limited_seconds_remaining == null
@@ -828,7 +828,7 @@ mod tests {
             homeserver_url: "http://example.invalid".to_string(),
             fetch_links: true,
             browser_rendering: false,
-            notify_on_start: vec!["@admin:example.org".to_string()],
+            notify_users: vec!["@admin:example.org".to_string()],
         });
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind ephemeral port");
@@ -853,7 +853,7 @@ mod tests {
         assert_eq!(status["version"], env!("CARGO_PKG_VERSION"));
         assert_eq!(status["repository"], "https://github.com/mdellavo/matrix-llm-bot");
         assert_eq!((status["fetch_links"].clone(), status["browser_rendering"].clone()), (true.into(), false.into()));
-        assert_eq!(status["notify_on_start"], serde_json::json!(["@admin:example.org"]));
+        assert_eq!(status["notify_users"], serde_json::json!(["@admin:example.org"]));
         assert_eq!(status["homeserver_url"], "http://example.invalid");
         assert_eq!(status["omdb_configured"], false, "no OMDb key was configured for this test");
         assert!(status["rate_limited_seconds_remaining"].is_null(), "not throttled in this test");

@@ -43,8 +43,10 @@ pub struct Bot {
     rate_limit: Arc<Throttle>,
     direct_rooms: Arc<DirectRooms>,
     database: Arc<Database>,
-    /// See `Config::notify_on_start`.
-    notify_on_start: Vec<OwnedUserId>,
+    /// See `Config::notify_users`.
+    notify_users: Vec<OwnedUserId>,
+    /// Alerts waiting for `run` to start delivering them.
+    alert_queue: Option<tokio::sync::mpsc::UnboundedReceiver<String>>,
 }
 
 impl Bot {
@@ -125,7 +127,12 @@ impl Bot {
         }));
 
         // Checked by `Config::validate`.
-        let notify_on_start = config.notify_on_start.iter().filter_map(|user| UserId::parse(user.as_str()).ok()).collect();
+        let notify_users: Vec<OwnedUserId> = config.notify_users.iter().filter_map(|user| UserId::parse(user.as_str()).ok()).collect();
+        let alert_queue = (!notify_users.is_empty()).then(|| {
+            let (alerts, queue) = crate::notify::Alerts::channel();
+            usage_tracker.alert_to(alerts);
+            queue
+        });
 
         Ok(Self {
             client,
@@ -138,7 +145,8 @@ impl Bot {
             rate_limit,
             direct_rooms,
             database,
-            notify_on_start,
+            notify_users,
+            alert_queue,
         })
     }
 
@@ -256,7 +264,7 @@ impl Bot {
 
     /// Runs an initial sync to catch up on state without triggering the message handler
     /// for backlog, then registers the handler and syncs forever.
-    pub async fn run(self) -> Result<()> {
+    pub async fn run(mut self) -> Result<()> {
         let response = self
             .client
             .sync_once(SyncSettings::default())
@@ -273,15 +281,29 @@ impl Bot {
         // After the first sync, so an existing private room with each user is found
         // rather than a new one made every start. In the background, so a slow
         // homeserver doesn't hold up replies.
-        if !self.notify_on_start.is_empty() {
+        if !self.notify_users.is_empty() {
             let (client, users, direct_rooms, database) =
-                (self.client.clone(), self.notify_on_start.clone(), Arc::clone(&self.direct_rooms), Arc::clone(&self.database));
-            tokio::spawn(async move { crate::startup_notice::announce(&client, &users, &direct_rooms, &database).await });
+                (self.client.clone(), self.notify_users.clone(), Arc::clone(&self.direct_rooms), Arc::clone(&self.database));
+            tokio::spawn(async move {
+                crate::startup_notice::announce(&client, &users, &direct_rooms, &database).await;
+            });
+        }
+        // Alerts raised before now wait in the queue, and go out after the start notice
+        // gets its turn at the rooms.
+        if let Some(queue) = self.alert_queue.take() {
+            let (client, users, direct_rooms) = (self.client.clone(), self.notify_users.clone(), Arc::clone(&self.direct_rooms));
+            tokio::spawn(crate::notify::deliver(queue, client, users, direct_rooms));
         }
 
         info!("starting sync loop");
         let settings = SyncSettings::default().token(response.next_batch);
-        self.client.sync(settings).await.context("sync loop failed")?;
+        // matrix-sdk retries network errors itself, so this only returns when syncing
+        // can't go on, and the bot exits for its container to restart it.
+        if let Err(err) = self.client.sync(settings).await {
+            let text = format!("The sync loop stopped, so the bot is exiting: {err}");
+            crate::notify::last_alert(&self.client, &self.notify_users, &self.direct_rooms, &text).await;
+            return Err(anyhow::Error::new(err).context("sync loop failed"));
+        }
         Ok(())
     }
 }

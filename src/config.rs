@@ -103,12 +103,13 @@ pub struct Config {
     #[serde(default)]
     pub dm_allowed_users: Vec<String>,
 
-    /// Users to message privately each time the bot starts, like
-    /// `@alice:example.org`, with what's new since their last notice. The bot reuses
-    /// the private room it shares with each, or creates one. Empty (the default) sends
-    /// nothing.
-    #[serde(default)]
-    pub notify_on_start: Vec<String>,
+    /// Users to message privately, like `@alice:example.org`: each time the bot
+    /// starts, with what's new since their last notice, and with alerts about spend,
+    /// failing Claude calls, and the sync loop stopping. The bot reuses the private
+    /// room it shares with each, or creates one. Empty (the default) sends nothing.
+    /// `notify_on_start` is its old name.
+    #[serde(default, alias = "notify_on_start")]
+    pub notify_users: Vec<String>,
 
     /// A headless Chrome's DevTools address, like `http://chrome:9222`, for rendering
     /// linked pages so their scripts run. Unset (the default) fetches pages without
@@ -201,10 +202,10 @@ impl Config {
             anyhow::ensure!(self.browser_proxy_url.is_some(), "browser_proxy_url is required with browser_url");
             anyhow::ensure!(self.fetch_links, "browser_url needs fetch_links on");
         }
-        for user in &self.notify_on_start {
+        for user in &self.notify_users {
             anyhow::ensure!(
                 matrix_sdk::ruma::UserId::parse(user.as_str()).is_ok(),
-                "notify_on_start entries must be user IDs like @user:example.org, got {user}"
+                "notify_users entries must be user IDs like @user:example.org, got {user}"
             );
         }
         for entry in &self.dm_allowed_users {
@@ -230,12 +231,14 @@ mod tests {
     }
 
     #[test]
-    fn notify_on_start_takes_user_ids() {
-        assert!(config("").unwrap().notify_on_start.is_empty());
-        assert_eq!(config("notify_on_start = [\"@procyon:p.ound.town\"]").unwrap().notify_on_start, ["@procyon:p.ound.town"]);
+    fn notify_users_takes_user_ids() {
+        assert!(config("").unwrap().notify_users.is_empty());
+        assert_eq!(config("notify_users = [\"@procyon:p.ound.town\"]").unwrap().notify_users, ["@procyon:p.ound.town"]);
+        // The name it shipped with first.
+        assert_eq!(config("notify_on_start = [\"@procyon:p.ound.town\"]").unwrap().notify_users, ["@procyon:p.ound.town"]);
         for bad in ["procyon", ":p.ound.town", "@procyon"] {
-            let err = config(&format!("notify_on_start = [\"{bad}\"]")).unwrap_err().to_string();
-            assert!(err.contains("notify_on_start entries must be user IDs"), "{bad}: {err}");
+            let err = config(&format!("notify_users = [\"{bad}\"]")).unwrap_err().to_string();
+            assert!(err.contains("notify_users entries must be user IDs"), "{bad}: {err}");
         }
     }
 }
