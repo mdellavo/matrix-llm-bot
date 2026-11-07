@@ -21,7 +21,8 @@ To test Claude calls without the API, use the fake Messages server in `src/llm.r
 
 | Path | Purpose |
 |---|---|
-| `src/handler.rs` | Message flow: addressing, commands, replies, and the chat prompts |
+| `src/main.rs`, `src/bot.rs`, `src/config.rs` | Startup, login, the sync loop, and `config.toml` |
+| `src/handler.rs` | Message flow: addressing, commands, replies, the chat prompts, and the built-in commands |
 | `src/llm.rs` | Every plain completion, plus tool loops, pauses, and refusals |
 | `src/bot_docs.rs` | The chat reply's local tools: the README and changelog for help questions, and `read_page` |
 | `src/classify.rs` | Intent and sentiment classification |
@@ -33,6 +34,7 @@ To test Claude calls without the API, use the fake Messages server in `src/llm.r
 | `src/message_log.rs` | Stored messages and reactions, transcripts, and search |
 | `src/room_memory.rs` | Saved facts and room summaries |
 | `src/room_queue.rs` | Per-room ordering and message bursts |
+| `src/greeting.rs`, `src/ignore.rs`, `src/throttle.rs` | The greeting cooldown, `ignored_users`, and the pause after a rate limit |
 | `src/skills.rs`, `skills/*/SKILL.md` | Command loading, arguments, and prompts |
 | `src/tools.rs`, `src/rotten_tomatoes.rs` | The skills' outside lookups: Urban Dictionary, OMDb, Leafly, and Rotten Tomatoes |
 | `src/cast_sheet.rs`, `src/photo_sheet.rs` | The `!rt` sheet of cast and crew photos, and the `!strain` photo grid |
@@ -97,6 +99,11 @@ To test Claude calls without the API, use the fake Messages server in `src/llm.r
   and the shipped-skill count in the `src/skills.rs` test.
 - A skill without `model:` uses the cheap classifier model. Set one if the skill needs
   judgment.
+- A command answered in code goes in `handle_command` and `BUILTIN_COMMANDS` in
+  `src/handler.rs`, which `!help` and the status page list from, and in the README's
+  list of built-ins.
+- Every prompt includes `ABOUT_BOT` from `src/bot_docs.rs`, so the bot knows its version
+  and where its code is. Keep it free of anything that changes between replies.
 
 ## Code style
 

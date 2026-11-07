@@ -36,7 +36,8 @@ pub const ABOUT_BOT: &str = concat!(
     ". Its changelog, at ",
     env!("CARGO_PKG_REPOSITORY"),
     "/blob/main/CHANGELOG.md, says what changed in each version, and !changelog posts the running version's \
-     notes in chat. !help lists your commands, and !help <question> answers questions about you. When someone \
+     notes in chat. !help lists your commands, !help <question> answers questions about you, and !stats \
+     posts your activity and Claude spend. When someone \
      asks what you are, which version you're on, where your code is, or what's new, answer plainly and give \
      the link.",
 );

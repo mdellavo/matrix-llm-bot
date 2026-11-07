@@ -1167,7 +1167,7 @@ fn history_split(total: usize, loaded: usize) -> (usize, usize) {
 const CLASSIFY_HISTORY_LIMIT: usize = 10;
 
 /// Model for chat and greeting replies.
-const CHAT_MODEL: &str = "claude-opus-5-5";
+pub const CHAT_MODEL: &str = "claude-opus-5-5";
 
 /// Covers the reply plus thinking, which counts toward this on current models and
 /// can't be turned off on `CHAT_MODEL`.
@@ -1557,6 +1557,30 @@ fn room_context_line(room: &Room, conversation: Conversation, sender_name: &str)
     format!("This room is {room_desc}.")
 }
 
+/// A command handled in code rather than by a skill.
+pub struct BuiltinCommand {
+    pub name: &'static str,
+    pub usage: Option<&'static str>,
+    pub description: &'static str,
+}
+
+/// Every built-in `handle_command` answers, for `!help` and the status page.
+pub const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
+    BuiltinCommand {
+        name: "help",
+        usage: Some("help [question]"),
+        description: "List available commands, or ask anything about the bot with \"!help <question>\".",
+    },
+    BuiltinCommand { name: "stats", usage: None, description: "Activity and Claude usage, from the status page." },
+    BuiltinCommand {
+        name: "changelog",
+        usage: Some("changelog [version]"),
+        description: "What changed in the running version, or in another version or on a day.",
+    },
+    BuiltinCommand { name: "memories", usage: None, description: "List what's been saved about this room." },
+    BuiltinCommand { name: "pp", usage: None, description: "A celebration of pp's, as an animated GIF." },
+];
+
 /// Dispatches a `!command` to a built-in or a loaded skill, or replies that it
 /// doesn't exist.
 async fn handle_command(ctx: &HandlerContext, room: &Room, command: &ParsedCommand<'_>, message_text: &str) -> GeneratedReply {
@@ -1604,9 +1628,11 @@ async fn handle_command(ctx: &HandlerContext, room: &Room, command: &ParsedComma
 /// Lists every loaded skill's name, usage (if any), aliases (if any), and
 /// description, plus the built-in `help` entry itself.
 fn help_reply(skills: &SkillRegistry) -> String {
-    let mut reply = String::from(
-        "Available commands:\n- help: List available commands, or ask anything about the bot with \"!help <question>\".\n- stats: Activity and Claude usage, from the status page.\n- changelog [version]: What changed in the running version, or in another version or on a day.\n- memories: List what's been saved about this room.\n- pp: A celebration of pp's, as an animated GIF.\n",
-    );
+    let mut reply = String::from("Available commands:\n");
+    for command in BUILTIN_COMMANDS {
+        let usage = command.usage.map(|usage| format!(" ({usage})")).unwrap_or_default();
+        reply.push_str(&format!("- {}{usage}: {}\n", command.name, command.description));
+    }
     for skill in skills.list() {
         let usage = skill
             .usage

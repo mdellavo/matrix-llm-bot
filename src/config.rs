@@ -74,8 +74,8 @@ pub struct Config {
     /// Hard cap on cumulative estimated Claude API cost in USD (see
     /// `UsageTracker`). Once accumulated cost reaches this, every Claude call
     /// site (classifier, chat/greeting replies, skills) stops making API
-    /// calls entirely, until the limit is raised or the persisted usage state
-    /// (`usage_state_path`) is reset. `None` (the default) means no limit.
+    /// calls entirely, until the limit is raised or the usage totals in the
+    /// database are reset. `None` (the default) means no limit.
     #[serde(default)]
     pub cost_limit_usd: Option<f64>,
 

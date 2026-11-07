@@ -21,7 +21,7 @@ const STRAIN_REVIEWS: usize = 4;
 const STRAIN_REVIEW_CHARS: usize = 300;
 
 /// Shared HTTP client (built once, not per call — reqwest's own guidance) and the
-/// optional OMDb API key, for the tool-calling skills (`ud`, `imdb`, `strain`).
+/// optional OMDb API key, for the tool-calling skills (`ud`, `imdb`, `strain`, `rt`).
 /// Built once in `Bot::new` and registered as event-handler context, mirroring
 /// `MessageLogger`'s `Arc`-registration pattern.
 pub struct ToolClients {

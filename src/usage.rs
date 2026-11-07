@@ -74,7 +74,7 @@ fn cache_savings_usd(model: &str, usage: &Usage) -> Option<f64> {
 }
 
 /// USD price per web search the model performs via the built-in `web_search`
-/// server-side tool (`generate_chat_reply` — see `handler.rs`), independent of
+/// server-side tool (chat replies and some skills), independent of
 /// which model made the call. Not fetched live; keep in sync with Anthropic's
 /// published pricing if it changes.
 const WEB_SEARCH_PRICE_PER_REQUEST: f64 = 0.01;
@@ -185,9 +185,9 @@ pub struct UsageSnapshot {
 
 /// Accumulates Claude API token usage (and its estimated USD cost) across every
 /// completion the bot makes — the classifier (`classify_message`, labeled
-/// `"classify"`), the chat-reply generator (`generate_chat_reply`, labeled
-/// `"chat"`), and each skill's prompt (`skills::execute`'s `run_prompt`, labeled
-/// by skill name). Anthropic bills by token, so this is the number that actually
+/// `"classify"`), chat replies, greetings, and unprompted comments
+/// (`generate_grounded_reply`, labeled `"chat"`, `"greeting"`, and `"interjection"`),
+/// and each skill's prompt (`skills::execute`, labeled by skill name). Anthropic bills by token, so this is the number that actually
 /// answers "how much is this bot costing," which nothing else in the bot tracks.
 ///
 /// Totals live in memory and are written to the database on every `record` call,

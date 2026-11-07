@@ -77,6 +77,9 @@ async fn main() -> Result<()> {
         direct_rooms: bot.direct_rooms(),
         database: bot.database(),
         homeserver_url: config.homeserver_url.clone(),
+        fetch_links: config.fetch_links,
+        browser_rendering: config.browser_url.is_some(),
+        notify_on_start: config.notify_on_start.clone(),
     });
     let http_listen_addr = config.http_listen_addr;
     tokio::spawn(async move {

@@ -49,8 +49,9 @@ rooms = ["#some-room:matrix.org"]
 
 # Optional: hard cap on cumulative estimated Claude API cost in USD. Once
 # reached, every Claude call site (classifier, chat/greeting replies, skills)
-# stops making API calls entirely until the limit is raised or the persisted
-# usage state (usage_state_path) is reset. Unset (the default) means no limit.
+# stops making API calls entirely until the limit is raised or the usage totals
+# in the database are reset. !stats and the status page show spend so far. Unset
+# (the default) means no limit.
 # cost_limit_usd = 5.00
 
 # Optional: chance (0 to 1) that the bot considers joining in on a message not
