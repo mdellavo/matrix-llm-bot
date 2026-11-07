@@ -9,7 +9,7 @@ It joins configured rooms and any private conversation an allowed user invites i
 - **Help:** ask about the bot in chat or with `!help <question>`, and it answers from this README and the changelog.
 - **Private conversations:** one-on-one and small group chats where the bot answers without being addressed.
 - **Status page:** a built-in web page with activity stats, Claude costs, and a message browser. `!stats` posts its numbers in chat.
-- **Start notices:** a private message to the people in `notify_on_start` each time the bot starts.
+- **Start notices:** a private message to the people in `notify_on_start` each time the bot starts, with what's new since their last one.
 
 ## Setup
 
@@ -151,7 +151,7 @@ docker compose logs -f matrix-llm-bot
 Replace `matrix-llm-bot-image` with the image name from `docker images`, which Compose
 derives from the project's directory name. A healthy start logs `restored saved session`
 and then `starting sync loop`, and users in `notify_on_start` get a message with the version
-that's running.
+that's running and what's new in it.
 
 To roll back, retag the previous image as `latest` and run the `up` command again:
 
@@ -451,7 +451,7 @@ Optional:
 | `omdb_api_key` | none | Enables the `imdb` skill |
 | `ignored_users` | none | Users whose messages are dropped entirely |
 | `dm_allowed_users` | the bot's homeserver | Who may start a private conversation: `@user:example.org` or `:example.org`. Setting it replaces the default |
-| `notify_on_start` | nobody | Users to message privately each time the bot starts, with the version it's running: `@user:example.org`. The bot reuses the private room it shares with each, or creates one |
+| `notify_on_start` | nobody | Users to message privately each time the bot starts, with the version it's running and the changelog lines added since their last notice: `@user:example.org`. The bot reuses the private room it shares with each, or creates one |
 | `cost_limit_usd` | none | Lifetime cap on estimated Claude spend |
 | `rate_limit_backoff_secs` | `60` | How long to pause after a rate limit |
 | `interjection_chance` | `0` | Chance, from 0 to 1, of considering an unprompted comment |
@@ -491,8 +491,8 @@ aren't counted.
 
 ## Data and security
 
-- **Database:** messages, prompts, reactions, facts, room summaries, private rooms, and usage
-  totals live in one SQLite database (`src/db.rs`). Every message is recorded, whether or
+- **Database:** messages, prompts, reactions, facts, room summaries, private rooms, usage
+  totals, and what each start notice said live in one SQLite database (`src/db.rs`). Every message is recorded, whether or
   not the bot replies, including in private conversations and encrypted rooms, and it's
   stored unencrypted. The schema migrates automatically at startup.
 - **Older data:** files from older versions (`data/messages/*.jsonl`, `memory.json`,
