@@ -8,7 +8,8 @@ It joins configured rooms and any private conversation an allowed user invites i
 - **Commands:** `!commands` run **skills**, which are prompt files modeled on Claude Code's Skills.
 - **Help:** ask about the bot in chat or with `!help <question>`, and it answers from this README and the changelog.
 - **Private conversations:** one-on-one and small group chats where the bot answers without being addressed.
-- **Status page:** a built-in web page with activity stats, Claude costs, and a message browser.
+- **Status page:** a built-in web page with activity stats, Claude costs, and a message browser. `!stats` posts its numbers in chat.
+- **Start notices:** a private message to the people in `notify_on_start` each time the bot starts.
 
 ## Setup
 
@@ -149,7 +150,8 @@ docker compose logs -f matrix-llm-bot
 
 Replace `matrix-llm-bot-image` with the image name from `docker images`, which Compose
 derives from the project's directory name. A healthy start logs `restored saved session`
-and then `starting sync loop`.
+and then `starting sync loop`, and users in `notify_on_start` get a message with the version
+that's running.
 
 To roll back, retag the previous image as `latest` and run the `up` command again:
 
@@ -468,14 +470,16 @@ The status server has **no authentication** and binds to `127.0.0.1` by default.
 `http_listen_addr` deliberately, and put it behind your own auth or reverse proxy if you do.
 The page shows:
 
-- Bot details, uptime, and whether Claude calls are rate limited.
+- Bot details: the version, with links to the changelog and source, the chat and
+  classifier models, uptime, whether Claude calls are rate limited, whether links are
+  fetched and pages rendered, and who gets start notices.
 - Activity counted from the database: message, reply, thread, image, link, and reaction
   totals, per-room and per-person tables, the last 14 days, and breakdowns of reply kinds,
   intents, sentiment, and reactions. Saved facts and database size are shown too.
 - Claude usage per reply type: tokens, requests, estimated cost, web searches, cache hit
   rate, and net saving from caching.
 - A room browser with each message's classification, reply, and the full prompts sent.
-- The loaded commands.
+- Every command: the built-ins, then the loaded skills.
 
 Private conversations appear only as a total. The same data is available as JSON from
 `/api/status`, `/api/stats`, `/api/usage`, `/api/skills`, and
@@ -538,14 +542,14 @@ Ideas for later, not commitments. See [CHANGELOG.md](CHANGELOG.md) for what's sh
 - Cheaper classification, by skipping messages that clearly don't need it or running it after the reply
 - Pruning old prompts from the database, which are most of its size
 - Full-text search with SQLite FTS5, as history grows
-- Fuller cost tracking: show spend per day and per person
+- Fuller cost tracking: spend per day and per person, on the status page and in `!stats`
 
 ### Security and admin
 
 - Login for the status page
 - Device verification instead of trusting all devices
 - Stronger limits on prompt injection from web results and room text
-- Admin commands to ignore a user, reload skills, or show spend from chat
+- Admin commands to ignore a user or reload skills from chat
 
 ### Deployment
 

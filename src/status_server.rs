@@ -40,6 +40,12 @@ pub struct AppState {
     pub direct_rooms: Arc<DirectRooms>,
     pub database: Arc<Database>,
     pub homeserver_url: String,
+    /// See `Config::fetch_links`.
+    pub fetch_links: bool,
+    /// Whether a headless browser is set up (`Config::browser_url`).
+    pub browser_rendering: bool,
+    /// See `Config::notify_on_start`.
+    pub notify_on_start: Vec<String>,
 }
 
 fn router(state: Arc<AppState>) -> Router {
@@ -71,7 +77,13 @@ pub async fn serve(addr: SocketAddr, state: Arc<AppState>) -> Result<()> {
 struct StatusResponse {
     bot_user_id: Option<String>,
     homeserver_url: String,
+    version: &'static str,
+    repository: &'static str,
+    chat_model: &'static str,
     classifier_model: &'static str,
+    fetch_links: bool,
+    browser_rendering: bool,
+    notify_on_start: Vec<String>,
     uptime_seconds: u64,
     /// Whether an OMDb API key is configured — the `imdb` skill needs one to work.
     omdb_configured: bool,
@@ -108,7 +120,13 @@ async fn api_status(State(state): State<Arc<AppState>>) -> Json<StatusResponse> 
     Json(StatusResponse {
         bot_user_id: state.client.user_id().map(|id| id.to_string()),
         homeserver_url: state.homeserver_url.clone(),
+        version: env!("CARGO_PKG_VERSION"),
+        repository: env!("CARGO_PKG_REPOSITORY"),
+        chat_model: crate::handler::CHAT_MODEL,
         classifier_model: crate::classify::MODEL,
+        fetch_links: state.fetch_links,
+        browser_rendering: state.browser_rendering,
+        notify_on_start: state.notify_on_start.clone(),
         uptime_seconds: state.start_time.elapsed().as_secs(),
         omdb_configured: state.tool_clients.has_omdb_key(),
         rate_limited_seconds_remaining: state.rate_limit.remaining().map(|remaining| remaining.as_secs()),
@@ -146,29 +164,39 @@ struct SkillSummary {
     tools: Vec<String>,
     aliases: Vec<String>,
     model: Option<String>,
+    /// Handled in code, like `!stats`, rather than by a skill file.
+    builtin: bool,
 }
 
+/// Every command: the built-ins, then the loaded skills.
 async fn api_skills(State(state): State<Arc<AppState>>) -> Json<Vec<SkillSummary>> {
-    let skills = state
-        .skills
-        .list()
-        .into_iter()
-        .map(|skill| SkillSummary {
+    let builtins = crate::handler::BUILTIN_COMMANDS.iter().map(|command| SkillSummary {
+        name: command.name.to_string(),
+        description: command.description.to_string(),
+        usage: command.usage.map(String::from),
+        tools: Vec::new(),
+        aliases: Vec::new(),
+        model: None,
+        builtin: true,
+    });
+    let skills = builtins
+        .chain(state.skills.list().into_iter().map(|skill| SkillSummary {
             name: skill.name.clone(),
             description: skill.description.clone(),
             usage: skill.usage.clone(),
             tools: skill.tools.clone(),
             aliases: skill.aliases.clone(),
             model: skill.model.clone(),
-        })
+            builtin: false,
+        }))
         .collect();
 
     Json(skills)
 }
 
-/// Claude API token/request usage, accumulated in-memory since the bot started
-/// (see `UsageTracker`) — overall totals plus a per-label breakdown (`"classify"`
-/// for the message classifier, or a skill name for that skill's completions).
+/// Claude API token/request usage over the bot's whole life, kept in the database (see
+/// `UsageTracker`): overall totals plus a breakdown by label, such as `"classify"`,
+/// `"chat"`, or a skill's name.
 async fn api_usage(State(state): State<Arc<AppState>>) -> Json<crate::usage::UsageSnapshot> {
     Json(state.usage_tracker.snapshot())
 }
@@ -221,10 +249,15 @@ const INDEX_HTML: &str = r#"<!doctype html>
   <h1>matrix-llm-bot — status &amp; debug</h1>
   <dl>
     <dt>Bot user</dt><dd id="bot-user">…</dd>
+    <dt>Version</dt><dd id="version">…</dd>
     <dt>Homeserver</dt><dd id="homeserver">…</dd>
+    <dt>Chat model</dt><dd id="chat-model">…</dd>
     <dt>Classifier model</dt><dd id="model">…</dd>
     <dt>Uptime</dt><dd id="uptime">…</dd>
     <dt>OMDb configured</dt><dd id="omdb-configured">…</dd>
+    <dt>Link fetching</dt><dd id="fetch-links">…</dd>
+    <dt>Page rendering</dt><dd id="browser-rendering">…</dd>
+    <dt>Start notices</dt><dd id="notify-on-start">…</dd>
     <dt>Claude API rate limit</dt><dd id="rate-limited">…</dd>
   </dl>
 
@@ -439,7 +472,7 @@ async function loadSkills() {
       <td>${escapeHtml(skill.name)}</td>
       <td>${escapeHtml((skill.aliases ?? []).join(', '))}</td>
       <td>${escapeHtml(skill.usage ?? '')}</td>
-      <td>${escapeHtml((skill.tools ?? []).join(', '))}</td>
+      <td>${skill.builtin ? '<i>built-in</i>' : escapeHtml((skill.tools ?? []).join(', '))}</td>
       <td>${escapeHtml(skill.model ?? '')}</td>
       <td>${escapeHtml(skill.description)}</td>
     `;
@@ -617,7 +650,13 @@ async function loadStatus(selectFirstRoom) {
   const data = await res.json();
   document.getElementById('bot-user').textContent = data.bot_user_id ?? '(not logged in)';
   document.getElementById('homeserver').textContent = data.homeserver_url;
+  const version = document.getElementById('version');
+  version.innerHTML = `${escapeHtml(data.version)} · <a href="${escapeHtml(data.repository)}/blob/main/CHANGELOG.md">changelog</a> · <a href="${escapeHtml(data.repository)}">source</a>`;
+  document.getElementById('chat-model').textContent = data.chat_model;
   document.getElementById('model').textContent = data.classifier_model;
+  document.getElementById('fetch-links').textContent = data.fetch_links ? 'on' : 'off';
+  document.getElementById('browser-rendering').textContent = data.browser_rendering ? 'headless browser' : 'off (plain fetch only)';
+  document.getElementById('notify-on-start').textContent = data.notify_on_start.length ? data.notify_on_start.join(', ') : 'nobody';
   document.getElementById('uptime').textContent = formatUptime(data.uptime_seconds);
   document.getElementById('omdb-configured').textContent = data.omdb_configured ? 'yes' : 'no';
   document.getElementById('rate-limited').textContent = data.rate_limited_seconds_remaining == null
@@ -787,6 +826,9 @@ mod tests {
             direct_rooms,
             database: stats_database,
             homeserver_url: "http://example.invalid".to_string(),
+            fetch_links: true,
+            browser_rendering: false,
+            notify_on_start: vec!["@admin:example.org".to_string()],
         });
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind ephemeral port");
@@ -807,6 +849,11 @@ mod tests {
         assert!(status_resp.status().is_success());
         let status: serde_json::Value = status_resp.json().await.expect("status json");
         assert_eq!(status["classifier_model"], crate::classify::MODEL);
+        assert_eq!(status["chat_model"], crate::handler::CHAT_MODEL);
+        assert_eq!(status["version"], env!("CARGO_PKG_VERSION"));
+        assert_eq!(status["repository"], "https://github.com/mdellavo/matrix-llm-bot");
+        assert_eq!((status["fetch_links"].clone(), status["browser_rendering"].clone()), (true.into(), false.into()));
+        assert_eq!(status["notify_on_start"], serde_json::json!(["@admin:example.org"]));
         assert_eq!(status["homeserver_url"], "http://example.invalid");
         assert_eq!(status["omdb_configured"], false, "no OMDb key was configured for this test");
         assert!(status["rate_limited_seconds_remaining"].is_null(), "not throttled in this test");
@@ -856,7 +903,11 @@ mod tests {
         let skills_resp = http.get(format!("{base}/api/skills")).send().await.expect("GET /api/skills");
         assert!(skills_resp.status().is_success());
         let skills_json: serde_json::Value = skills_resp.json().await.expect("skills json");
-        assert!(skills_json.as_array().expect("skills array").is_empty());
+        // No skill files in this test, so only the built-ins.
+        let commands = skills_json.as_array().expect("skills array");
+        let names: Vec<&str> = commands.iter().map(|command| command["name"].as_str().expect("name")).collect();
+        assert_eq!(names, ["help", "stats", "changelog", "memories", "pp"]);
+        assert!(commands.iter().all(|command| command["builtin"] == true));
 
         let usage_resp = http.get(format!("{base}/api/usage")).send().await.expect("GET /api/usage");
         assert!(usage_resp.status().is_success());

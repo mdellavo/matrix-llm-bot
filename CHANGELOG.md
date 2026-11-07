@@ -17,6 +17,7 @@ one day of commits, newest first.
 - `!strain` posts a grid of photos of the strain from Leafly before its reply, in place of a link to one image
 - `!strain` also gives the strain's Leafly rating and quotes from its highlighted user reviews
 - The bot knows which version it's running and where its code and changelog are, in chat replies and commands alike, so it can answer what it is and what's new
+- The status page shows the version with links to the changelog and source, the chat model, whether links are fetched and pages rendered, and who gets start notices, and its command list includes the built-ins
 
 ## 0.15.0 - 2026-11-05
 
