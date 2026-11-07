@@ -1,4 +1,4 @@
-//! Messages the people in `Config::notify_on_start` privately each time the bot
+//! Messages the people in `Config::notify_users` privately each time the bot
 //! starts, with what's new since the last notice they got, so whoever runs it knows a
 //! deploy or restart went through and what it brought.
 
@@ -19,24 +19,7 @@ const MAX_NEW_LINES: usize = 12;
 pub async fn announce(client: &Client, users: &[OwnedUserId], direct_rooms: &DirectRooms, database: &Database) {
     let (version, notes) = crate::changelog::current();
     for user in users {
-        let room = match client.get_dm_room(user) {
-            Some(room) => room,
-            None => match client.create_dm(user).await {
-                Ok(room) => {
-                    info!(room = %room.room_id(), %user, "created a private room for start notices");
-                    room
-                }
-                Err(err) => {
-                    warn!(?err, %user, "failed to create a private room for the start notice");
-                    continue;
-                }
-            },
-        };
-        // Replies there are private conversation, like a room the user invited the
-        // bot into, so they stay off the status page.
-        if let Err(err) = direct_rooms.add(room.room_id().as_str(), user.as_str()) {
-            warn!(?err, room = %room.room_id(), "failed to record the start notice's room as private");
-        }
+        let Some(room) = crate::notify::private_room(client, user, direct_rooms).await else { continue };
 
         let seen = last_seen(database, user.as_str()).unwrap_or_else(|err| {
             warn!(?err, %user, "failed to read the last start notice; treating it as the first");

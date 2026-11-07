@@ -81,6 +81,9 @@ rooms = ["#some-room:matrix.org"]
 
 # Optional: users to message privately each time the bot starts, with the version
 # it's running and the changelog lines added since their last notice, so you know a
-# deploy or restart went through and what it brought. The bot reuses the
-# private room it shares with each user, or creates one. Defaults to nobody.
-# notify_on_start = ["@alice:matrix.org"]
+# deploy or restart went through and what it brought. They also get alerts: when
+# spend passes 50% and 90% of cost_limit_usd or reaches it, when Claude calls keep
+# failing, and when the sync loop stops. The bot reuses the private room it shares
+# with each user, or creates one. Defaults to nobody. notify_on_start, its old name,
+# still works.
+# notify_users = ["@alice:matrix.org"]

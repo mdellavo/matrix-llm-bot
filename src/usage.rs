@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use anyhow::{Context, Result};
 use rusqlite::{Connection, params};
@@ -8,6 +8,17 @@ use threatflux_anthropic_sdk::models::Usage;
 use tracing::warn;
 
 use crate::db::Database;
+use crate::notify::Alerts;
+
+/// Shares of `cost_limit_usd` that raise an alert when spend passes them.
+const SPEND_ALERT_PERCENTS: [u32; 3] = [50, 90, 100];
+
+/// Claude calls that must fail in a row before an alert, so one bad request or a
+/// brief outage doesn't page anyone.
+const FAILURES_BEFORE_ALERT: u32 = 5;
+
+/// How much of a failure's error text an alert quotes.
+const ALERT_ERROR_CHARS: usize = 300;
 
 /// The `usage_totals` row holding the bot-wide totals. Label names come from skills
 /// and fixed strings, which never start with `*`.
@@ -203,6 +214,16 @@ pub struct UsageTracker {
     database: Arc<Database>,
     cost_limit_usd: Option<f64>,
     inner: Mutex<Inner>,
+    /// Where spend and failure alerts go, once `alert_to` sets it.
+    alerts: OnceLock<Alerts>,
+    failures: Mutex<Failures>,
+}
+
+/// Claude calls that have failed since the last one that worked.
+#[derive(Debug, Default)]
+struct Failures {
+    in_a_row: u32,
+    alerted: bool,
 }
 
 #[derive(Debug, Default)]
@@ -225,7 +246,33 @@ impl UsageTracker {
             }
         }
 
-        Ok(Self { database, cost_limit_usd, inner: Mutex::new(inner) })
+        Ok(Self { database, cost_limit_usd, inner: Mutex::new(inner), alerts: OnceLock::new(), failures: Mutex::default() })
+    }
+
+    /// Sends alerts when spend passes a share of the cost limit, and when Claude calls
+    /// keep failing. Without this, they're only logged.
+    pub fn alert_to(&self, alerts: Alerts) {
+        let _ = self.alerts.set(alerts);
+    }
+
+    fn alert(&self, text: String) {
+        match self.alerts.get() {
+            Some(alerts) => alerts.raise(text),
+            None => warn!(alert = %text, "no one to alert"),
+        }
+    }
+
+    /// Records a Claude call that failed. Enough in a row raises an alert, once, until
+    /// a call works again.
+    pub fn record_failure(&self, error: &str) {
+        let mut failures = self.failures.lock().expect("failure count mutex poisoned");
+        failures.in_a_row += 1;
+        if failures.in_a_row >= FAILURES_BEFORE_ALERT && !failures.alerted {
+            failures.alerted = true;
+            let quoted: String = error.chars().take(ALERT_ERROR_CHARS).collect();
+            let more = if error.chars().count() > ALERT_ERROR_CHARS { "…" } else { "" };
+            self.alert(format!("The last {} Claude calls failed. The latest error: {quoted}{more}", failures.in_a_row));
+        }
     }
 
     /// Whether cumulative estimated cost has reached `cost_limit_usd` — always
@@ -247,8 +294,24 @@ impl UsageTracker {
     /// call actually used — a skill's own `model:` override if it has one, not
     /// necessarily `classify::MODEL` — since cost depends on it.
     pub fn record(&self, label: &str, model: &str, usage: &Usage) {
+        let recovered = {
+            let mut failures = self.failures.lock().expect("failure count mutex poisoned");
+            let recovered = failures.alerted;
+            *failures = Failures::default();
+            recovered
+        };
+        if recovered {
+            self.alert("Claude calls are working again.".to_string());
+        }
+
         let mut inner = self.inner.lock().expect("usage tracker mutex poisoned");
+        let spent_before = inner.overall.estimated_cost_usd;
         inner.overall.add(model, usage);
+        if let Some(limit) = self.cost_limit_usd
+            && let Some(percent) = spend_crossing(spent_before, inner.overall.estimated_cost_usd, limit)
+        {
+            self.alert(spend_alert(percent, inner.overall.estimated_cost_usd, limit));
+        }
         inner.by_label.entry(label.to_string()).or_default().add(model, usage);
 
         let (overall, by_label) = (inner.overall, inner.by_label[label]);
@@ -271,6 +334,29 @@ impl UsageTracker {
         by_label.sort_by(|a, b| a.label.cmp(&b.label));
         let cost_limit_reached = self.cost_limit_usd.is_some_and(|limit| inner.overall.estimated_cost_usd >= limit);
         UsageSnapshot { overall: inner.overall, by_label, cost_limit_usd: self.cost_limit_usd, cost_limit_reached }
+    }
+}
+
+/// The highest of `SPEND_ALERT_PERCENTS` that spend passed in going from `before` to
+/// `after`. Spend already past a share when the bot started doesn't count again.
+fn spend_crossing(before: f64, after: f64, limit: f64) -> Option<u32> {
+    if limit <= 0.0 {
+        return None;
+    }
+    SPEND_ALERT_PERCENTS
+        .into_iter()
+        .rev()
+        .find(|&percent| {
+            let threshold = limit * f64::from(percent) / 100.0;
+            before < threshold && after >= threshold
+        })
+}
+
+fn spend_alert(percent: u32, spent: f64, limit: f64) -> String {
+    if percent >= 100 {
+        format!("Claude spend reached the ${limit:.2} cost limit, so Claude calls are paused until `cost_limit_usd` is raised.")
+    } else {
+        format!("Claude spend passed {percent}% of the cost limit: ${spent:.2} of ${limit:.2}.")
     }
 }
 
@@ -525,5 +611,68 @@ mod tests {
         let snapshot = tracker.snapshot();
         assert_eq!(snapshot.cost_limit_usd, Some(1.0));
         assert!(snapshot.cost_limit_reached);
+    }
+
+    fn alerts(tracker: &UsageTracker) -> tokio::sync::mpsc::UnboundedReceiver<String> {
+        let (alerts, receiver) = Alerts::channel();
+        tracker.alert_to(alerts);
+        receiver
+    }
+
+    fn raised(receiver: &mut tokio::sync::mpsc::UnboundedReceiver<String>) -> Vec<String> {
+        std::iter::from_fn(|| receiver.try_recv().ok()).collect()
+    }
+
+    #[test]
+    fn alerts_as_spend_passes_shares_of_the_limit() {
+        let tracker = UsageTracker::open(test_db(), Some(2.0)).unwrap();
+        let mut receiver = alerts(&tracker);
+        // $4 per million input tokens on Opus 5.5, so 250,000 is $1.
+        tracker.record("chat", "claude-opus-5-5", &usage(250_000, 0));
+        assert_eq!(raised(&mut receiver), ["Claude spend passed 50% of the cost limit: $1.00 of $2.00."]);
+        tracker.record("chat", "claude-opus-5-5", &usage(150_000, 0));
+        assert!(raised(&mut receiver).is_empty(), "$1.60 is under 90%");
+        // Passing 90% and the limit at once only says the limit was reached.
+        tracker.record("chat", "claude-opus-5-5", &usage(100_000, 0));
+        assert_eq!(
+            raised(&mut receiver),
+            ["Claude spend reached the $2.00 cost limit, so Claude calls are paused until `cost_limit_usd` is raised."]
+        );
+    }
+
+    #[test]
+    fn spend_already_past_a_share_at_startup_doesnt_alert_again() {
+        assert_eq!(spend_crossing(0.0, 0.4, 1.0), None);
+        assert_eq!(spend_crossing(0.4, 0.5, 1.0), Some(50));
+        assert_eq!(spend_crossing(0.5, 0.6, 1.0), None);
+        assert_eq!(spend_crossing(0.89, 0.95, 1.0), Some(90));
+        assert_eq!(spend_crossing(0.4, 1.2, 1.0), Some(100));
+        assert_eq!(spend_crossing(0.0, 5.0, 0.0), None);
+    }
+
+    #[test]
+    fn alerts_once_when_calls_keep_failing_and_again_when_they_work() {
+        let tracker = UsageTracker::open(test_db(), None).unwrap();
+        let mut receiver = alerts(&tracker);
+        for _ in 0..FAILURES_BEFORE_ALERT - 1 {
+            tracker.record_failure("overloaded");
+        }
+        assert!(raised(&mut receiver).is_empty());
+        tracker.record_failure(&"x".repeat(500));
+        tracker.record_failure("overloaded");
+        let alert = raised(&mut receiver);
+        assert_eq!(alert.len(), 1, "{alert:?}");
+        assert!(alert[0].starts_with("The last 5 Claude calls failed. The latest error: xxx"), "{alert:?}");
+        assert!(alert[0].ends_with("x…"), "{alert:?}");
+
+        tracker.record("chat", "claude-haiku-5-5", &usage(1, 1));
+        assert_eq!(raised(&mut receiver), ["Claude calls are working again."]);
+        tracker.record("chat", "claude-haiku-5-5", &usage(1, 1));
+        assert!(raised(&mut receiver).is_empty());
+
+        // A failure or two between successes is no alert.
+        tracker.record_failure("overloaded");
+        tracker.record("chat", "claude-haiku-5-5", &usage(1, 1));
+        assert!(raised(&mut receiver).is_empty());
     }
 }

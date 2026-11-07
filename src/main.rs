@@ -15,6 +15,7 @@ mod legacy_import;
 mod links;
 mod llm;
 mod message_log;
+mod notify;
 mod photo_sheet;
 mod pp;
 mod room_memory;
@@ -79,7 +80,7 @@ async fn main() -> Result<()> {
         homeserver_url: config.homeserver_url.clone(),
         fetch_links: config.fetch_links,
         browser_rendering: config.browser_url.is_some(),
-        notify_on_start: config.notify_on_start.clone(),
+        notify_users: config.notify_users.clone(),
     });
     let http_listen_addr = config.http_listen_addr;
     tokio::spawn(async move {

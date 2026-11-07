@@ -9,7 +9,7 @@ It joins configured rooms and any private conversation an allowed user invites i
 - **Help:** ask about the bot in chat or with `!help <question>`, and it answers from this README and the changelog.
 - **Private conversations:** one-on-one and small group chats where the bot answers without being addressed.
 - **Status page:** a built-in web page with activity stats, Claude costs, and a message browser. `!stats` posts its numbers in chat.
-- **Start notices:** a private message to the people in `notify_on_start` each time the bot starts, with what's new since their last one.
+- **Notices and alerts:** private messages to the people in `notify_users` each time the bot starts, with what's new since their last one, and when something needs attention.
 
 ## Setup
 
@@ -150,7 +150,7 @@ docker compose logs -f matrix-llm-bot
 
 Replace `matrix-llm-bot-image` with the image name from `docker images`, which Compose
 derives from the project's directory name. A healthy start logs `restored saved session`
-and then `starting sync loop`, and users in `notify_on_start` get a message with the version
+and then `starting sync loop`, and users in `notify_users` get a message with the version
 that's running and what's new in it.
 
 To roll back, retag the previous image as `latest` and run the `up` command again:
@@ -429,6 +429,20 @@ the system prompt, or nothing would ever match.
 - If a reply fails to generate, the bot posts a short apology. An unprompted comment
   just stays quiet.
 
+### Alerts
+
+The people in `notify_users` get a private message, starting with ⚠️, when:
+
+- Claude spend passes 50% and 90% of `cost_limit_usd`, and when it reaches the limit and
+  Claude calls stop. Spend already past a share when the bot starts doesn't alert again.
+- 5 Claude calls in a row fail, quoting the latest error. Once one works again, a second
+  message says so.
+- The sync loop stops for good and the bot exits, for its container to restart. That one
+  is sent straight away and given 10 seconds. The start notice follows the restart.
+
+Every alert is also logged as a warning, and without `notify_users` that's all that
+happens.
+
 ## Configuration
 
 Required in `config.toml`, plus `ANTHROPIC_API_KEY` in the environment:
@@ -451,7 +465,7 @@ Optional:
 | `omdb_api_key` | none | Enables the `imdb` skill |
 | `ignored_users` | none | Users whose messages are dropped entirely |
 | `dm_allowed_users` | the bot's homeserver | Who may start a private conversation: `@user:example.org` or `:example.org`. Setting it replaces the default |
-| `notify_on_start` | nobody | Users to message privately each time the bot starts, with the version it's running and the changelog lines added since their last notice: `@user:example.org`. The bot reuses the private room it shares with each, or creates one |
+| `notify_users` | nobody | Users to message privately: each time the bot starts, with the version it's running and the changelog lines added since their last notice, and with [alerts](#alerts). Written as `@user:example.org`. The bot reuses the private room it shares with each, or creates one. `notify_on_start`, its old name, still works |
 | `cost_limit_usd` | none | Lifetime cap on estimated Claude spend |
 | `rate_limit_backoff_secs` | `60` | How long to pause after a rate limit |
 | `interjection_chance` | `0` | Chance, from 0 to 1, of considering an unprompted comment |
@@ -472,7 +486,7 @@ The page shows:
 
 - Bot details: the version, with links to the changelog and source, the chat and
   classifier models, uptime, whether Claude calls are rate limited, whether links are
-  fetched and pages rendered, and who gets start notices.
+  fetched and pages rendered, and who gets notices and alerts.
 - Activity counted from the database: message, reply, thread, image, link, and reaction
   totals, per-room and per-person tables, the last 14 days, and breakdowns of reply kinds,
   intents, sentiment, and reactions. Saved facts and database size are shown too.

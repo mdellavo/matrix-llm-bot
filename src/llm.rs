@@ -124,6 +124,7 @@ pub async fn send(
             if is_rate_limited(&err) {
                 rate_limit.note_rate_limited();
             }
+            usage_tracker.record_failure(&err.to_string());
             return Err(anyhow::Error::new(err).context("request to Claude failed"));
         }
     };
