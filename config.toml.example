@@ -77,3 +77,8 @@ rooms = ["#some-room:matrix.org"]
 # whole servers. Invites from anyone else are declined. Each reply there costs a Claude
 # call, so consider setting cost_limit_usd too. Defaults to the bot's own homeserver.
 # dm_allowed_users = ["@alice:matrix.org", ":example.org"]
+
+# Optional: users to message privately each time the bot starts, with the version
+# it's running, so you know a deploy or restart went through. The bot reuses the
+# private room it shares with each user, or creates one. Defaults to nobody.
+# notify_on_start = ["@alice:matrix.org"]

@@ -6,7 +6,7 @@ use matrix_sdk::{
     Client,
     authentication::matrix::MatrixSession,
     config::SyncSettings,
-    ruma::{DeviceId, RoomOrAliasId},
+    ruma::{DeviceId, OwnedUserId, RoomOrAliasId, UserId},
 };
 use threatflux_anthropic_sdk::Client as Anthropic;
 use tracing::{info, warn};
@@ -43,6 +43,8 @@ pub struct Bot {
     rate_limit: Arc<Throttle>,
     direct_rooms: Arc<DirectRooms>,
     database: Arc<Database>,
+    /// See `Config::notify_on_start`.
+    notify_on_start: Vec<OwnedUserId>,
 }
 
 impl Bot {
@@ -122,7 +124,22 @@ impl Bot {
             start_time: std::time::Instant::now(),
         }));
 
-        Ok(Self { client, message_log, skills, tool_clients, usage_tracker, greeting_cooldown, ignored_users, rate_limit, direct_rooms, database })
+        // Checked by `Config::validate`.
+        let notify_on_start = config.notify_on_start.iter().filter_map(|user| UserId::parse(user.as_str()).ok()).collect();
+
+        Ok(Self {
+            client,
+            message_log,
+            skills,
+            tool_clients,
+            usage_tracker,
+            greeting_cooldown,
+            ignored_users,
+            rate_limit,
+            direct_rooms,
+            database,
+            notify_on_start,
+        })
     }
 
     /// Restores a previously saved session if one exists at `<store_path>/session.json`
@@ -252,6 +269,14 @@ impl Bot {
 
         // The handler only sees new invites, not ones that came in while offline.
         answer_pending_invites(&self.client, &self.direct_rooms, &self.ignored_users).await;
+
+        // After the first sync, so an existing private room with each user is found
+        // rather than a new one made every start. In the background, so a slow
+        // homeserver doesn't hold up replies.
+        if !self.notify_on_start.is_empty() {
+            let (client, users, direct_rooms) = (self.client.clone(), self.notify_on_start.clone(), Arc::clone(&self.direct_rooms));
+            tokio::spawn(async move { crate::startup_notice::announce(&client, &users, &direct_rooms).await });
+        }
 
         info!("starting sync loop");
         let settings = SyncSettings::default().token(response.next_batch);

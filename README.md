@@ -449,6 +449,7 @@ Optional:
 | `omdb_api_key` | none | Enables the `imdb` skill |
 | `ignored_users` | none | Users whose messages are dropped entirely |
 | `dm_allowed_users` | the bot's homeserver | Who may start a private conversation: `@user:example.org` or `:example.org`. Setting it replaces the default |
+| `notify_on_start` | nobody | Users to message privately each time the bot starts, with the version it's running: `@user:example.org`. The bot reuses the private room it shares with each, or creates one |
 | `cost_limit_usd` | none | Lifetime cap on estimated Claude spend |
 | `rate_limit_backoff_secs` | `60` | How long to pause after a rate limit |
 | `interjection_chance` | `0` | Chance, from 0 to 1, of considering an unprompted comment |

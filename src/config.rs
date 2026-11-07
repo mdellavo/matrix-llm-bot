@@ -103,6 +103,12 @@ pub struct Config {
     #[serde(default)]
     pub dm_allowed_users: Vec<String>,
 
+    /// Users to message privately each time the bot starts, like
+    /// `@alice:example.org`. The bot reuses the private room it shares with each, or
+    /// creates one. Empty (the default) sends nothing.
+    #[serde(default)]
+    pub notify_on_start: Vec<String>,
+
     /// A headless Chrome's DevTools address, like `http://chrome:9222`, for rendering
     /// linked pages so their scripts run. Unset (the default) fetches pages without
     /// running scripts. The browser must have no internet access of its own: it reaches
@@ -194,6 +200,12 @@ impl Config {
             anyhow::ensure!(self.browser_proxy_url.is_some(), "browser_proxy_url is required with browser_url");
             anyhow::ensure!(self.fetch_links, "browser_url needs fetch_links on");
         }
+        for user in &self.notify_on_start {
+            anyhow::ensure!(
+                matrix_sdk::ruma::UserId::parse(user.as_str()).is_ok(),
+                "notify_on_start entries must be user IDs like @user:example.org, got {user}"
+            );
+        }
         for entry in &self.dm_allowed_users {
             anyhow::ensure!(
                 (entry.starts_with('@') || entry.starts_with(':')) && entry.contains(':') && entry.len() > 1,
@@ -201,5 +213,28 @@ impl Config {
             );
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn config(extra: &str) -> Result<Config> {
+        let config: Config = toml::from_str(&format!(
+            "homeserver_url = \"https://example.org\"\nusername = \"bot\"\npassword = \"x\"\nrooms = [\"#a:example.org\"]\n{extra}"
+        ))?;
+        config.validate()?;
+        Ok(config)
+    }
+
+    #[test]
+    fn notify_on_start_takes_user_ids() {
+        assert!(config("").unwrap().notify_on_start.is_empty());
+        assert_eq!(config("notify_on_start = [\"@procyon:p.ound.town\"]").unwrap().notify_on_start, ["@procyon:p.ound.town"]);
+        for bad in ["procyon", ":p.ound.town", "@procyon"] {
+            let err = config(&format!("notify_on_start = [\"{bad}\"]")).unwrap_err().to_string();
+            assert!(err.contains("notify_on_start entries must be user IDs"), "{bad}: {err}");
+        }
     }
 }

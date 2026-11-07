@@ -28,7 +28,7 @@ To test Claude calls without the API, use the fake Messages server in `src/llm.r
 | `src/links.rs` | Fetching linked pages, limited to public addresses |
 | `src/browser.rs`, `src/browser_proxy.rs` | Rendering pages in headless Chrome, and the proxy that's its only way out |
 | `src/db.rs` | The SQLite database and its schema migrations |
-| `src/direct_rooms.rs` | Private rooms, and who may start one |
+| `src/direct_rooms.rs`, `src/startup_notice.rs` | Private rooms, who may start one, and the message sent to `notify_on_start` users |
 | `src/legacy_import.rs` | One-time import of pre-SQLite data files |
 | `src/message_log.rs` | Stored messages and reactions, transcripts, and search |
 | `src/room_memory.rs` | Saved facts and room summaries |
