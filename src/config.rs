@@ -104,8 +104,9 @@ pub struct Config {
     pub dm_allowed_users: Vec<String>,
 
     /// Users to message privately each time the bot starts, like
-    /// `@alice:example.org`. The bot reuses the private room it shares with each, or
-    /// creates one. Empty (the default) sends nothing.
+    /// `@alice:example.org`, with what's new since their last notice. The bot reuses
+    /// the private room it shares with each, or creates one. Empty (the default) sends
+    /// nothing.
     #[serde(default)]
     pub notify_on_start: Vec<String>,
 

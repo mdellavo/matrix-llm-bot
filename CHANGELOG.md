@@ -9,7 +9,7 @@ one day of commits, newest first.
 
 - `!changelog [version]`: what changed in the running version, or in another version or on a day
 - `!stats`: the status page's numbers in chat, with this room's activity and the bot's Claude usage and cost
-- `notify_on_start`: users the bot messages privately each time it starts, with the version it's running
+- `notify_on_start`: users the bot messages privately each time it starts, with the version it's running and the changelog lines added since their last notice
 
 ### Changed
 

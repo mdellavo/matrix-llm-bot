@@ -1,5 +1,5 @@
 //! The bot's own SQLite database: messages, reactions, saved facts, room summaries,
-//! private rooms, and usage totals. Matrix session and encryption state is separate, in
+//! private rooms, usage totals, and what each start notice said. Matrix session and encryption state is separate, in
 //! matrix-sdk's own stores.
 //!
 //! Queries are synchronous and run on the caller's task. They're short, and a single
@@ -91,6 +91,13 @@ const MIGRATIONS: &[&str] = &["
     ALTER TABLE usage_totals ADD COLUMN cache_read_tokens INTEGER NOT NULL DEFAULT 0;
     ALTER TABLE usage_totals ADD COLUMN cache_write_tokens INTEGER NOT NULL DEFAULT 0;
     ALTER TABLE usage_totals ADD COLUMN cache_saved_usd REAL NOT NULL DEFAULT 0;
+", "
+    CREATE TABLE start_notices (
+        user_id TEXT PRIMARY KEY,
+        version TEXT NOT NULL,
+        notes TEXT NOT NULL,
+        sent_at TEXT NOT NULL
+    );
 "];
 
 #[derive(Debug)]

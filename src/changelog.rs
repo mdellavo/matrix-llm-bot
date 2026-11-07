@@ -37,6 +37,36 @@ pub fn reply(args: &str) -> String {
     }
 }
 
+/// The newest version and its notes, as the build was made with them.
+pub fn current() -> (&'static str, &'static str) {
+    let newest = versions(CHANGELOG).into_iter().next().expect("CHANGELOG.md has a version, which a test checks");
+    (newest.number, newest.body)
+}
+
+/// The changelog lines added since someone was last shown `seen`, a version and its
+/// notes as they were then, newest first. Lines added to that same version later,
+/// as happens when several deploys land on one day, count as new. Someone never
+/// shown anything, or shown a version this changelog doesn't have, gets the newest
+/// version's lines.
+pub fn new_since(seen: Option<(&str, &str)>) -> Vec<&'static str> {
+    new_lines(CHANGELOG, seen)
+}
+
+fn new_lines<'a>(changelog: &'a str, seen: Option<(&str, &str)>) -> Vec<&'a str> {
+    let versions = versions(changelog);
+    let entries = |body: &'a str| body.lines().filter(|line| line.starts_with("- ")).map(|line| &line[2..]);
+    let Some((seen_version, seen_notes)) = seen else {
+        return versions.first().map(|newest| entries(newest.body).collect()).unwrap_or_default();
+    };
+    let Some(seen_at) = versions.iter().position(|version| version.number == seen_version) else {
+        return versions.first().map(|newest| entries(newest.body).collect()).unwrap_or_default();
+    };
+    let already: Vec<&str> = seen_notes.lines().collect();
+    let mut lines: Vec<&str> = versions[..seen_at].iter().flat_map(|version| entries(version.body)).collect();
+    lines.extend(entries(versions[seen_at].body).filter(|line| !already.contains(&format!("- {line}").as_str())));
+    lines
+}
+
 /// Each `## <version> - <date>` section, newest first as the file lists them.
 fn versions(changelog: &str) -> Vec<Version<'_>> {
     let mut versions = Vec::new();
@@ -72,6 +102,22 @@ mod tests {
         let missing = reply("9.9");
         assert!(missing.starts_with("There's no version 9.9 in the changelog. Recent versions: "), "{missing}");
         assert!(missing.contains(&format!("{} ({})", newest.number, newest.date)), "{missing}");
+    }
+
+    #[test]
+    fn finds_what_was_added_since_someone_was_last_told() {
+        let changelog = "# Changelog\n\n## 0.3.0 - 2026-07-21\n\n### Added\n\n- Three\n\n### Changed\n\n- Three again\n\n\
+                         ## 0.2.0 - 2026-07-20\n\n### Added\n\n- Two\n- Two, later that day\n\n## 0.1.0 - 2026-07-18\n\n- One\n";
+        // Never told: the newest version.
+        assert_eq!(new_lines(changelog, None), ["Three", "Three again"]);
+        // Told about 0.2.0 before its second deploy that day.
+        assert_eq!(new_lines(changelog, Some(("0.2.0", "### Added\n\n- Two"))), ["Three", "Three again", "Two, later that day"]);
+        // Told about everything already.
+        let newest = &versions(changelog)[0];
+        assert!(new_lines(changelog, Some((newest.number, newest.body))).is_empty());
+        // Told about a version this changelog doesn't have.
+        assert_eq!(new_lines(changelog, Some(("9.9.9", ""))), ["Three", "Three again"]);
+        assert_eq!(current().0, env!("CARGO_PKG_VERSION"));
     }
 
     /// The rules AGENTS.md sets for the changelog: the newest version is the crate's,

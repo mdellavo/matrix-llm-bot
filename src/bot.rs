@@ -274,8 +274,9 @@ impl Bot {
         // rather than a new one made every start. In the background, so a slow
         // homeserver doesn't hold up replies.
         if !self.notify_on_start.is_empty() {
-            let (client, users, direct_rooms) = (self.client.clone(), self.notify_on_start.clone(), Arc::clone(&self.direct_rooms));
-            tokio::spawn(async move { crate::startup_notice::announce(&client, &users, &direct_rooms).await });
+            let (client, users, direct_rooms, database) =
+                (self.client.clone(), self.notify_on_start.clone(), Arc::clone(&self.direct_rooms), Arc::clone(&self.database));
+            tokio::spawn(async move { crate::startup_notice::announce(&client, &users, &direct_rooms, &database).await });
         }
 
         info!("starting sync loop");

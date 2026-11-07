@@ -80,6 +80,7 @@ rooms = ["#some-room:matrix.org"]
 # dm_allowed_users = ["@alice:matrix.org", ":example.org"]
 
 # Optional: users to message privately each time the bot starts, with the version
-# it's running, so you know a deploy or restart went through. The bot reuses the
+# it's running and the changelog lines added since their last notice, so you know a
+# deploy or restart went through and what it brought. The bot reuses the
 # private room it shares with each user, or creates one. Defaults to nobody.
 # notify_on_start = ["@alice:matrix.org"]
