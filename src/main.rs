@@ -23,6 +23,7 @@ mod room_queue;
 mod skills;
 mod stats;
 mod stats_command;
+mod startup_notice;
 mod status_server;
 mod throttle;
 mod tools;
