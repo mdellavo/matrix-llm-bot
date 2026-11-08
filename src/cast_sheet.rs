@@ -155,7 +155,8 @@ fn wrap(text: &str, width: usize, max_lines: usize) -> Vec<String> {
     lines
 }
 
-fn draw_text(image: &mut RgbImage, font: &FontRef, scale: PxScale, x: f32, baseline: f32, text: &str, ink: [u8; 3]) {
+/// Also used for the `!dm` map's labels.
+pub(crate) fn draw_text(image: &mut RgbImage, font: &FontRef, scale: PxScale, x: f32, baseline: f32, text: &str, ink: [u8; 3]) {
     let scaled = font.as_scaled(scale);
     let (width, height) = image.dimensions();
     let mut x = x;

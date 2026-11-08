@@ -1,6 +1,6 @@
 //! The bot's own SQLite database: messages, reactions, saved facts, room summaries,
-//! private rooms, usage totals, and what each start notice said. Matrix session and encryption state is separate, in
-//! matrix-sdk's own stores.
+//! private rooms, usage totals, what each start notice said, and `!dm` games. Matrix
+//! session and encryption state is separate, in matrix-sdk's own stores.
 //!
 //! Queries are synchronous and run on the caller's task. They're short, and a single
 //! connection behind a mutex keeps writes ordered without any further coordination.
@@ -97,6 +97,44 @@ const MIGRATIONS: &[&str] = &["
         version TEXT NOT NULL,
         notes TEXT NOT NULL,
         sent_at TEXT NOT NULL
+    );
+", "
+    CREATE TABLE games (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT NOT NULL UNIQUE,
+        premise TEXT NOT NULL,
+        owner TEXT NOT NULL,
+        main_room_id TEXT NOT NULL,
+        thread_root_id TEXT NOT NULL,
+        game_room_id TEXT NOT NULL UNIQUE,
+        status TEXT NOT NULL,
+        round INTEGER NOT NULL DEFAULT 0,
+        state_json TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    );
+    CREATE TABLE game_players (
+        game_id INTEGER NOT NULL REFERENCES games (id),
+        user_id TEXT NOT NULL,
+        name TEXT NOT NULL,
+        entity_id TEXT NOT NULL,
+        PRIMARY KEY (game_id, user_id)
+    );
+    CREATE TABLE game_actions (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        game_id INTEGER NOT NULL REFERENCES games (id),
+        user_id TEXT NOT NULL,
+        text TEXT NOT NULL,
+        sent_at_ms INTEGER NOT NULL
+    );
+    CREATE TABLE game_rounds (
+        game_id INTEGER NOT NULL REFERENCES games (id),
+        round INTEGER NOT NULL,
+        actions_json TEXT NOT NULL,
+        narration TEXT NOT NULL,
+        summary TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        PRIMARY KEY (game_id, round)
     );
 "];
 

@@ -906,7 +906,7 @@ mod tests {
         // No skill files in this test, so only the built-ins.
         let commands = skills_json.as_array().expect("skills array");
         let names: Vec<&str> = commands.iter().map(|command| command["name"].as_str().expect("name")).collect();
-        assert_eq!(names, ["help", "stats", "changelog", "memories", "pp"]);
+        assert_eq!(names, ["help", "dm", "stats", "changelog", "memories", "pp"]);
         assert!(commands.iter().all(|command| command["builtin"] == true));
 
         let usage_resp = http.get(format!("{base}/api/usage")).send().await.expect("GET /api/usage");

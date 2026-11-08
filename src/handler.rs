@@ -439,12 +439,12 @@ const TYPING_REFRESH_INTERVAL: Duration = Duration::from_secs(3);
 /// `TypingIndicator` is ever dropped without `stop` being called, that still
 /// aborts the refresh loop and lets the indicator expire on its own within
 /// `TYPING_REFRESH_INTERVAL`, rather than looping forever.
-struct TypingIndicator {
+pub(crate) struct TypingIndicator {
     refresh_task: tokio::task::JoinHandle<()>,
 }
 
 impl TypingIndicator {
-    fn start(room: Room) -> Self {
+    pub(crate) fn start(room: Room) -> Self {
         let refresh_task = tokio::spawn(async move {
             loop {
                 if let Err(err) = room.typing_notice(true).await {
@@ -458,7 +458,7 @@ impl TypingIndicator {
 
     /// Stops the refresh loop and clears the indicator immediately, rather than
     /// leaving it to expire on its own.
-    async fn stop(self, room: &Room) {
+    pub(crate) async fn stop(self, room: &Room) {
         self.refresh_task.abort();
         if let Err(err) = room.typing_notice(false).await {
             warn!(?err, room = %room.room_id(), "failed to clear typing notice");
@@ -506,6 +506,8 @@ pub struct HandlerContext {
     pub database: Arc<crate::db::Database>,
     /// When the bot started, for `!stats`.
     pub start_time: std::time::Instant,
+    /// `!dm` games.
+    pub dm: Arc<crate::dm::Dm>,
 }
 
 /// A message waiting its turn in its room's inbox.
@@ -652,6 +654,10 @@ const BURST_WINDOW: Duration = Duration::from_millis(1500);
 
 async fn process_message(ctx: &HandlerContext, inbox: &mut Inbox<QueuedMessage>, message: QueuedMessage) {
     let QueuedMessage { event, room, client } = message;
+    // Messages in a `!dm` game room are the game's, not chat.
+    if ctx.dm.on_message(&room, &event).await {
+        return;
+    }
     let Some((event, edit)) = resolve_edit(ctx, &room, event).await else {
         return;
     };
@@ -803,7 +809,7 @@ async fn process_message(ctx: &HandlerContext, inbox: &mut Inbox<QueuedMessage>,
     }
 
     let response = match (&command, kind) {
-        (Some(command), _) => Some(handle_command(ctx, &room, command, body).await),
+        (Some(command), _) => Some(handle_command(ctx, &room, &event, command, body).await),
         (None, Some(kind)) => {
             let now_ms = event.origin_server_ts.get().into();
             let image = match kind {
@@ -1106,7 +1112,7 @@ async fn pp_reply() -> GeneratedReply {
     }
 }
 
-async fn send_reaction(room: &Room, event_id: &EventId, key: &str) {
+pub(crate) async fn send_reaction(room: &Room, event_id: &EventId, key: &str) {
     let content = ReactionEventContent::new(Annotation::new(event_id.to_owned(), key.to_string()));
     if let Err(err) = room.send(content).await {
         warn!(?err, room = %room.room_id(), "failed to send reaction");
@@ -1571,6 +1577,11 @@ pub const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
         usage: Some("help [question]"),
         description: "List available commands, or ask anything about the bot with \"!help <question>\".",
     },
+    BuiltinCommand {
+        name: "dm",
+        usage: Some("dm @friend … <premise>"),
+        description: "Start a role-playing game in its own room, with the bot as Dungeon Master.",
+    },
     BuiltinCommand { name: "stats", usage: None, description: "Activity and Claude usage, from the status page." },
     BuiltinCommand {
         name: "changelog",
@@ -1583,13 +1594,23 @@ pub const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
 
 /// Dispatches a `!command` to a built-in or a loaded skill, or replies that it
 /// doesn't exist.
-async fn handle_command(ctx: &HandlerContext, room: &Room, command: &ParsedCommand<'_>, message_text: &str) -> GeneratedReply {
+async fn handle_command(
+    ctx: &HandlerContext,
+    room: &Room,
+    event: &OriginalSyncRoomMessageEvent,
+    command: &ParsedCommand<'_>,
+    message_text: &str,
+) -> GeneratedReply {
     if command.name.eq_ignore_ascii_case("help") {
         return GeneratedReply::plain(help_reply(&ctx.skills), "help");
     }
 
     if command.name.eq_ignore_ascii_case("pp") {
         return pp_reply().await;
+    }
+
+    if command.name.eq_ignore_ascii_case("dm") {
+        return GeneratedReply::plain(ctx.dm.start(room, event, command.args).await, "dm");
     }
 
     if command.name.eq_ignore_ascii_case("stats") {

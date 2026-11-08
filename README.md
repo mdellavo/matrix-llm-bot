@@ -213,9 +213,11 @@ Frontmatter fields:
 
 A `!command`'s args are parsed from the text after its name, without a model: they fill the skill's declared `args` in order, with the last one taking the rest of the line. Lists split on commas or " or ", or on spaces if there are neither.
 
-Thirteen skills ship as worked examples under `skills/`. There are five built-ins too:
+Thirteen skills ship as worked examples under `skills/`. There are six built-ins too:
 
 - `!help` lists commands, or answers `!help <question>` (see [Help](#help)).
+- `!dm @friend … <premise>` starts a role-playing game in its own room, with the bot as
+  Dungeon Master (see [Role-playing games](#role-playing-games)).
 - `!memories` lists saved facts.
 - `!pp` posts an animated GIF of a randomly sized pp, drawn by the bot with no Claude call.
   Its font and emoji images are credited in `assets/pp/README.md`.
@@ -401,6 +403,46 @@ aren't for the bot only update history, without being classified again, and edit
 don't change the text are ignored. If the new version no longer needs an answer, the
 earlier reply stays as it was.
 
+### Role-playing games
+
+`!dm @foo @bar you found a cave in the woods` starts a game. The bot names it from the
+premise, like `cave-in-the-woods-x7k2`, creates an encrypted private room with that name,
+and invites whoever sent the command and the people they mentioned, up to 6 players.
+Only people `dm_allowed_users` allows, and not `ignored_users`, are invited. It replies in
+a thread on the `!dm` message, then sets the scene in the game room.
+
+In the game room, each message from a player is their character's action, and the bot
+reacts with ✅ to show it was counted. A round is played once every player who has joined
+has acted, or 60 seconds after the first action. `!dm go` plays it now, `!dm map` reposts
+the map, `!dm status` shows each character's health and what they carry, and `!dm end`
+ends the game, for whoever started it. Other people in the room, and other commands,
+aren't part of the game.
+
+Each round is one call to `claude-opus-5-5`, with the DM instructions in
+`src/dm/prompt.md`, the premise, the last 5 rounds in full and one-line summaries of older
+ones, the world as it stands, and the round's actions. Claude plays it with three tools:
+
+- `roll_dice` rolls real dice, like `1d20+3`, so results aren't made up. The rolls are
+  listed under the round's story.
+- `update_state` changes the world: the map, up to 24 by 16 squares, and who and what is
+  on it, their health, what they carry, and the party's goal. Changes are checked, and a
+  wrong one is refused and explained to Claude, so the map always matches the story.
+  Players' characters start with 12 hp, and only their own players move them.
+- `end_round` gives the story for the game room and a one-line summary.
+
+The bot draws the map from that state each round: coloured squares for the ground, a
+lettered token for each character, red for monsters, and a strip with the round, the goal,
+and the party's health. The story is posted in the game room as the map's caption. The
+summary goes to the `!dm` thread as the caption of a half-size map, one message per
+round. Clients that don't show captions show the text as the image's name.
+
+Games, players, waiting actions, and every round are kept in the database, so a restart
+picks up where it left off. A round that fails keeps its actions for `!dm go` to retry. At
+most 3 games run at once, a game ends after 150 rounds, and the cost limit pauses games
+like everything else. A round costs about 4¢. Game rooms are left off the status page and
+out of `!stats`, and their messages are kept in the game's own tables rather than the
+message log.
+
 ### Reactions
 
 Reactions from others are saved and shown in history, including reactions to the bot's own
@@ -506,9 +548,10 @@ aren't counted.
 ## Data and security
 
 - **Database:** messages, prompts, reactions, facts, room summaries, private rooms, usage
-  totals, and what each start notice said live in one SQLite database (`src/db.rs`). Every message is recorded, whether or
-  not the bot replies, including in private conversations and encrypted rooms, and it's
-  stored unencrypted. The schema migrates automatically at startup.
+  totals, what each start notice said, and `!dm` games live in one SQLite database
+  (`src/db.rs`). Every message is recorded, whether or not the bot replies, including in
+  private conversations and encrypted rooms, and it's stored unencrypted. Messages in game
+  rooms are kept as the game's actions instead. The schema migrates automatically at startup.
 - **Older data:** files from older versions (`data/messages/*.jsonl`, `memory.json`,
   `usage.json`) are imported once at startup and then ignored, so they can be deleted once
   you're happy with the import.

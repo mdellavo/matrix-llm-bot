@@ -3,6 +3,12 @@
 Notable changes to matrix-llm-bot, built from the git history. Each version covers
 one day of commits, newest first.
 
+## 0.17.0 - 2026-11-08
+
+### Added
+
+- `!dm @friend … <premise>`: a role-playing game in its own room, with the bot as Dungeon Master. Each player's message is their action, and each round, played once everyone has acted or a minute after the first action, is posted with a map of the scene. A summary and a small map of each round go to a thread in the room the game started from
+
 ## 0.16.0 - 2026-11-06
 
 ### Added
