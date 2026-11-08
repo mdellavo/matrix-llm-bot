@@ -8,6 +8,7 @@ mod classify;
 mod config;
 mod db;
 mod direct_rooms;
+mod dm;
 mod greeting;
 mod handler;
 mod ignore;

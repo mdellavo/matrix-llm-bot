@@ -1,6 +1,6 @@
 [package]
 name = "matrix-llm-bot"
-version = "0.16.0"
+version = "0.17.0"
 edition = "2024"
 # Also what the bot tells people when they ask where its code is.
 repository = "https://github.com/mdellavo/matrix-llm-bot"

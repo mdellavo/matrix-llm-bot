@@ -45,6 +45,7 @@ pub struct Bot {
     database: Arc<Database>,
     /// See `Config::notify_users`.
     notify_users: Vec<OwnedUserId>,
+    dm: Arc<crate::dm::Dm>,
     /// Alerts waiting for `run` to start delivering them.
     alert_queue: Option<tokio::sync::mpsc::UnboundedReceiver<String>>,
 }
@@ -103,6 +104,15 @@ impl Bot {
         // and registered as a single event-handler context, rather than one
         // `add_event_handler_context` call per resource — matrix-sdk's
         // `EventHandler` trait only supports so many separate `Ctx<T>` params.
+        let dm = crate::dm::Dm::new(crate::dm::DmParts {
+            client: client.clone(),
+            anthropic: Arc::clone(&anthropic),
+            usage_tracker: Arc::clone(&usage_tracker),
+            rate_limit: Arc::clone(&rate_limit),
+            database: Arc::clone(&database),
+            direct_rooms: Arc::clone(&direct_rooms),
+            ignored_users: Arc::clone(&ignored_users),
+        });
         client.add_event_handler_context(Arc::new(HandlerContext {
             anthropic,
             message_log: Arc::clone(&message_log),
@@ -124,6 +134,7 @@ impl Bot {
             bot_name: short_name(&config.username).to_string(),
             database: Arc::clone(&database),
             start_time: std::time::Instant::now(),
+            dm: Arc::clone(&dm),
         }));
 
         // Checked by `Config::validate`.
@@ -147,6 +158,7 @@ impl Bot {
             database,
             notify_users,
             alert_queue,
+            dm,
         })
     }
 
@@ -288,6 +300,9 @@ impl Bot {
                 crate::startup_notice::announce(&client, &users, &direct_rooms, &database).await;
             });
         }
+        // Games waiting on a round when the bot stopped carry on.
+        self.dm.resume();
+
         // Alerts raised before now wait in the queue, and go out after the start notice
         // gets its turn at the rooms.
         if let Some(queue) = self.alert_queue.take() {
