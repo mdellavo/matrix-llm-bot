@@ -2,6 +2,8 @@
 //! changes it only through `Change`, and every change is checked, so the map that's
 //! drawn always matches what the story says.
 
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 
 pub const MIN_SIZE: usize = 4;
@@ -11,6 +13,9 @@ const MAX_ENTITIES: usize = 30;
 const MAX_NAME_CHARS: usize = 40;
 const MAX_ITEMS: usize = 20;
 const MAX_QUEST_CHARS: usize = 200;
+const MAX_STATS: usize = 8;
+const MAX_STAT_NAME_CHARS: usize = 16;
+const STAT_RANGE: std::ops::RangeInclusive<i32> = -999..=99_999;
 const MAX_HP: i32 = 999;
 pub const PLAYER_HP: i32 = 12;
 
@@ -60,6 +65,9 @@ pub struct Entity {
     /// for a player, a look picked by the order they joined.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub look: Option<String>,
+    /// Whatever else the story keeps count of, like gold, XP, or armour, by name.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub stats: BTreeMap<String, i32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -93,6 +101,8 @@ pub enum Change {
     },
     /// How something is drawn, from `sprites::LOOKS`, like a player who says they're an elf.
     SetLook { id: String, look: String },
+    /// A stat like gold or XP, or with no value, removes it.
+    SetStat { id: String, stat: String, value: Option<i32> },
     Move { id: String, x: usize, y: usize },
     SetHp { id: String, hp: i32 },
     Remove { id: String },
@@ -120,6 +130,7 @@ impl GameState {
                 items: Vec::new(),
                 player: Some(user_id.clone()),
                 look: None,
+                stats: BTreeMap::new(),
             })
             .collect();
         Self { width, height, rows: vec![".".repeat(width); height], entities, quest: String::new() }
@@ -197,7 +208,30 @@ impl GameState {
                     items: Vec::new(),
                     player: None,
                     look: look.clone(),
+                    stats: BTreeMap::new(),
                 });
+            }
+            Change::SetStat { id, stat, value } => {
+                let stat = stat.trim();
+                if stat.is_empty() || stat.chars().count() > MAX_STAT_NAME_CHARS {
+                    return Err(format!("stat names are 1 to {MAX_STAT_NAME_CHARS} characters"));
+                }
+                if stat.eq_ignore_ascii_case("hp") || stat.eq_ignore_ascii_case("max_hp") {
+                    return Err("hp has its own op, set_hp".to_string());
+                }
+                let entity = self.entity_mut(id)?;
+                match value {
+                    Some(value) if STAT_RANGE.contains(value) => {
+                        if !entity.stats.contains_key(stat) && entity.stats.len() >= MAX_STATS {
+                            return Err(format!("{id} can have at most {MAX_STATS} stats"));
+                        }
+                        entity.stats.insert(stat.to_string(), *value);
+                    }
+                    Some(_) => return Err(format!("stats run from {} to {}", STAT_RANGE.start(), STAT_RANGE.end())),
+                    None => {
+                        entity.stats.remove(stat);
+                    }
+                }
             }
             Change::SetLook { id, look } => {
                 check_look(look)?;
@@ -327,6 +361,10 @@ mod tests {
         assert_eq!(state.entity("wolf-1").unwrap().max_hp, Some(5));
         assert_eq!(state.entity("wolf-1").unwrap().look.as_deref(), Some("wolf"));
         assert_eq!(state.entity("alice").unwrap().look.as_deref(), Some("ranger"));
+
+        state.apply(&changes(r#"[{"op": "set_stat", "id": "alice", "stat": "Gold", "value": 12}, {"op": "set_stat", "id": "alice", "stat": "XP", "value": 40}]"#)).unwrap();
+        state.apply(&changes(r#"[{"op": "set_stat", "id": "alice", "stat": "XP", "value": null}]"#)).unwrap();
+        assert_eq!(state.entity("alice").unwrap().stats.iter().collect::<Vec<_>>(), [(&"Gold".to_string(), &12)]);
         assert_eq!(state.entity("alice").unwrap().items, ["torch"]);
 
         state.apply(&changes(r#"[{"op": "set_hp", "id": "wolf-1", "hp": 99}, {"op": "take", "id": "alice", "item": "Torch"}]"#)).unwrap();
@@ -351,6 +389,9 @@ mod tests {
             (r#"[{"op": "set_tile", "x": 1, "y": 1, "tile": "TT"}]"#, "exactly one character"),
             (r#"[{"op": "take", "id": "alice", "item": "sword"}]"#, "isn't carrying sword"),
             (r#"[{"op": "set_look", "id": "alice", "look": "astronaut"}]"#, "no look called astronaut"),
+            (r#"[{"op": "set_stat", "id": "alice", "stat": "hp", "value": 99}]"#, "its own op, set_hp"),
+            (r#"[{"op": "set_stat", "id": "alice", "stat": "gold", "value": 1000000}]"#, "stats run from"),
+            (r#"[{"op": "set_stat", "id": "alice", "stat": "", "value": 1}]"#, "stat names are"),
             (r#"[{"op": "add", "id": "w", "kind": "monster", "name": "Wolf", "x": 1, "y": 1, "look": "wolfish"}]"#, "no look called wolfish"),
         ] {
             let mut state = original.clone();

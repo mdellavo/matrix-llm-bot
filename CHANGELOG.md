@@ -12,6 +12,7 @@ one day of commits, newest first.
 ### Changed
 
 - `!dm` posts each round's story as its own formatted message, with a round heading, names in bold, and the dice rolled as a list, then the map under it, in place of a caption on the map, which some clients didn't show. The thread gets the same treatment
+- `!dm` rounds show the party's goal, and post a party card under the map: each player's character, health bar, stats, and inventory, with pictures for items like swords, coins, and potions. The DM can track stats like gold or XP, and `!dm status` posts the card too
 
 ## 0.17.0 - 2026-11-08
 
