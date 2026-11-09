@@ -35,11 +35,24 @@ pub struct RoundTools {
     pub state: Mutex<GameState>,
     pub rolls: Mutex<Vec<String>>,
     pub ending: Mutex<Option<Ending>>,
+    /// Every call in order, with what it was given and what it said back, for the
+    /// game log.
+    pub calls: Mutex<Vec<Value>>,
 }
 
 impl RoundTools {
     pub fn new(state: GameState) -> Self {
-        Self { state: Mutex::new(state), rolls: Mutex::new(Vec::new()), ending: Mutex::new(None) }
+        Self { state: Mutex::new(state), rolls: Mutex::new(Vec::new()), ending: Mutex::new(None), calls: Mutex::new(Vec::new()) }
+    }
+
+    fn run_and_record(&self, name: &str, input: &Value) -> Result<String, String> {
+        let result = self.run_tool(name, input);
+        let (output, refused) = match &result {
+            Ok(output) => (output.as_str(), false),
+            Err(error) => (error.as_str(), true),
+        };
+        self.calls.lock().expect("calls mutex poisoned").push(json!({"tool": name, "input": input, "output": output, "refused": refused}));
+        result
     }
 
     fn run_tool(&self, name: &str, input: &Value) -> Result<String, String> {
@@ -138,7 +151,7 @@ impl LocalTools for RoundTools {
     }
 
     fn run<'a>(&'a self, name: &'a str, input: &'a Value) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + 'a>> {
-        Box::pin(std::future::ready(self.run_tool(name, input)))
+        Box::pin(std::future::ready(self.run_and_record(name, input)))
     }
 }
 

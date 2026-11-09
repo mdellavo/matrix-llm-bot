@@ -118,6 +118,13 @@ pub fn by_id(database: &Database, id: i64) -> Result<Option<Game>> {
     found.map(with_state).transpose()
 }
 
+pub fn all(database: &Database) -> Result<Vec<Game>> {
+    let rows = database.with(|connection| {
+        connection.prepare(&format!("SELECT {GAME_COLUMNS} FROM games ORDER BY id"))?.query_map([], read_game)?.collect::<rusqlite::Result<Vec<_>>>()
+    })?;
+    rows.into_iter().map(with_state).collect()
+}
+
 pub fn active(database: &Database) -> Result<Vec<Game>> {
     let rows = database.with(|connection| {
         connection.prepare(&format!("SELECT {GAME_COLUMNS} FROM games WHERE status = ?1 ORDER BY id"))?.query_map([ACTIVE], read_game)?.collect::<rusqlite::Result<Vec<_>>>()
@@ -213,6 +220,43 @@ pub fn end(database: &Database, game_id: i64) -> Result<()> {
     Ok(())
 }
 
+/// Adds to the game's log: everything that happened, in order, for reading back later.
+/// See `Dm::log` for the kinds.
+pub fn log(database: &Database, game_id: i64, round: u32, kind: &str, user_id: Option<&str>, data: &serde_json::Value) -> Result<()> {
+    let now = chrono::Utc::now().to_rfc3339();
+    let data_json = serde_json::to_string(data)?;
+    database.with(|connection| {
+        connection.execute(
+            "INSERT INTO game_log (game_id, round, kind, user_id, data_json, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![game_id, round, kind, user_id, data_json, now],
+        )
+    })?;
+    Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct LogEntry {
+    pub created_at: String,
+    pub round: u32,
+    pub kind: String,
+    pub user_id: Option<String>,
+    pub data: serde_json::Value,
+}
+
+pub fn game_log(database: &Database, game_id: i64) -> Result<Vec<LogEntry>> {
+    let rows: Vec<(String, u32, String, Option<String>, String)> = database.with(|connection| {
+        connection
+            .prepare("SELECT created_at, round, kind, user_id, data_json FROM game_log WHERE game_id = ?1 ORDER BY id")?
+            .query_map([game_id], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)))?
+            .collect()
+    })?;
+    rows.into_iter()
+        .map(|(created_at, round, kind, user_id, data_json)| {
+            Ok(LogEntry { created_at, round, kind, user_id, data: serde_json::from_str(&data_json).context("unreadable game log entry")? })
+        })
+        .collect()
+}
+
 pub fn rounds(database: &Database, game_id: i64) -> Result<Vec<Round>> {
     let rows: Vec<(u32, String, String, String)> = database.with(|connection| {
         connection
@@ -269,6 +313,20 @@ mod tests {
 
         end(&database, id).unwrap();
         assert!(active(&database).unwrap().is_empty());
+    }
+
+    #[test]
+    fn keeps_the_log_in_order() {
+        let database = Database::open_in_memory();
+        let id = game(&database);
+        log(&database, id, 0, "start", Some("@a:x"), &serde_json::json!({"premise": "a cave"})).unwrap();
+        log(&database, id, 1, "action", Some("@a:x"), &serde_json::json!({"text": "look"})).unwrap();
+        let entries = game_log(&database, id).unwrap();
+        let kinds: Vec<&str> = entries.iter().map(|entry| entry.kind.as_str()).collect();
+        assert_eq!(kinds, ["start", "action"]);
+        assert_eq!(entries[1].data["text"], "look");
+        assert_eq!(entries[1].user_id.as_deref(), Some("@a:x"));
+        assert!(game_log(&database, id + 1).unwrap().is_empty());
     }
 
     #[test]

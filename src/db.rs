@@ -136,6 +136,17 @@ const MIGRATIONS: &[&str] = &["
         created_at TEXT NOT NULL,
         PRIMARY KEY (game_id, round)
     );
+", "
+    CREATE TABLE game_log (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        game_id INTEGER NOT NULL REFERENCES games (id),
+        round INTEGER NOT NULL,
+        kind TEXT NOT NULL,
+        user_id TEXT,
+        data_json TEXT NOT NULL,
+        created_at TEXT NOT NULL
+    );
+    CREATE INDEX game_log_game ON game_log (game_id, id);
 "];
 
 #[derive(Debug)]

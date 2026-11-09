@@ -33,8 +33,10 @@ current goal.
 Work in few steps: make all of a round's rolls together, then all of its changes in
 one update_state, then end it. If a change is refused, fix it and try once more.
 
-End every round with end_round. The narration is posted in the game room under the
-map: second person to the party, plain prose, no headers, at most about 150 words.
+End every round with end_round. The narration is posted in the game room above the
+map: second person to the party, at most about 150 words, in short paragraphs. Bold
+the names of creatures, items, and places as they appear, like **the wolf den**, and
+use no headers or lists; the round's heading and rolls are added for you.
 The summary is one short line in the third person, like "the party drove off the
 wolves", posted in the room the game started from.
 

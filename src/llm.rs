@@ -9,6 +9,7 @@
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::Mutex;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -101,6 +102,16 @@ pub struct CompletionRequest<'a> {
     pub local_tools: Option<&'a dyn LocalTools>,
     /// Label the call is recorded under in `UsageTracker`.
     pub label: &'a str,
+    /// Collects every request sent and what came back, for callers that keep a
+    /// record of their calls, like `!dm`'s game log.
+    pub exchanges: Option<&'a Mutex<Vec<Exchange>>>,
+}
+
+/// One request to the Messages API and its response, or the error in its place.
+#[derive(Debug, Clone)]
+pub struct Exchange {
+    pub request: Value,
+    pub response: Result<Value, String>,
 }
 
 /// Sends a Messages API request, records its usage, and returns the raw response.
@@ -151,7 +162,12 @@ pub async fn complete(
     let beta = supports_fallback(request.model).then_some(FALLBACK_BETA);
 
     for attempt in 0..=MAX_CONTINUATIONS {
-        let response = send(client, body.clone(), beta, request.label, usage_tracker, rate_limit).await?;
+        let sent = send(client, body.clone(), beta, request.label, usage_tracker, rate_limit).await;
+        if let Some(exchanges) = request.exchanges {
+            let response = sent.as_ref().map(Clone::clone).map_err(|err| format!("{err:#}"));
+            exchanges.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).push(Exchange { request: body.clone(), response });
+        }
+        let response = sent?;
         let content = response["content"].as_array().cloned().unwrap_or_default();
         let stop_reason = response["stop_reason"].as_str().unwrap_or_default();
 
