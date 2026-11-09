@@ -9,6 +9,10 @@ one day of commits, newest first.
 
 - `!dm @friend … <premise>`: a role-playing game in its own room, with the bot as Dungeon Master. Each player's message is their action, and each round, played once everyone has acted or a minute after the first action, is posted with a map of the scene. A summary and a small map of each round go to a thread in the room the game started from
 
+### Changed
+
+- `!dm` maps have a key naming every creature with its health, every item and place, and each kind of ground shown. Creatures that share an initial are numbered, like G1 and G2, and named places, like a wolf den, are marked on the map
+
 ## 0.16.0 - 2026-11-06
 
 ### Added
