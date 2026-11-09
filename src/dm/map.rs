@@ -40,11 +40,11 @@ const KEY_FONT: f32 = 14.0;
 const BADGE_FONT: f32 = 10.0;
 const STRIP_HEIGHT: u32 = 30;
 
-const BACKGROUND: Rgb<u8> = Rgb([30, 31, 34]);
-const TEXT: [u8; 3] = [235, 235, 235];
-const MUTED: [u8; 3] = [160, 162, 168];
-const HEADING: [u8; 3] = [200, 200, 205];
-const OUTLINE: [u8; 3] = [20, 20, 22];
+pub(super) const BACKGROUND: Rgb<u8> = Rgb([30, 31, 34]);
+pub(super) const TEXT: [u8; 3] = [235, 235, 235];
+pub(super) const MUTED: [u8; 3] = [160, 162, 168];
+pub(super) const HEADING: [u8; 3] = [200, 200, 205];
+pub(super) const OUTLINE: [u8; 3] = [20, 20, 22];
 const PLAYER_COLOURS: [[u8; 3]; 6] =
     [[66, 135, 245], [245, 166, 35], [155, 89, 182], [26, 188, 156], [236, 240, 241], [241, 196, 15]];
 const MONSTER: [u8; 3] = [200, 45, 45];
@@ -55,12 +55,12 @@ const FALLEN: [u8; 3] = [110, 110, 110];
 
 /// How one thing on the map is drawn, and named in the key.
 #[derive(Debug, Clone, PartialEq)]
-struct Marker {
-    label: String,
-    colour: [u8; 3],
+pub(super) struct Marker {
+    pub(super) label: String,
+    pub(super) colour: [u8; 3],
     shape: Shape,
     /// From its look. Without one, it's drawn as `shape` with its label inside.
-    sprite: Option<RgbaImage>,
+    pub(super) sprite: Option<RgbaImage>,
     /// The top half of a look two squares tall, drawn in the square above.
     top: Option<RgbaImage>,
 }
@@ -81,7 +81,7 @@ pub fn render(state: &GameState, round: u32) -> Result<(ReplyImage, ReplyImage)>
 
 /// A label for everything on the map: a creature's initial, numbered when others
 /// share it, like W1 and W2 for two wolves, and numbers for items and for places.
-fn markers(state: &GameState) -> Vec<Marker> {
+pub(super) fn markers(state: &GameState) -> Vec<Marker> {
     let creature = |entity: &Entity| matches!(entity.kind, Kind::Player | Kind::Monster | Kind::Npc);
     let initial = |entity: &Entity| entity.name.chars().find(|c| c.is_alphanumeric()).unwrap_or('?').to_uppercase().to_string();
     let (mut players, mut items, mut places) = (0, 0, 0);
@@ -295,11 +295,11 @@ fn draw_badge(image: &mut RgbImage, font: &FontRef, marker: &Marker, left: u32, 
     crate::cast_sheet::draw_text(image, font, scale, (left + 3) as f32, (top + 9) as f32, &marker.label, ink_for(marker.colour));
 }
 
-fn ink_for(colour: [u8; 3]) -> [u8; 3] {
+pub(super) fn ink_for(colour: [u8; 3]) -> [u8; 3] {
     if colour.iter().map(|&c| u32::from(c)).sum::<u32>() > 450 { OUTLINE } else { TEXT }
 }
 
-fn text_width(font: &FontRef, scale: PxScale, text: &str) -> f32 {
+pub(super) fn text_width(font: &FontRef, scale: PxScale, text: &str) -> f32 {
     let scaled = font.as_scaled(scale);
     text.chars().map(|c| scaled.h_advance(font.glyph_id(c))).sum()
 }
@@ -308,7 +308,7 @@ fn chars_that_fit(font: &FontRef, width: u32) -> usize {
     (width as f32 / text_width(font, PxScale::from(KEY_FONT), "M")) as usize
 }
 
-fn fit(text: &str, chars: usize) -> String {
+pub(super) fn fit(text: &str, chars: usize) -> String {
     if text.chars().count() <= chars {
         return text.to_string();
     }
@@ -316,14 +316,14 @@ fn fit(text: &str, chars: usize) -> String {
     format!("{}…", kept.trim_end())
 }
 
-fn png(image: &RgbImage, filename: &str) -> Result<ReplyImage> {
+pub(super) fn png(image: &RgbImage, filename: &str) -> Result<ReplyImage> {
     let mut data = Vec::new();
     image.write_to(&mut Cursor::new(&mut data), ImageFormat::Png).context("failed to encode the map")?;
     Ok(ReplyImage { filename: filename.to_string(), mime: mime::IMAGE_PNG, data, width: image.width(), height: image.height(), animated: false })
 }
 
 /// Draws a sprite over the image, keeping what's under its transparent pixels.
-fn overlay(image: &mut RgbImage, sprite: &RgbaImage, left: u32, top: u32) {
+pub(super) fn overlay(image: &mut RgbImage, sprite: &RgbaImage, left: u32, top: u32) {
     for (x, y, pixel) in sprite.enumerate_pixels() {
         let (px, py) = (left + x, top + y);
         if px >= image.width() || py >= image.height() || pixel[3] == 0 {
@@ -420,7 +420,7 @@ fn circle(image: &mut RgbImage, cx: i32, cy: i32, radius: i32, colour: [u8; 3]) 
     }
 }
 
-fn rectangle(image: &mut RgbImage, left: i32, top: i32, right: i32, bottom: i32, colour: [u8; 3]) {
+pub(super) fn rectangle(image: &mut RgbImage, left: i32, top: i32, right: i32, bottom: i32, colour: [u8; 3]) {
     for y in top..=bottom {
         for x in left..=right {
             put(image, x, y, colour);

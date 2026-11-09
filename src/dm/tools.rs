@@ -120,7 +120,8 @@ impl LocalTools for RoundTools {
                     feature is a place worth naming, like an altar, a den, or a glowing crystal; \
                     set_look {{id, look}}, for anything including players, like one who says they're a wizard; \
                     move {{id, x, y}}; set_hp {{id, hp}}, where 0 means fallen; remove {{id}}, not for players; \
-                    give {{id, item}}; take {{id, item}}; set_quest {{quest}}. A look draws it as a picture, \
+                    give {{id, item}}; take {{id, item}}; set_stat {{id, stat, value}}, for counts like gold, XP, \
+                    level, or armour, up to 8 each, with a null value removing one; set_quest {{quest}}. A look draws it as a picture, \
                     and must be one of: {}. Pick the closest; something with no close look is left without one and \
                     drawn as a lettered token.",
                     legend.join(", "),

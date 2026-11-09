@@ -128,6 +128,45 @@ pub fn look(name: &str) -> Option<(RgbaImage, Option<RgbaImage>)> {
     Some((sprite(sheet, index), top))
 }
 
+/// Item looks, and other words for them, that an inventory item can be pictured by.
+const ITEM_WORDS: &[(&str, &str)] = &[
+    ("axe", "axe"),
+    ("bomb", "bomb"),
+    ("bottle", "bottle"),
+    ("vial", "bottle"),
+    ("flask", "bottle"),
+    ("bow", "bow"),
+    ("bucket", "bucket"),
+    ("chest", "chest"),
+    ("coin", "coin"),
+    ("coins", "coin"),
+    ("gold", "coin"),
+    ("dagger", "dagger"),
+    ("knife", "dagger"),
+    ("hammer", "hammer"),
+    ("key", "key"),
+    ("mana", "mana-potion"),
+    ("potion", "potion"),
+    ("elixir", "potion"),
+    ("shield", "shield"),
+    ("spear", "spear"),
+    ("sword", "sword"),
+    ("blade", "sword"),
+    ("wand", "wand"),
+    ("staff", "wand"),
+];
+
+/// A picture for an inventory item, from a word in its name, like the sword for
+/// "rusty sword". The last such word wins, since English puts the noun last.
+pub fn item_icon(item: &str) -> Option<RgbaImage> {
+    let lower = item.to_lowercase();
+    let name = lower
+        .split(|c: char| !c.is_alphanumeric())
+        .rev()
+        .find_map(|word| ITEM_WORDS.iter().find(|(word_for, _)| *word_for == word).map(|(_, name)| *name))?;
+    look(name).map(|(sprite, _)| sprite)
+}
+
 /// The tiles a map character is drawn with: its ground, and anything standing on it,
 /// like a tree on grass. `None` for ground the packs don't have, which is drawn in code.
 /// `x` and `y` vary plain grass a little, so a field isn't one tile repeated.
@@ -220,6 +259,21 @@ mod tests {
     /// one, like the tall tree's lower half that was once drawn as a tree, runs across it.
     fn cut_off_at_the_top(sprite: &RgbaImage) -> bool {
         (0..SIZE).filter(|&x| sprite.get_pixel(x, 0)[3] > 0).count() > 8
+    }
+
+    #[test]
+    fn pictures_inventory_items_by_their_names() {
+        let icon = |item: &str| item_icon(item).map(|sprite| sprite.into_raw());
+        let look_raw = |name: &str| look(name).map(|(sprite, _)| sprite.into_raw());
+        assert_eq!(icon("Rusty Sword"), look_raw("sword"));
+        assert_eq!(icon("12 gold coins"), look_raw("coin"));
+        assert_eq!(icon("potion of mana"), look_raw("mana-potion"), "the last word that has a picture wins");
+        assert_eq!(icon("Vial of holy water"), look_raw("bottle"));
+        assert_eq!(icon("Old map"), None);
+        assert_eq!(icon("Swordfish"), None, "whole words only");
+        for (_, look) in ITEM_WORDS {
+            assert!(is_look(look), "{look}");
+        }
     }
 
     #[test]

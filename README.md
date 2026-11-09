@@ -414,7 +414,8 @@ a thread on the `!dm` message, then sets the scene in the game room.
 In the game room, each message from a player is their character's action, and the bot
 reacts with ✅ to show it was counted. A round is played once every player who has joined
 has acted, or 60 seconds after the first action. `!dm go` plays it now, `!dm map` reposts
-the map, `!dm status` shows each character's health and what they carry, and `!dm end`
+the map, `!dm status` shows each character's health and what they carry, with the party
+card, and `!dm end`
 ends the game, for whoever started it. Other people in the room, and other commands,
 aren't part of the game.
 
@@ -425,7 +426,8 @@ ones, the world as it stands, and the round's actions. Claude plays it with thre
 - `roll_dice` rolls real dice, like `1d20+3`, so results aren't made up. The rolls are
   listed under the round's story.
 - `update_state` changes the world: the map, up to 24 by 16 squares, and the creatures,
-  items, and places on it, their health, what they carry, and the party's goal. Changes are checked, and a
+  items, and places on it, their health, what they carry, up to 8 stats each like gold or
+  XP, and the party's goal. Changes are checked, and a
   wrong one is refused and explained to Claude, so the map always matches the story.
   Players' characters start with 12 hp, and only their own players move them.
 - `end_round` gives the story for the game room and a one-line summary.
@@ -445,9 +447,12 @@ are numbered, like G1 and G2 for two grey wolves, and on the full-size map each 
 wears its label in a badge, coloured like its token, so it matches the key. A key beside the map names every creature with its health, every item and place,
 and each kind of ground shown, and a strip under it gives the round and the party's goal.
 Each round posts the story in the game room as formatted text, with a "Round 3" heading,
-the names of new creatures, items, and places in bold, and the dice rolled as a list, then
-the map as its own message under it. The thread on the `!dm` message gets the game's name
-and round in bold with the summary, then a smaller map, at the tiles' own size and without
+the names of new creatures, items, and places in bold, the party's goal, and the dice
+rolled as a list. The map follows as its own message, then the party card: a panel for
+each player with their character drawn large in their colour from the map, a health bar,
+their stats, and what they carry, with a picture for items the tile sheets have, like a
+sword, coins, or a potion. The thread on the `!dm` message gets the game's name and round
+in bold with the summary and the goal, then a smaller map, at the tiles' own size and without
 badges, with its key still full size. Text and map are separate messages because image
 captions don't show on every client.
 

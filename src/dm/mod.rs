@@ -9,6 +9,7 @@
 //! message, so the room it started from can follow along.
 
 mod map;
+mod party;
 mod sprites;
 mod state;
 mod store;
@@ -310,7 +311,15 @@ impl Dm {
                     Err(err) => warn!(?err, game = game.id, "failed to draw the map"),
                 }
             }
-            "status" => say(room, &status(game)).await,
+            "status" => {
+                say(room, &status(game)).await;
+                let (state, round) = (game.state.clone(), game.round);
+                match tokio::task::spawn_blocking(move || party::render(&state, round)).await? {
+                    Ok(Some(card)) => post_image(room, &card, None).await,
+                    Ok(None) => {}
+                    Err(err) => warn!(?err, game = game.id, "failed to draw the party card"),
+                }
+            }
             "end" if game.owner == event.sender.as_str() => {
                 store::end(&self.database, game.id)?;
                 self.log(game, Some(event.sender.as_str()), "end", json!({"reason": "ended by its starter", "rounds": game.round}));
@@ -431,27 +440,33 @@ impl Dm {
 
         let drawn_state = state.clone();
         let drawn_round = game.round + 1;
-        let maps = match tokio::task::spawn_blocking(move || map::render(&drawn_state, drawn_round)).await {
-            Ok(Ok(maps)) => Some(maps),
+        let pictures = tokio::task::spawn_blocking(move || {
+            Ok::<_, anyhow::Error>((map::render(&drawn_state, drawn_round)?, party::render(&drawn_state, drawn_round)?))
+        });
+        let (maps, party_card) = match pictures.await {
+            Ok(Ok((maps, card))) => (Some(maps), card),
             Ok(Err(err)) => {
                 warn!(?err, game = game.id, "failed to draw the map");
-                None
+                (None, None)
             }
             Err(err) => {
                 warn!(?err, game = game.id, "map task failed");
-                None
+                (None, None)
             }
         };
 
         // The story, then its map under it, as separate messages: captions don't show
         // on every client.
-        post_text(&room, &story_message(game.round + 1, &ending, &rolls), None).await;
+        post_text(&room, &story_message(game.round + 1, &ending, &rolls, &state.quest), None).await;
         if let Some((full, _)) = &maps {
             post_image(&room, full, None).await;
         }
+        if let Some(card) = &party_card {
+            post_image(&room, card, None).await;
+        }
 
         if let Some(main) = self.room(&game.main_room_id) {
-            post_text(&main, &thread_message(&game.name, game.round + 1, &ending), Some(&game.thread_root_id)).await;
+            post_text(&main, &thread_message(&game.name, game.round + 1, &ending, &state.quest), Some(&game.thread_root_id)).await;
             if let Some((_, small)) = &maps {
                 post_image(&main, small, Some(&game.thread_root_id)).await;
             }
@@ -596,9 +611,13 @@ pub fn export(database: &Database, game: Option<&str>, out: &mut impl std::io::W
     Ok(())
 }
 
-/// A round's story for the game room: a heading, the story, and the dice rolled.
-fn story_message(round: u32, ending: &Ending, rolls: &[String]) -> String {
+/// A round's story for the game room: a heading, the story, the party's goal, and the
+/// dice rolled.
+fn story_message(round: u32, ending: &Ending, rolls: &[String], goal: &str) -> String {
     let mut message = format!("### Round {round}\n\n{}", ending.narration.trim());
+    if !goal.trim().is_empty() && !ending.game_over {
+        message.push_str(&format!("\n\n🎯 **Goal:** {}", goal.trim()));
+    }
     if !rolls.is_empty() {
         message.push_str("\n\n🎲 **Rolls**\n");
         for roll in rolls {
@@ -611,9 +630,12 @@ fn story_message(round: u32, ending: &Ending, rolls: &[String]) -> String {
     message
 }
 
-/// A round's line for the thread in the room the game started from.
-fn thread_message(name: &str, round: u32, ending: &Ending) -> String {
+/// A round's line for the thread in the room the game started from, with the goal.
+fn thread_message(name: &str, round: u32, ending: &Ending, goal: &str) -> String {
     let mut message = format!("**{name}** · round {round}\n\n{}", capitalized(ending.summary.trim()));
+    if !goal.trim().is_empty() && !ending.game_over {
+        message.push_str(&format!("\n\n🎯 **Goal:** {}", goal.trim()));
+    }
     if ending.game_over {
         message.push_str("\n\n**The end.**");
     }
@@ -1081,14 +1103,20 @@ mod tests {
         let ending = Ending { narration: "The wolves flee.\n\nThe cave mouth glows.".to_string(), summary: "the party drove off the wolves".to_string(), game_over: false };
         let rolls = ["Alice attacks the wolf: 1d20+2 → 17".to_string(), "Wolf bites: 1d6 → 3".to_string()];
         assert_eq!(
-            story_message(3, &ending, &rolls),
-            "### Round 3\n\nThe wolves flee.\n\nThe cave mouth glows.\n\n🎲 **Rolls**\n\n- Alice attacks the wolf: 1d20+2 → 17\n- Wolf bites: 1d6 → 3"
+            story_message(3, &ending, &rolls, "Find the glow"),
+            "### Round 3\n\nThe wolves flee.\n\nThe cave mouth glows.\n\n🎯 **Goal:** Find the glow\n\n🎲 **Rolls**\n\n- Alice attacks the wolf: 1d20+2 → 17\n- Wolf bites: 1d6 → 3"
         );
-        assert_eq!(thread_message("cave-xxxx", 3, &ending), "**cave-xxxx** · round 3\n\nThe party drove off the wolves");
+        assert_eq!(
+            thread_message("cave-xxxx", 3, &ending, "Find the glow"),
+            "**cave-xxxx** · round 3\n\nThe party drove off the wolves\n\n🎯 **Goal:** Find the glow"
+        );
+        // No goal yet, no goal line.
+        assert_eq!(thread_message("cave-xxxx", 3, &ending, " "), "**cave-xxxx** · round 3\n\nThe party drove off the wolves");
 
+        // A finished story has no goal left.
         let over = Ending { game_over: true, ..ending };
-        assert_eq!(story_message(9, &over, &[]), "### Round 9\n\nThe wolves flee.\n\nThe cave mouth glows.\n\n**The end.** Thanks for playing!");
-        assert!(thread_message("cave-xxxx", 9, &over).ends_with("\n\n**The end.**"));
+        assert_eq!(story_message(9, &over, &[], "Find the glow"), "### Round 9\n\nThe wolves flee.\n\nThe cave mouth glows.\n\n**The end.** Thanks for playing!");
+        assert!(thread_message("cave-xxxx", 9, &over, "Find the glow").ends_with("The party drove off the wolves\n\n**The end.**"));
     }
 
     #[test]
