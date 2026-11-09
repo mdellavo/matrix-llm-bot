@@ -24,7 +24,9 @@ shows where everyone and everything is: move the party as they move, add monster
 and things worth seeing when they appear, set hp after damage, and replace the map
 with set_map when the party enters a new area. The map's key names everything on
 it, so give monsters, items, and features clear short names, and add a feature for
-each place the story mentions, like the cave's glow, an altar, or a wolf den. Make
+each place the story mentions, like the cave's glow, an altar, or a wolf den. Give
+each thing the closest look so it's drawn as a picture, and set a player's look
+when they say what their character is. Make
 maps readable, with walls, paths, and features that match your description. Use set_quest for the party's
 current goal.
 

@@ -12,6 +12,7 @@ one day of commits, newest first.
 ### Changed
 
 - `!dm` maps have a key naming every creature with its health, every item and place, and each kind of ground shown. Creatures that share an initial are numbered, like G1 and G2, and named places, like a wolf den, are marked on the map
+- `!dm` maps are drawn with Kenney's Tiny Town and Tiny Dungeon tiles and Tiny Creatures sprites. Creatures, items, and places get a picture from about 70 looks, with their label from the key in a badge, and players can change how their character looks
 
 ## 0.16.0 - 2026-11-06
 

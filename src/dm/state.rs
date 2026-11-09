@@ -56,6 +56,10 @@ pub struct Entity {
     /// The Matrix user who plays this character.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub player: Option<String>,
+    /// How it's drawn, from `sprites::LOOKS`. Without one it's a lettered token, or
+    /// for a player, a look picked by the order they joined.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub look: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -76,7 +80,19 @@ pub enum Change {
     /// A new area, replacing the whole map. Everything on it must be moved onto it.
     SetMap { rows: Vec<String> },
     SetTile { x: usize, y: usize, tile: String },
-    Add { id: String, kind: Kind, name: String, x: usize, y: usize, hp: Option<i32>, max_hp: Option<i32> },
+    Add {
+        id: String,
+        kind: Kind,
+        name: String,
+        x: usize,
+        y: usize,
+        hp: Option<i32>,
+        max_hp: Option<i32>,
+        #[serde(default)]
+        look: Option<String>,
+    },
+    /// How something is drawn, from `sprites::LOOKS`, like a player who says they're an elf.
+    SetLook { id: String, look: String },
     Move { id: String, x: usize, y: usize },
     SetHp { id: String, hp: i32 },
     Remove { id: String },
@@ -103,6 +119,7 @@ impl GameState {
                 max_hp: Some(PLAYER_HP),
                 items: Vec::new(),
                 player: Some(user_id.clone()),
+                look: None,
             })
             .collect();
         Self { width, height, rows: vec![".".repeat(width); height], entities, quest: String::new() }
@@ -151,7 +168,7 @@ impl GameState {
                 let row: Vec<char> = self.rows[*y].chars().enumerate().map(|(column, old)| if column == *x { tile } else { old }).collect();
                 self.rows[*y] = row.into_iter().collect();
             }
-            Change::Add { id, kind, name, x, y, hp, max_hp } => {
+            Change::Add { id, kind, name, x, y, hp, max_hp, look } => {
                 if *kind == Kind::Player {
                     return Err("players are only the party's own characters, which already exist".to_string());
                 }
@@ -165,6 +182,9 @@ impl GameState {
                 check_name(name)?;
                 let hp = hp.map(check_hp).transpose()?;
                 let max_hp = max_hp.or(hp).map(check_hp).transpose()?;
+                if let Some(look) = look {
+                    check_look(look)?;
+                }
                 self.in_bounds(*x, *y)?;
                 self.entities.push(Entity {
                     id: id.clone(),
@@ -176,7 +196,12 @@ impl GameState {
                     max_hp,
                     items: Vec::new(),
                     player: None,
+                    look: look.clone(),
                 });
+            }
+            Change::SetLook { id, look } => {
+                check_look(look)?;
+                self.entity_mut(id)?.look = Some(look.clone());
             }
             Change::Move { id, x, y } => {
                 self.in_bounds(*x, *y)?;
@@ -248,6 +273,14 @@ fn check_name(name: &str) -> Result<(), String> {
     }
 }
 
+fn check_look(look: &str) -> Result<(), String> {
+    if super::sprites::is_look(look) {
+        Ok(())
+    } else {
+        Err(format!("there's no look called {look}; leave it out to draw a lettered token"))
+    }
+}
+
 fn check_hp(hp: i32) -> Result<i32, String> {
     if (0..=MAX_HP).contains(&hp) { Ok(hp) } else { Err(format!("hp is 0 to {MAX_HP}")) }
 }
@@ -280,7 +313,8 @@ mod tests {
                 r#"[
                 {"op": "set_map", "rows": ["TTTT..", "T....c", "......", "~~...."]},
                 {"op": "move", "id": "alice", "x": 1, "y": 2},
-                {"op": "add", "id": "wolf-1", "kind": "monster", "name": "Wolf", "x": 4, "y": 1, "hp": 5},
+                {"op": "add", "id": "wolf-1", "kind": "monster", "name": "Wolf", "x": 4, "y": 1, "hp": 5, "look": "wolf"},
+                {"op": "set_look", "id": "alice", "look": "ranger"},
                 {"op": "set_tile", "x": 0, "y": 3, "tile": "."},
                 {"op": "give", "id": "alice", "item": "torch"},
                 {"op": "set_quest", "quest": "Find the glow"}
@@ -291,6 +325,8 @@ mod tests {
         assert_eq!(state.tile(5, 1), 'c');
         assert_eq!(state.tile(0, 3), '.');
         assert_eq!(state.entity("wolf-1").unwrap().max_hp, Some(5));
+        assert_eq!(state.entity("wolf-1").unwrap().look.as_deref(), Some("wolf"));
+        assert_eq!(state.entity("alice").unwrap().look.as_deref(), Some("ranger"));
         assert_eq!(state.entity("alice").unwrap().items, ["torch"]);
 
         state.apply(&changes(r#"[{"op": "set_hp", "id": "wolf-1", "hp": 99}, {"op": "take", "id": "alice", "item": "Torch"}]"#)).unwrap();
@@ -314,6 +350,8 @@ mod tests {
             (r#"[{"op": "add", "id": "alice", "kind": "npc", "name": "Twin", "x": 1, "y": 1}]"#, "alice already exists"),
             (r#"[{"op": "set_tile", "x": 1, "y": 1, "tile": "TT"}]"#, "exactly one character"),
             (r#"[{"op": "take", "id": "alice", "item": "sword"}]"#, "isn't carrying sword"),
+            (r#"[{"op": "set_look", "id": "alice", "look": "astronaut"}]"#, "no look called astronaut"),
+            (r#"[{"op": "add", "id": "w", "kind": "monster", "name": "Wolf", "x": 1, "y": 1, "look": "wolfish"}]"#, "no look called wolfish"),
         ] {
             let mut state = original.clone();
             // A good change first, to show nothing is kept when a later one fails.

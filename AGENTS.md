@@ -30,7 +30,7 @@ To test Claude calls without the API, use the fake Messages server in `src/llm.r
 | `src/browser.rs`, `src/browser_proxy.rs` | Rendering pages in headless Chrome, and the proxy that's its only way out |
 | `src/db.rs` | The SQLite database and its schema migrations |
 | `src/direct_rooms.rs` | Private rooms, and who may start one |
-| `src/dm/` | `!dm` games: rooms and rounds, the checked world state, the round's tools, the map, and the DM's prompt in `prompt.md` |
+| `src/dm/`, `assets/dm/` | `!dm` games: rooms and rounds, the checked world state, the round's tools, the map and its tile sheets, and the DM's prompt in `prompt.md` |
 | `src/notify.rs`, `src/startup_notice.rs` | Private messages to `notify_users`: alerts, and the start notice |
 | `src/legacy_import.rs` | One-time import of pre-SQLite data files |
 | `src/message_log.rs` | Stored messages and reactions, transcripts, and search |
