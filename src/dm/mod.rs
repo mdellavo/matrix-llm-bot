@@ -9,6 +9,7 @@
 //! message, so the room it started from can follow along.
 
 mod map;
+mod sprites;
 mod state;
 mod store;
 mod tools;

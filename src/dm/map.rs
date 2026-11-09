@@ -1,13 +1,19 @@
 //! Draws a game's map, with a key beside it naming everything on it: each creature
 //! with its health, each item and place by number, and each kind of ground shown. A
 //! strip under the map gives the round and the party's goal.
+//!
+//! Ground and anything with a look are drawn from the Kenney tile sheets (see
+//! `sprites`). On the full-size map each thing also wears a badge with its label from
+//! the key, so two wolves can be told apart.
 
 use std::io::Cursor;
 
 use ab_glyph::{Font, FontRef, PxScale, ScaleFont};
 use anyhow::{Context, Result};
-use image::{ImageFormat, Rgb, RgbImage};
+use image::imageops::{self, FilterType};
+use image::{ImageFormat, Rgb, RgbImage, RgbaImage};
 
+use super::sprites;
 use super::state::{Entity, GameState, Kind, TILES};
 use crate::message_log::ReplyImage;
 
@@ -17,18 +23,21 @@ struct Scale {
     square: u32,
     token_radius: i32,
     token_font: f32,
+    /// Labels on the map itself. At the small size they'd hide the sprites.
+    badges: bool,
 }
 
-/// For the game room.
-const FULL: Scale = Scale { square: 32, token_radius: 12, token_font: 15.0 };
-/// For the thread in the room the game started from: a smaller map, with the key at
-/// the same readable size.
-const SMALL: Scale = Scale { square: 20, token_radius: 8, token_font: 11.0 };
+/// For the game room: the tiles at twice their size.
+const FULL: Scale = Scale { square: 32, token_radius: 12, token_font: 15.0, badges: true };
+/// For the thread in the room the game started from: the tiles at their own size,
+/// with the key still full size.
+const SMALL: Scale = Scale { square: 16, token_radius: 6, token_font: 9.0, badges: false };
 
-const KEY_WIDTH: u32 = 250;
+const KEY_WIDTH: u32 = 270;
 const KEY_LINE: u32 = 22;
 const KEY_PADDING: u32 = 12;
 const KEY_FONT: f32 = 14.0;
+const BADGE_FONT: f32 = 10.0;
 const STRIP_HEIGHT: u32 = 30;
 
 const BACKGROUND: Rgb<u8> = Rgb([30, 31, 34]);
@@ -50,6 +59,8 @@ struct Marker {
     label: String,
     colour: [u8; 3],
     shape: Shape,
+    /// From its look. Without one, it's drawn as `shape` with its label inside.
+    sprite: Option<RgbaImage>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -79,6 +90,10 @@ fn markers(state: &GameState) -> Vec<Marker> {
         .map(|(index, entity)| {
             let fallen = entity.hp == Some(0);
             let colour = |colour| if fallen { FALLEN } else { colour };
+            let look = |default: Option<&str>| {
+                let sprite = entity.look.as_deref().or(default).and_then(sprites::look);
+                if fallen { sprite.map(|sprite| greyed(&sprite)) } else { sprite }
+            };
             match entity.kind {
                 Kind::Player | Kind::Monster | Kind::Npc => {
                     let letter = initial(entity);
@@ -93,23 +108,24 @@ fn markers(state: &GameState) -> Vec<Marker> {
                         Some(number) if sharing.len() > 1 => format!("{letter}{}", number + 1),
                         _ => letter,
                     };
-                    let base = match entity.kind {
+                    let (base, default_look) = match entity.kind {
                         Kind::Player => {
                             players += 1;
-                            PLAYER_COLOURS[(players - 1) % PLAYER_COLOURS.len()]
+                            let order = (players - 1) % PLAYER_COLOURS.len();
+                            (PLAYER_COLOURS[order], Some(sprites::PLAYER_LOOKS[order]))
                         }
-                        Kind::Monster => MONSTER,
-                        _ => NPC,
+                        Kind::Monster => (MONSTER, None),
+                        _ => (NPC, None),
                     };
-                    Marker { label, colour: colour(base), shape: Shape::Token }
+                    Marker { label, colour: colour(base), shape: Shape::Token, sprite: look(default_look) }
                 }
                 Kind::Item => {
                     items += 1;
-                    Marker { label: items.to_string(), colour: ITEM, shape: Shape::Square }
+                    Marker { label: items.to_string(), colour: ITEM, shape: Shape::Square, sprite: look(None) }
                 }
                 Kind::Feature => {
                     places += 1;
-                    Marker { label: places.to_string(), colour: FEATURE, shape: Shape::Diamond }
+                    Marker { label: places.to_string(), colour: FEATURE, shape: Shape::Diamond, sprite: look(None) }
                 }
             }
         })
@@ -127,19 +143,32 @@ fn draw(state: &GameState, round: u32, markers: &[Marker], scale: Scale, font: &
 
     for y in 0..state.height {
         for x in 0..state.width {
-            draw_square(&mut image, x as u32 * scale.square, y as u32 * scale.square, scale.square, state.tile(x, y));
+            draw_ground(&mut image, x as u32 * scale.square, y as u32 * scale.square, scale.square, state.tile(x, y), x, y);
         }
     }
     // Places and items under creatures, so a creature standing on one is still seen.
     let mut order: Vec<usize> = (0..state.entities.len()).collect();
     order.sort_by_key(|&index| markers[index].shape == Shape::Token);
-    for index in order {
+    for &index in &order {
         let entity = &state.entities[index];
-        let (cx, cy) = (
-            (entity.x as u32 * scale.square + scale.square / 2) as i32,
-            (entity.y as u32 * scale.square + scale.square / 2) as i32,
-        );
-        draw_marker(&mut image, font, &markers[index], cx, cy, scale.token_radius, scale.token_font);
+        let (left, top) = (entity.x as u32 * scale.square, entity.y as u32 * scale.square);
+        let marker = &markers[index];
+        match &marker.sprite {
+            Some(sprite) => overlay(&mut image, &imageops::resize(sprite, scale.square, scale.square, FilterType::Nearest), left, top),
+            None => {
+                let (cx, cy) = ((left + scale.square / 2) as i32, (top + scale.square / 2) as i32);
+                draw_marker(&mut image, font, marker, cx, cy, scale.token_radius, scale.token_font);
+            }
+        }
+    }
+    // Badges last, so none is hidden under a neighbour's sprite.
+    if scale.badges {
+        for &index in &order {
+            let entity = &state.entities[index];
+            if markers[index].sprite.is_some() {
+                draw_badge(&mut image, font, &markers[index], entity.x as u32 * scale.square, entity.y as u32 * scale.square);
+            }
+        }
     }
 
     let text = |image: &mut RgbImage, x: u32, baseline: u32, line: &str, ink: [u8; 3]| {
@@ -154,11 +183,15 @@ fn draw(state: &GameState, round: u32, markers: &[Marker], scale: Scale, font: &
             KeyLine::Heading(heading) => text(&mut image, key_left, baseline, heading, HEADING),
             KeyLine::Marker(index, description) => {
                 let marker = &markers[*index];
-                draw_marker(&mut image, font, marker, (key_left + 10) as i32, (top + KEY_LINE / 2) as i32, 9, 11.0);
-                text(&mut image, key_left + 26, baseline, &fit(description, fits), TEXT);
+                match &marker.sprite {
+                    Some(sprite) => overlay(&mut image, sprite, key_left + 2, top + (KEY_LINE - sprites::SIZE) / 2),
+                    None => draw_marker(&mut image, font, marker, (key_left + 10) as i32, (top + KEY_LINE / 2) as i32, 9, 11.0),
+                }
+                let line = format!("{} {description}", marker.label);
+                text(&mut image, key_left + 26, baseline, &fit(&line, fits), TEXT);
             }
             KeyLine::Ground(tile, name) => {
-                draw_square(&mut image, key_left + 1, top + 2, KEY_LINE - 4, *tile);
+                draw_ground(&mut image, key_left + 1, top + 2, KEY_LINE - 4, *tile, 0, 1);
                 text(&mut image, key_left + 26, baseline, &fit(name, fits), TEXT);
             }
         }
@@ -216,6 +249,7 @@ fn key_lines(state: &GameState) -> Vec<KeyLine> {
     lines
 }
 
+/// A lettered or numbered token, for things without a look.
 fn draw_marker(image: &mut RgbImage, font: &FontRef, marker: &Marker, cx: i32, cy: i32, radius: i32, font_size: f32) {
     match marker.shape {
         Shape::Token => {
@@ -234,15 +268,32 @@ fn draw_marker(image: &mut RgbImage, font: &FontRef, marker: &Marker, cx: i32, c
     // Two-character labels are drawn smaller to fit.
     let size = if marker.label.chars().count() > 1 { font_size * 0.8 } else { font_size };
     let scale = PxScale::from(size);
+    let width = text_width(font, scale, &marker.label);
+    crate::cast_sheet::draw_text(image, font, scale, cx as f32 - width / 2.0, cy as f32 + size * 0.36, &marker.label, ink_for(marker.colour));
+}
+
+/// A sprite's label from the key, in the top-left corner of its square, in the
+/// colour that says what it is: a player's own colour, red for monsters, and so on.
+fn draw_badge(image: &mut RgbImage, font: &FontRef, marker: &Marker, left: u32, top: u32) {
+    let scale = PxScale::from(BADGE_FONT);
+    let width = text_width(font, scale, &marker.label).ceil() as i32 + 4;
+    let (left, top) = (left as i32, top as i32);
+    rectangle(image, left, top, left + width + 1, top + 12, OUTLINE);
+    rectangle(image, left + 1, top + 1, left + width, top + 11, marker.colour);
+    crate::cast_sheet::draw_text(image, font, scale, (left + 3) as f32, (top + 9) as f32, &marker.label, ink_for(marker.colour));
+}
+
+fn ink_for(colour: [u8; 3]) -> [u8; 3] {
+    if colour.iter().map(|&c| u32::from(c)).sum::<u32>() > 450 { OUTLINE } else { TEXT }
+}
+
+fn text_width(font: &FontRef, scale: PxScale, text: &str) -> f32 {
     let scaled = font.as_scaled(scale);
-    let width: f32 = marker.label.chars().map(|c| scaled.h_advance(font.glyph_id(c))).sum();
-    let ink = if marker.colour.iter().map(|&c| u32::from(c)).sum::<u32>() > 450 { OUTLINE } else { TEXT };
-    crate::cast_sheet::draw_text(image, font, scale, cx as f32 - width / 2.0, cy as f32 + size * 0.36, &marker.label, ink);
+    text.chars().map(|c| scaled.h_advance(font.glyph_id(c))).sum()
 }
 
 fn chars_that_fit(font: &FontRef, width: u32) -> usize {
-    let scale = PxScale::from(KEY_FONT);
-    (width as f32 / font.as_scaled(scale).h_advance(font.glyph_id('M'))) as usize
+    (width as f32 / text_width(font, PxScale::from(KEY_FONT), "M")) as usize
 }
 
 fn fit(text: &str, chars: usize) -> String {
@@ -259,61 +310,83 @@ fn png(image: &RgbImage, filename: &str) -> Result<ReplyImage> {
     Ok(ReplyImage { filename: filename.to_string(), mime: mime::IMAGE_PNG, data, width: image.width(), height: image.height(), animated: false })
 }
 
-const GRASS: [u8; 3] = [86, 125, 70];
-const WATER: [u8; 3] = [52, 98, 160];
-
-/// One square of ground, `size` pixels across, with a little drawing for what it is.
-fn draw_square(image: &mut RgbImage, left: u32, top: u32, size: u32, tile: char) {
-    let base = match tile {
-        '.' | 'T' | 'c' | '*' => GRASS,
-        ',' => [139, 115, 85],
-        '_' => [118, 118, 124],
-        '#' | '+' => [64, 64, 70],
-        '^' => [98, 92, 86],
-        '~' => WATER,
-        ' ' => [14, 14, 16],
-        _ => [92, 70, 92],
-    };
-    for y in top..top + size {
-        for x in left..left + size {
-            // A faint grid, so squares can be counted.
-            let shade = if x == left || y == top { 0.82 } else { 1.0 };
-            image.put_pixel(x, y, Rgb(base.map(|c| (f32::from(c) * shade) as u8)));
+/// Draws a sprite over the image, keeping what's under its transparent pixels.
+fn overlay(image: &mut RgbImage, sprite: &RgbaImage, left: u32, top: u32) {
+    for (x, y, pixel) in sprite.enumerate_pixels() {
+        let (px, py) = (left + x, top + y);
+        if px >= image.width() || py >= image.height() || pixel[3] == 0 {
+            continue;
+        }
+        let alpha = f32::from(pixel[3]) / 255.0;
+        let under = image.get_pixel_mut(px, py);
+        for channel in 0..3 {
+            under[channel] = (f32::from(pixel[channel]) * alpha + f32::from(under[channel]) * (1.0 - alpha)).round() as u8;
         }
     }
+}
+
+/// A fallen creature, faded to grey.
+fn greyed(sprite: &RgbaImage) -> RgbaImage {
+    let mut grey = sprite.clone();
+    for pixel in grey.pixels_mut() {
+        let luma = (u32::from(pixel[0]) * 3 + u32::from(pixel[1]) * 6 + u32::from(pixel[2])) / 10;
+        let faded = (luma * 7 / 10) as u8;
+        (pixel[0], pixel[1], pixel[2]) = (faded, faded, faded);
+    }
+    grey
+}
+
+const GRASS: [u8; 3] = [86, 125, 70];
+const WATER: [u8; 3] = [56, 128, 196];
+const RIPPLE: [u8; 3] = [120, 178, 228];
+
+/// One square of ground, `size` pixels across: a tile from the sheets where the packs
+/// have one, otherwise drawn here in the same flat style.
+fn draw_ground(image: &mut RgbImage, left: u32, top: u32, size: u32, tile: char, x: usize, y: usize) {
+    let grass = || sprites::ground('.', x, y).map(|(grass, _)| grass);
+    if let Some((ground, standing)) = sprites::ground(tile, x, y) {
+        // Some tiles, like the cave's doorway, have see-through corners.
+        if let Some(grass) = grass() {
+            overlay(image, &imageops::resize(&grass, size, size, FilterType::Nearest), left, top);
+        }
+        overlay(image, &imageops::resize(&ground, size, size, FilterType::Nearest), left, top);
+        if let Some(standing) = standing {
+            overlay(image, &imageops::resize(&standing, size, size, FilterType::Nearest), left, top);
+        }
+        return;
+    }
+
+    let base = match tile {
+        '~' => WATER,
+        '^' => [112, 104, 96],
+        ' ' => [14, 14, 16],
+        '*' => GRASS,
+        _ => [92, 70, 92],
+    };
+    rectangle(image, left as i32, top as i32, (left + size) as i32 - 1, (top + size) as i32 - 1, base);
     let (cx, cy, s) = ((left + size / 2) as i32, (top + size / 2) as i32, size as i32);
+    // In whole steps of the tiles' own pixels, so drawn ground matches the sprites.
+    let pixel = (s / 16).max(1);
     match tile {
-        'T' => {
-            circle(image, cx, cy, s * 3 / 8, [34, 78, 38]);
-            circle(image, cx - s / 10, cy - s / 10, s / 6, [52, 104, 54]);
-        }
-        'c' => ellipse(image, cx, cy + s / 10, s * 3 / 8, s / 4, [10, 10, 12]),
-        '*' => {
-            circle(image, cx, cy, s * 5 / 16, [250, 232, 140]);
-            circle(image, cx, cy, s / 6, [255, 250, 220]);
-        }
         '~' => {
-            for x in left + size / 5..left + size - size / 5 {
-                image.put_pixel(x, top + size * 3 / 8, Rgb([92, 140, 200]));
-                image.put_pixel(x, top + size * 5 / 8, Rgb([92, 140, 200]));
+            for (row, offset) in [(5, 2), (11, 8)] {
+                let ripple_top = top as i32 + row * s / 16;
+                rectangle(image, left as i32 + offset * s / 16, ripple_top, left as i32 + (offset + 5) * s / 16, ripple_top + pixel - 1, RIPPLE);
             }
         }
-        '#' => {
-            for x in left..left + size {
-                image.put_pixel(x, top + size / 2, Rgb([84, 84, 92]));
-            }
-            for y in top..top + size / 2 {
-                image.put_pixel(left + size / 2, y, Rgb([84, 84, 92]));
-            }
-        }
-        '+' => rectangle(image, left as i32 + s / 4, top as i32 + s / 8, left as i32 + s - s / 4 - 1, top as i32 + s - s / 16 - 1, [128, 84, 44]),
         '^' => {
             let peak = s * 7 / 16;
             for row in 0..peak {
-                for x in (cx - row)..=(cx + row) {
-                    image.put_pixel(x as u32, (top as i32 + s / 4 + row) as u32, Rgb([130, 122, 112]));
-                }
+                let shade = if row < peak / 3 { [236, 236, 240] } else { [150, 142, 132] };
+                rectangle(image, cx - row, top as i32 + s / 4 + row, cx + row, top as i32 + s / 4 + row, shade);
             }
+        }
+        '*' => {
+            if let Some(grass) = grass() {
+                overlay(image, &imageops::resize(&grass, size, size, FilterType::Nearest), left, top);
+            }
+            circle(image, cx, cy, s * 5 / 16, [250, 232, 140]);
+            circle(image, cx, cy, s / 6, [255, 250, 220]);
         }
         _ => {}
     }
@@ -326,13 +399,9 @@ fn put(image: &mut RgbImage, x: i32, y: i32, colour: [u8; 3]) {
 }
 
 fn circle(image: &mut RgbImage, cx: i32, cy: i32, radius: i32, colour: [u8; 3]) {
-    ellipse(image, cx, cy, radius, radius, colour);
-}
-
-fn ellipse(image: &mut RgbImage, cx: i32, cy: i32, rx: i32, ry: i32, colour: [u8; 3]) {
-    for y in -ry..=ry {
-        for x in -rx..=rx {
-            if (x * x) as f32 / (rx * rx).max(1) as f32 + (y * y) as f32 / (ry * ry).max(1) as f32 <= 1.0 {
+    for y in -radius..=radius {
+        for x in -radius..=radius {
+            if x * x + y * y <= radius * radius {
                 put(image, cx + x, cy + y, colour);
             }
         }
@@ -371,11 +440,11 @@ mod tests {
             {"op": "set_map", "rows": ["~~~~~~~~~~~~", "............", "......T.....", "...........c"]},
             {"op": "move", "id": "alice", "x": 1, "y": 1},
             {"op": "move", "id": "will", "x": 2, "y": 1},
-            {"op": "add", "id": "wolf-1", "kind": "monster", "name": "Wolf", "x": 4, "y": 2, "hp": 5},
+            {"op": "add", "id": "wolf-1", "kind": "monster", "name": "Wolf", "x": 4, "y": 2, "hp": 5, "look": "wolf"},
             {"op": "add", "id": "wolf-2", "kind": "monster", "name": "Wolf", "x": 5, "y": 2, "hp": 5},
             {"op": "set_hp", "id": "wolf-2", "hp": 0},
             {"op": "add", "id": "bones", "kind": "item", "name": "Old bones", "x": 8, "y": 1},
-            {"op": "add", "id": "glow", "kind": "feature", "name": "Faint glow", "x": 11, "y": 3},
+            {"op": "add", "id": "glow", "kind": "feature", "name": "Faint glow", "x": 11, "y": 3, "look": "crystal"},
             {"op": "set_quest", "quest": "Find the glow"}
         ]"#,
         )
@@ -386,18 +455,21 @@ mod tests {
 
     #[test]
     fn labels_everything_so_the_key_can_name_it() {
-        let labels: Vec<String> = markers(&scene()).into_iter().map(|marker| marker.label).collect();
+        let markers = markers(&scene());
+        let labels: Vec<&str> = markers.iter().map(|marker| marker.label.as_str()).collect();
         // Alice stands alone; Will and the two wolves share W, so they're numbered.
         assert_eq!(labels, ["A", "W1", "W2", "W3", "1", "1"]);
-        let markers = markers(&scene());
+        // Players look like adventurers by default; things given a look use it, and
+        // others are tokens.
+        let drawn: Vec<bool> = markers.iter().map(|marker| marker.sprite.is_some()).collect();
+        assert_eq!(drawn, [true, true, true, false, false, true]);
         assert_eq!(markers[3].colour, FALLEN, "the fallen wolf is greyed out");
         assert_eq!((markers[4].shape, markers[5].shape), (Shape::Square, Shape::Diamond));
     }
 
     #[test]
     fn the_key_names_creatures_with_health_items_places_and_ground() {
-        let state = scene();
-        let key: Vec<String> = key_lines(&state)
+        let key: Vec<String> = key_lines(&scene())
             .into_iter()
             .map(|line| match line {
                 KeyLine::Heading(heading) => format!("# {heading}"),
@@ -437,15 +509,15 @@ mod tests {
         let image = image::load_from_memory(&full.data).unwrap().to_rgb8();
         let square = FULL.square;
         let at = |x: u32, y: u32, dx: u32, dy: u32| image.get_pixel(x * square + dx, y * square + dy).0;
-        assert_eq!(at(0, 0, 23, 23), WATER);
-        assert_eq!(at(3, 1, 23, 23), GRASS);
-        // Alice's token, the first wolf's, and the bones' square, each in its colour.
-        assert_eq!(at(1, 1, 16 + 9, 16), PLAYER_COLOURS[0]);
-        assert_eq!(at(4, 2, 16 + 9, 16), MONSTER);
+        assert_eq!(at(0, 0, 1, 1), WATER);
+        // Alice's badge, in her colour, in the corner of her square.
+        assert_eq!(at(1, 1, 3, 3), PLAYER_COLOURS[0]);
+        // The fallen wolf has no look, so it's a grey token.
+        assert_eq!(at(5, 2, 16 + 9, 16), FALLEN);
+        // The bones' numbered square.
         assert_eq!(at(8, 1, 16 + 9, 16 + 9), ITEM);
-        // The key has its first creature's token beside the map.
-        let key_token = image.get_pixel(12 * square + KEY_PADDING + 10 + 6, KEY_PADDING + KEY_LINE + KEY_LINE / 2).0;
-        assert_eq!(key_token, PLAYER_COLOURS[0]);
+        // Grass comes from the tile sheet, so it isn't the drawn colour.
+        assert_ne!(at(3, 3, 8, 8), GRASS);
     }
 
     #[test]

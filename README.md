@@ -430,15 +430,23 @@ ones, the world as it stands, and the round's actions. Claude plays it with thre
   Players' characters start with 12 hp, and only their own players move them.
 - `end_round` gives the story for the game room and a one-line summary.
 
-The bot draws the map from that state each round: coloured squares for the ground, a
-lettered token for each creature, red for monsters and pink for other characters, numbered
-gold squares for items, and numbered pink diamonds for named places, like a wolf den or
-an altar. Creatures that share an initial are numbered, like G1 and G2 for two grey
-wolves. A key beside the map names every creature with its health, every item and place,
+The bot draws the map from that state each round, with tiles and sprites from Kenney's
+[Tiny Town](https://kenney.nl/assets/tiny-town) and
+[Tiny Dungeon](https://kenney.nl/assets/tiny-dungeon) and Clint Bellanger's
+[Tiny Creatures](https://clintbellanger.itch.io/tiny-creatures), all CC0 (see
+`assets/dm/README.md`). Grass, paths, stone floors, walls, doors, cave mouths, and trees
+come from the tile sheets, and water, mountains, and glowing spots are drawn to match.
+Claude gives each creature, item, and place a look from about 70 names, like `wolf`,
+`skeleton`, `potion`, or `gravestone`, and can change a player's when they say what their
+character is. Players start as adventurers in the order they joined. Anything without a
+close look is a lettered token: red for monsters, pink for other characters, numbered gold
+squares for items, and numbered pink diamonds for places. Creatures that share an initial
+are numbered, like G1 and G2 for two grey wolves, and on the full-size map each sprite
+wears its label in a badge, coloured like its token, so it matches the key. A key beside the map names every creature with its health, every item and place,
 and each kind of ground shown, and a strip under it gives the round and the party's goal.
 The story is posted in the game room as the map's caption. The summary goes to the `!dm`
-thread as the caption of a smaller map, with its key still full size, one message per
-round. Clients that don't show captions show the text as the image's name.
+thread as the caption of a smaller map, at the tiles' own size and without badges, with
+its key still full size, one message per round. Clients that don't show captions show the text as the image's name.
 
 Games, players, waiting actions, and every round are kept in the database, so a restart
 picks up where it left off. A round that fails keeps its actions for `!dm go` to retry. At
