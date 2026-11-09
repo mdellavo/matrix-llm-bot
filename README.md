@@ -444,9 +444,12 @@ squares for items, and numbered pink diamonds for places. Creatures that share a
 are numbered, like G1 and G2 for two grey wolves, and on the full-size map each sprite
 wears its label in a badge, coloured like its token, so it matches the key. A key beside the map names every creature with its health, every item and place,
 and each kind of ground shown, and a strip under it gives the round and the party's goal.
-The story is posted in the game room as the map's caption. The summary goes to the `!dm`
-thread as the caption of a smaller map, at the tiles' own size and without badges, with
-its key still full size, one message per round. Clients that don't show captions show the text as the image's name.
+Each round posts the story in the game room as formatted text, with a "Round 3" heading,
+the names of new creatures, items, and places in bold, and the dice rolled as a list, then
+the map as its own message under it. The thread on the `!dm` message gets the game's name
+and round in bold with the summary, then a smaller map, at the tiles' own size and without
+badges, with its key still full size. Text and map are separate messages because image
+captions don't show on every client.
 
 Games, players, waiting actions, and every round are kept in the database, so a restart
 picks up where it left off. A round that fails keeps its actions for `!dm go` to retry. At
@@ -454,6 +457,31 @@ most 3 games run at once, a game ends after 150 rounds, and the cost limit pause
 like everything else. A round costs about 4¢. Game rooms are left off the status page and
 out of `!stats`, and their messages are kept in the game's own tables rather than the
 message log.
+
+Every game also keeps a full log in the `game_log` table, for working out afterwards how
+the DM played and what each round cost:
+
+- the start, with the premise and party, and each player's action and `!dm` command, with
+  who sent it
+- each round's prompt: the system prompt and the user turn Claude was given
+- every request to Claude and its full response, including token usage and stop reason.
+  Only a round's first request repeats the system prompt and tool definitions
+- every tool call: each roll, change to the world, and the ending, with what it said back,
+  including changes that were refused and why
+- each round's story, summary, rolls, and actions, and the world after it
+- rounds that failed or were paused, and why, and the game's end
+
+Export a game's log as JSON lines, one entry per line after a first line describing the
+game, by its name or number. Without one, it lists the games:
+
+```sh
+docker exec matrix-llm-bot matrix-llm-bot export-game                  # list games
+docker exec matrix-llm-bot matrix-llm-bot export-game cave-in-the-woods-x7k2 > game.jsonl
+```
+
+The export reads the database directly and doesn't log in to Matrix, so it's safe to run
+while the bot is up. The log holds everything said in the game room and every prompt, so
+treat it like the rest of the database.
 
 ### Reactions
 

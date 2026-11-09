@@ -3,6 +3,16 @@
 Notable changes to matrix-llm-bot, built from the git history. Each version covers
 one day of commits, newest first.
 
+## 0.18.0 - 2026-11-09
+
+### Added
+
+- A full log of each `!dm` game for analysis: player actions and commands, each round's prompt, every request to Claude and its response, every roll and change to the world with its result, each round's outcome, and failed rounds. `matrix-llm-bot export-game <name>` exports it as JSON lines
+
+### Changed
+
+- `!dm` posts each round's story as its own formatted message, with a round heading, names in bold, and the dice rolled as a list, then the map under it, in place of a caption on the map, which some clients didn't show. The thread gets the same treatment
+
 ## 0.17.0 - 2026-11-08
 
 ### Added

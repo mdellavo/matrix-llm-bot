@@ -56,14 +56,20 @@ const DEFAULT_LOG_FILTER: &str = "info,matrix_sdk_base::client=warn,matrix_sdk_c
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // `matrix-llm-bot export-game [name]` prints a `!dm` game's log as JSON lines, or
+    // lists the games. Before logging starts, since logs also go to stdout.
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.first().map(String::as_str) == Some("export-game") {
+        let config = Config::load(&config_path())?;
+        let database = db::Database::open(&config.database_path)?;
+        return dm::export(&database, args.get(1).map(String::as_str), &mut std::io::stdout().lock());
+    }
+
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(DEFAULT_LOG_FILTER)))
         .init();
 
-    let config_path = std::env::var("MATRIX_LLM_BOT_CONFIG")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("config.toml"));
-    let config = Config::load(&config_path)?;
+    let config = Config::load(&config_path())?;
 
     let bot = Bot::new(&config).await?;
     bot.join_configured_rooms(&config.rooms).await?;
@@ -93,4 +99,8 @@ async fn main() -> Result<()> {
     bot.run().await?;
 
     Ok(())
+}
+
+fn config_path() -> PathBuf {
+    std::env::var("MATRIX_LLM_BOT_CONFIG").map(PathBuf::from).unwrap_or_else(|_| PathBuf::from("config.toml"))
 }

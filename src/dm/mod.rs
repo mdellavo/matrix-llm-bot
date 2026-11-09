@@ -19,6 +19,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use serde_json::json;
 use matrix_sdk::attachment::{AttachmentConfig, AttachmentInfo, BaseImageInfo};
 use matrix_sdk::room::reply::{EnforceThread, Reply};
 use matrix_sdk::ruma::api::client::room::create_room::v3::{Request as CreateRoomRequest, RoomPreset};
@@ -27,7 +28,6 @@ use matrix_sdk::ruma::events::relation::Thread;
 use matrix_sdk::ruma::events::room::encryption::RoomEncryptionEventContent;
 use matrix_sdk::ruma::events::room::message::{
     AddMentions, MessageType, OriginalSyncRoomMessageEvent, Relation, ReplyWithinThread, RoomMessageEventContent,
-    TextMessageEventContent,
 };
 use matrix_sdk::ruma::{EventId, OwnedUserId, RoomId, UInt, UserId};
 use matrix_sdk::{Client, Room, RoomMemberships};
@@ -208,6 +208,21 @@ impl Dm {
             state: &state,
         })?;
         info!(game = id, %name, room = %game_room.room_id(), players = players.len(), "started a game");
+        if let Some(game) = store::by_id(&self.database, id)? {
+            let party: Vec<serde_json::Value> = players
+                .iter()
+                .map(|player| json!({"user_id": player.user_id, "name": player.name, "entity_id": player.entity_id}))
+                .collect();
+            let left_out: Vec<String> = left_out.iter().map(|user| user.to_string()).collect();
+            self.log(&game, Some(event.sender.as_str()), "start", json!({
+                "name": name,
+                "premise": premise,
+                "party": party,
+                "not_invited": left_out,
+                "main_room_id": room.room_id().as_str(),
+                "game_room_id": game_room.room_id().as_str(),
+            }));
+        }
         self.play_soon(id);
 
         let mut reply = format!(
@@ -251,6 +266,7 @@ impl Dm {
             return Ok(());
         }
         if let Some(command) = body.strip_prefix("!dm") {
+            self.log(game, Some(event.sender.as_str()), "command", json!({"command": command.trim()}));
             return self.game_command(room, event, game, command.trim()).await;
         }
         // Other commands, and anyone not playing, aren't part of the game.
@@ -263,6 +279,7 @@ impl Dm {
         }
 
         let text: String = body.chars().take(MAX_ACTION_CHARS).collect();
+        self.log(game, Some(event.sender.as_str()), "action", json!({"text": text, "event_id": event.event_id.as_str()}));
         store::add_action(&self.database, game.id, &Action { user_id: event.sender.to_string(), text, sent_at_ms: event.origin_server_ts.get().into() })?;
         crate::handler::send_reaction(room, &event.event_id, "✅").await;
 
@@ -289,13 +306,14 @@ impl Dm {
                 let state = game.state.clone();
                 let round = game.round;
                 match tokio::task::spawn_blocking(move || map::render(&state, round)).await? {
-                    Ok((full, _)) => post_image(room, &full, None, None).await,
+                    Ok((full, _)) => post_image(room, &full, None).await,
                     Err(err) => warn!(?err, game = game.id, "failed to draw the map"),
                 }
             }
             "status" => say(room, &status(game)).await,
             "end" if game.owner == event.sender.as_str() => {
                 store::end(&self.database, game.id)?;
+                self.log(game, Some(event.sender.as_str()), "end", json!({"reason": "ended by its starter", "rounds": game.round}));
                 say(room, "**The end.** The game was ended by whoever started it. Thanks for playing.").await;
                 if let Some(main) = self.room(&game.main_room_id) {
                     post_text(&main, &format!("**{}** ended after {} rounds.", game.name, game.round), Some(&game.thread_root_id)).await;
@@ -365,6 +383,7 @@ impl Dm {
 
         if game.round >= MAX_ROUNDS {
             store::end(&self.database, game.id)?;
+            self.log(&game, None, "end", json!({"reason": "round limit", "rounds": game.round}));
             say(&room, &format!("**The end.** That's {MAX_ROUNDS} rounds, as long as a game can go. Thanks for playing.")).await;
             return Ok(());
         }
@@ -376,6 +395,7 @@ impl Dm {
             None
         };
         if let Some(paused) = paused {
+            self.log(&game, None, "paused", json!({"reason": paused, "actions": actions}));
             store::restore_actions(&self.database, game.id, &actions)?;
             say(&room, paused).await;
             return Ok(());
@@ -388,12 +408,24 @@ impl Dm {
             Ok(played) => played,
             Err(err) => {
                 warn!(?err, game = game.id, "the round failed");
+                self.log(&game, None, "round_failed", json!({"error": format!("{err:#}"), "actions": actions}));
                 store::restore_actions(&self.database, game.id, &actions)?;
                 say(&room, "I lost the thread there. Send `!dm go` to try the round again.").await;
                 return Ok(());
             }
         };
 
+        self.log(&game, None, "round", json!({
+            "narration": ending.narration,
+            "summary": ending.summary,
+            "game_over": ending.game_over,
+            "rolls": rolls,
+            "actions": actions,
+        }));
+        self.log(&game, None, "state", serde_json::to_value(&state)?);
+        if ending.game_over {
+            self.log(&game, None, "end", json!({"reason": "story ended", "rounds": game.round + 1}));
+        }
         let round = Round { round: game.round, actions, narration: ending.narration.clone(), summary: ending.summary.clone() };
         store::finish_round(&self.database, &game, &round, &state, ending.game_over)?;
 
@@ -411,37 +443,57 @@ impl Dm {
             }
         };
 
-        let mut narration = ending.narration.clone();
-        if !rolls.is_empty() {
-            narration.push_str(&format!("\n\n🎲 {}", rolls.join(" · ")));
-        }
-        if ending.game_over {
-            narration.push_str("\n\n**The end.** Thanks for playing.");
-        }
-        match &maps {
-            Some((full, _)) => post_image(&room, full, Some(&narration), None).await,
-            None => post_text(&room, &narration, None).await,
+        // The story, then its map under it, as separate messages: captions don't show
+        // on every client.
+        post_text(&room, &story_message(game.round + 1, &ending, &rolls), None).await;
+        if let Some((full, _)) = &maps {
+            post_image(&room, full, None).await;
         }
 
         if let Some(main) = self.room(&game.main_room_id) {
-            let mut line = format!("**{}**, round {}: {}", game.name, game.round + 1, ending.summary);
-            if ending.game_over {
-                line.push_str(" **The end.**");
-            }
-            match &maps {
-                Some((_, small)) => post_image(&main, small, Some(&line), Some(&game.thread_root_id)).await,
-                None => post_text(&main, &line, Some(&game.thread_root_id)).await,
+            post_text(&main, &thread_message(&game.name, game.round + 1, &ending), Some(&game.thread_root_id)).await;
+            if let Some((_, small)) = &maps {
+                post_image(&main, small, Some(&game.thread_root_id)).await;
             }
         }
         info!(game = game.id, round = game.round + 1, over = ending.game_over, "played a round");
         Ok(())
     }
 
+    /// Plays the round with Claude, logging the prompt, every request and response,
+    /// and every tool call, whether or not the round works out.
     async fn run_round(&self, game: &Game, actions: &[Action]) -> Result<(Ending, GameState, Vec<String>)> {
         let players = store::players(&self.database, game.id)?;
         let rounds = store::rounds(&self.database, game.id)?;
         let user = round_prompt(game, &players, &rounds, actions);
-        claude_round(&self.anthropic, &self.usage_tracker, &self.rate_limit, &game.state, &user).await
+        self.log(game, None, "prompt", json!({"model": MODEL, "max_tokens": MAX_TOKENS, "system": PROMPT, "user": user}));
+        let played = claude_round(&self.anthropic, &self.usage_tracker, &self.rate_limit, &game.state, &user).await;
+        for (attempt, exchange) in played.exchanges.iter().enumerate() {
+            self.log(game, None, "api", api_entry(attempt, exchange));
+        }
+        for call in &played.calls {
+            self.log(game, None, "tool", call.clone());
+        }
+        played.outcome
+    }
+
+    /// Adds to the game's log. Kinds, in the order they happen:
+    /// - `start`: the premise, party, and rooms.
+    /// - `action`: a player's message, as their character's action.
+    /// - `command`: a `!dm` command in the game room, and who sent it.
+    /// - `prompt`: the round's system prompt and user turn.
+    /// - `api`: one request to Claude and its response or error. The system prompt
+    ///   and tool definitions are only in the round's first request.
+    /// - `tool`: a tool call, what it was given, what it said back, and whether it
+    ///   was refused.
+    /// - `round`: the story, summary, rolls, and actions of a played round.
+    /// - `state`: the world after the round.
+    /// - `round_failed` and `paused`: a round that wasn't played, and why.
+    /// - `end`: the game ending, and why.
+    fn log(&self, game: &Game, user_id: Option<&str>, kind: &str, data: serde_json::Value) {
+        if let Err(err) = store::log(&self.database, game.id, game.round, kind, user_id, &data) {
+            warn!(?err, game = game.id, kind, "failed to write to the game log");
+        }
     }
 
     fn room(&self, room_id: &str) -> Option<Room> {
@@ -460,15 +512,17 @@ impl Dm {
     }
 }
 
+/// A round's outcome, and the record of how it came about, kept whether it worked.
+struct Played {
+    outcome: Result<(Ending, GameState, Vec<String>)>,
+    exchanges: Vec<llm::Exchange>,
+    calls: Vec<serde_json::Value>,
+}
+
 /// One Claude call, with the tools to roll, change the world, and end the round.
-async fn claude_round(
-    anthropic: &Anthropic,
-    usage_tracker: &UsageTracker,
-    rate_limit: &Throttle,
-    state: &GameState,
-    user: &str,
-) -> Result<(Ending, GameState, Vec<String>)> {
+async fn claude_round(anthropic: &Anthropic, usage_tracker: &UsageTracker, rate_limit: &Throttle, state: &GameState, user: &str) -> Played {
     let tools = RoundTools::new(state.clone());
+    let exchanges = Mutex::new(Vec::new());
     let request = CompletionRequest {
         model: MODEL,
         system: PROMPT,
@@ -477,26 +531,114 @@ async fn claude_round(
         max_tokens: MAX_TOKENS,
         local_tools: Some(&tools),
         label: LABEL,
+        exchanges: Some(&exchanges),
         ..Default::default()
     };
     let answered = llm::complete(anthropic, &request, usage_tracker, rate_limit).await;
     let ending = tools.ending.lock().expect("ending mutex poisoned").take();
-    // Once the round is ended there's often nothing left to say, which `complete`
-    // treats as a failed reply. The ending is what counts.
-    let text = match answered {
-        Ok(text) => text,
-        Err(_) if ending.is_some() => String::new(),
-        Err(err) => return Err(err),
+    let outcome = (|| {
+        // Once the round is ended there's often nothing left to say, which `complete`
+        // treats as a failed reply. The ending is what counts.
+        let text = match answered {
+            Ok(text) => text,
+            Err(_) if ending.is_some() => String::new(),
+            Err(err) => return Err(err),
+        };
+        let ending = match ending {
+            Some(ending) => ending,
+            // It told the story without ending the round properly. The story still counts.
+            None if !text.trim().is_empty() => {
+                Ending { narration: text.trim().to_string(), summary: first_sentence(text.trim()), game_over: false }
+            }
+            None => anyhow::bail!("the round ended without a story"),
+        };
+        Ok((ending, tools.state.lock().expect("state mutex poisoned").clone(), tools.rolls.lock().expect("rolls mutex poisoned").clone()))
+    })();
+    Played {
+        outcome,
+        exchanges: exchanges.into_inner().expect("exchanges mutex poisoned"),
+        calls: tools.calls.into_inner().expect("calls mutex poisoned"),
+    }
+}
+
+/// Writes a game's log as JSON lines, for analysis: the game first, then each entry in
+/// order. `game` is its name or number. Without one, lists the games instead.
+pub fn export(database: &Database, game: Option<&str>, out: &mut impl std::io::Write) -> Result<()> {
+    let games = store::all(database)?;
+    let Some(wanted) = game else {
+        for game in &games {
+            writeln!(out, "{}\t{}\t{}\t{} rounds\t{}", game.id, game.name, game.status, game.round, game.premise)?;
+        }
+        return Ok(());
     };
-    let ending = match ending {
-        Some(ending) => ending,
-        // It told the story without ending the round properly. The story still counts.
-        None if !text.trim().is_empty() => Ending { narration: text.trim().to_string(), summary: first_sentence(text.trim()), game_over: false },
-        None => anyhow::bail!("the round ended without a story"),
-    };
-    let state = tools.state.into_inner().expect("state mutex poisoned");
-    let rolls = tools.rolls.into_inner().expect("rolls mutex poisoned");
-    Ok((ending, state, rolls))
+    let game = games
+        .iter()
+        .find(|game| game.name == wanted || game.id.to_string() == wanted)
+        .with_context(|| format!("there's no game called {wanted}"))?;
+    let players = store::players(database, game.id)?;
+    let party: Vec<serde_json::Value> =
+        players.iter().map(|player| json!({"user_id": player.user_id, "name": player.name, "entity_id": player.entity_id})).collect();
+    writeln!(
+        out,
+        "{}",
+        json!({
+            "kind": "game", "id": game.id, "name": game.name, "premise": game.premise, "owner": game.owner,
+            "status": game.status, "rounds": game.round, "party": party,
+        })
+    )?;
+    for entry in store::game_log(database, game.id)? {
+        writeln!(
+            out,
+            "{}",
+            json!({"at": entry.created_at, "round": entry.round, "kind": entry.kind, "user_id": entry.user_id, "data": entry.data})
+        )?;
+    }
+    Ok(())
+}
+
+/// A round's story for the game room: a heading, the story, and the dice rolled.
+fn story_message(round: u32, ending: &Ending, rolls: &[String]) -> String {
+    let mut message = format!("### Round {round}\n\n{}", ending.narration.trim());
+    if !rolls.is_empty() {
+        message.push_str("\n\n🎲 **Rolls**\n");
+        for roll in rolls {
+            message.push_str(&format!("\n- {roll}"));
+        }
+    }
+    if ending.game_over {
+        message.push_str("\n\n**The end.** Thanks for playing!");
+    }
+    message
+}
+
+/// A round's line for the thread in the room the game started from.
+fn thread_message(name: &str, round: u32, ending: &Ending) -> String {
+    let mut message = format!("**{name}** · round {round}\n\n{}", capitalized(ending.summary.trim()));
+    if ending.game_over {
+        message.push_str("\n\n**The end.**");
+    }
+    message
+}
+
+fn capitalized(text: &str) -> String {
+    let mut chars = text.chars();
+    chars.next().map(|first| first.to_uppercase().chain(chars).collect()).unwrap_or_default()
+}
+
+/// One API exchange for the log. A round's later requests repeat the system prompt
+/// and tool definitions, so only the first keeps them.
+fn api_entry(attempt: usize, exchange: &llm::Exchange) -> serde_json::Value {
+    let mut request = exchange.request.clone();
+    if attempt > 0
+        && let Some(request) = request.as_object_mut()
+    {
+        request.remove("system");
+        request.remove("tools");
+    }
+    match &exchange.response {
+        Ok(response) => json!({"attempt": attempt, "request": request, "response": response}),
+        Err(error) => json!({"attempt": attempt, "request": request, "error": error}),
+    }
 }
 
 /// What Claude gets each round: the game, the party, the story so far, the world,
@@ -670,9 +812,9 @@ async fn post_text(room: &Room, text: &str, thread_root: Option<&str>) {
     }
 }
 
-/// Posts an image with `caption` as its text, in the thread at `thread_root` if given.
-/// Clients that don't show captions show the caption as the image's name.
-async fn post_image(room: &Room, image: &ReplyImage, caption: Option<&str>, thread_root: Option<&str>) {
+/// Posts an image, in the thread at `thread_root` if given. Its text goes in a message
+/// of its own, since some clients show a caption as the file's name.
+async fn post_image(room: &Room, image: &ReplyImage, thread_root: Option<&str>) {
     let info = AttachmentInfo::Image(BaseImageInfo {
         width: Some(UInt::from(image.width)),
         height: Some(UInt::from(image.height)),
@@ -680,7 +822,7 @@ async fn post_image(room: &Room, image: &ReplyImage, caption: Option<&str>, thre
         is_animated: Some(false),
         blurhash: None,
     });
-    let mut config = AttachmentConfig::new().info(info).caption(caption.map(TextMessageEventContent::markdown));
+    let mut config = AttachmentConfig::new().info(info);
     if let Some(root) = thread_root.and_then(|root| EventId::parse(root).ok()) {
         config = config.reply(Some(Reply {
             event_id: root,
@@ -690,9 +832,6 @@ async fn post_image(room: &Room, image: &ReplyImage, caption: Option<&str>, thre
     }
     if let Err(err) = room.send_attachment(image.filename.clone(), &image.mime, image.data.clone(), config).await {
         warn!(?err, room = %room.room_id(), "failed to post a map");
-        if let Some(caption) = caption {
-            post_text(room, caption, thread_root).await;
-        }
     }
 }
 
@@ -844,7 +983,9 @@ mod tests {
             .await;
             let (usage, throttle) = trackers();
             let state = game(1).state;
-            let (ending, state, rolls) = claude_round(&anthropic, &usage, &throttle, &state, "Round 2.").await.unwrap();
+            let played = claude_round(&anthropic, &usage, &throttle, &state, "Round 2.").await;
+            let (exchanges, calls) = (played.exchanges, played.calls);
+            let (ending, state, rolls) = played.outcome.unwrap();
 
             assert_eq!((ending.narration.as_str(), ending.summary.as_str(), ending.game_over), ("The wolf yelps and flees.", "the party drove off a wolf", false));
             let alice = state.entity("alice").unwrap();
@@ -863,18 +1004,91 @@ mod tests {
             let results = seen[1]["messages"].as_array().unwrap().last().unwrap()["content"].clone();
             assert_eq!(results[2]["is_error"], true, "{results}");
             assert_eq!(usage.snapshot().by_label[0].label, LABEL);
+
+            // Everything is kept for the game log: each request and response, and each
+            // tool call with what it said back.
+            assert_eq!(exchanges.len(), 3);
+            assert_eq!(exchanges[0].request["system"].to_string(), seen[0]["system"].to_string());
+            assert_eq!(exchanges[2].response.as_ref().unwrap()["stop_reason"], "end_turn");
+            let tools_called: Vec<(&str, bool)> = calls.iter().map(|call| (call["tool"].as_str().unwrap(), call["refused"].as_bool().unwrap())).collect();
+            assert_eq!(
+                tools_called,
+                [(tools::ROLL_DICE, false), (tools::UPDATE_STATE, false), (tools::UPDATE_STATE, true), (tools::END_ROUND, false)]
+            );
+            assert!(calls[2]["output"].as_str().unwrap().contains("off the"), "{}", calls[2]);
+
+            // Only the first request in the log keeps the system prompt and tools.
+            let first = api_entry(0, &exchanges[0]);
+            let later = api_entry(1, &exchanges[1]);
+            assert!(first["request"].get("system").is_some() && first["request"].get("tools").is_some());
+            assert!(later["request"].get("system").is_none() && later["request"].get("tools").is_none());
+            assert!(later["request"]["messages"].as_array().unwrap().len() > 1);
+            assert_eq!(later["response"]["stop_reason"], "tool_use");
         }
 
         #[tokio::test]
         async fn a_story_without_an_ending_still_counts() {
             let (anthropic, _) = serve(vec![response(json!([{"type": "text", "text": "The cave is dark. Something moves."}]), "end_turn")]).await;
             let (usage, throttle) = trackers();
-            let (ending, _, _) = claude_round(&anthropic, &usage, &throttle, &game(1).state, "Round 2.").await.unwrap();
+            let (ending, _, _) = claude_round(&anthropic, &usage, &throttle, &game(1).state, "Round 2.").await.outcome.unwrap();
             assert_eq!((ending.narration.as_str(), ending.summary.as_str()), ("The cave is dark. Something moves.", "The cave is dark."));
 
+            // A failed round still keeps what was sent and what came back.
             let (anthropic, _) = serve(vec![response(json!([{"type": "text", "text": " "}]), "end_turn")]).await;
-            assert!(claude_round(&anthropic, &usage, &throttle, &game(1).state, "Round 2.").await.is_err());
+            let failed = claude_round(&anthropic, &usage, &throttle, &game(1).state, "Round 2.").await;
+            assert!(failed.outcome.is_err());
+            assert_eq!(failed.exchanges.len(), 1);
+            assert!(failed.exchanges[0].response.is_ok());
         }
+    }
+
+    #[test]
+    fn exports_a_games_log_as_json_lines() {
+        let database = Database::open_in_memory();
+        let players = party();
+        let state = game(0).state;
+        let id = store::create(&database, &store::NewGame {
+            name: "cave-xxxx",
+            premise: "a cave",
+            owner: "@a:x",
+            main_room_id: "!main:x",
+            thread_root_id: "$root",
+            game_room_id: "!game:x",
+            players: &players,
+            state: &state,
+        })
+        .unwrap();
+        store::log(&database, id, 0, "start", Some("@a:x"), &json!({"premise": "a cave"})).unwrap();
+        store::log(&database, id, 1, "action", Some("@b:x"), &json!({"text": "attack the wolf"})).unwrap();
+
+        let mut listing = Vec::new();
+        export(&database, None, &mut listing).unwrap();
+        assert_eq!(String::from_utf8(listing).unwrap(), format!("{id}\tcave-xxxx\tactive\t0 rounds\ta cave\n"));
+
+        for wanted in ["cave-xxxx", &id.to_string()] {
+            let mut out = Vec::new();
+            export(&database, Some(wanted), &mut out).unwrap();
+            let lines: Vec<serde_json::Value> = String::from_utf8(out).unwrap().lines().map(|line| serde_json::from_str(line).unwrap()).collect();
+            assert_eq!(lines.len(), 3);
+            assert_eq!((lines[0]["kind"].as_str(), lines[0]["party"][1]["name"].as_str()), (Some("game"), Some("Bob")));
+            assert_eq!((lines[2]["kind"].as_str(), lines[2]["user_id"].as_str(), lines[2]["data"]["text"].as_str()), (Some("action"), Some("@b:x"), Some("attack the wolf")));
+        }
+        assert!(export(&database, Some("nope"), &mut Vec::new()).is_err());
+    }
+
+    #[test]
+    fn formats_the_story_and_the_threads_line() {
+        let ending = Ending { narration: "The wolves flee.\n\nThe cave mouth glows.".to_string(), summary: "the party drove off the wolves".to_string(), game_over: false };
+        let rolls = ["Alice attacks the wolf: 1d20+2 → 17".to_string(), "Wolf bites: 1d6 → 3".to_string()];
+        assert_eq!(
+            story_message(3, &ending, &rolls),
+            "### Round 3\n\nThe wolves flee.\n\nThe cave mouth glows.\n\n🎲 **Rolls**\n\n- Alice attacks the wolf: 1d20+2 → 17\n- Wolf bites: 1d6 → 3"
+        );
+        assert_eq!(thread_message("cave-xxxx", 3, &ending), "**cave-xxxx** · round 3\n\nThe party drove off the wolves");
+
+        let over = Ending { game_over: true, ..ending };
+        assert_eq!(story_message(9, &over, &[]), "### Round 9\n\nThe wolves flee.\n\nThe cave mouth glows.\n\n**The end.** Thanks for playing!");
+        assert!(thread_message("cave-xxxx", 9, &over).ends_with("\n\n**The end.**"));
     }
 
     #[test]
