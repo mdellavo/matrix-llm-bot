@@ -36,6 +36,8 @@ pub enum Kind {
     Monster,
     Npc,
     Item,
+    /// A place or thing worth naming on the map, like an altar or a wolf den.
+    Feature,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

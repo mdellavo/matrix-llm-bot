@@ -103,7 +103,8 @@ impl LocalTools for RoundTools {
                     "Change the world so the map matches the story. Changes are made together, or not at all if \
                     one is wrong. Squares run from (0, 0) at the top left. Map characters: {}. Ops: \
                     set_map {{rows}} replaces the map for a new area, up to 24 wide and 16 tall, every row the same length; \
-                    set_tile {{x, y, tile}}; add {{id, kind: monster|npc|item, name, x, y, hp?, max_hp?}}; \
+                    set_tile {{x, y, tile}}; add {{id, kind: monster|npc|item|feature, name, x, y, hp?, max_hp?}}, where a \
+                    feature is a place worth naming, like an altar, a den, or a glowing crystal; \
                     move {{id, x, y}}; set_hp {{id, hp}}, where 0 means fallen; remove {{id}}, not for players; \
                     give {{id, item}}; take {{id, item}}; set_quest {{quest}}.",
                     legend.join(", ")

@@ -424,16 +424,20 @@ ones, the world as it stands, and the round's actions. Claude plays it with thre
 
 - `roll_dice` rolls real dice, like `1d20+3`, so results aren't made up. The rolls are
   listed under the round's story.
-- `update_state` changes the world: the map, up to 24 by 16 squares, and who and what is
-  on it, their health, what they carry, and the party's goal. Changes are checked, and a
+- `update_state` changes the world: the map, up to 24 by 16 squares, and the creatures,
+  items, and places on it, their health, what they carry, and the party's goal. Changes are checked, and a
   wrong one is refused and explained to Claude, so the map always matches the story.
   Players' characters start with 12 hp, and only their own players move them.
 - `end_round` gives the story for the game room and a one-line summary.
 
 The bot draws the map from that state each round: coloured squares for the ground, a
-lettered token for each character, red for monsters, and a strip with the round, the goal,
-and the party's health. The story is posted in the game room as the map's caption. The
-summary goes to the `!dm` thread as the caption of a half-size map, one message per
+lettered token for each creature, red for monsters and pink for other characters, numbered
+gold squares for items, and numbered pink diamonds for named places, like a wolf den or
+an altar. Creatures that share an initial are numbered, like G1 and G2 for two grey
+wolves. A key beside the map names every creature with its health, every item and place,
+and each kind of ground shown, and a strip under it gives the round and the party's goal.
+The story is posted in the game room as the map's caption. The summary goes to the `!dm`
+thread as the caption of a smaller map, with its key still full size, one message per
 round. Clients that don't show captions show the text as the image's name.
 
 Games, players, waiting actions, and every round are kept in the database, so a restart
