@@ -92,19 +92,23 @@ pub const LOOKS: &[(&str, Sheet, u32)] = &[
     ("sword", Sheet::Dungeon, 104),
     ("wand", Sheet::Dungeon, 129),
     // Places and furniture.
-    ("altar", Sheet::Dungeon, 54),
+    ("altar", Sheet::Dungeon, 55),
     ("anvil", Sheet::Dungeon, 74),
-    ("banner", Sheet::Dungeon, 29),
-    ("bookshelf", Sheet::Dungeon, 63),
+    ("bookshelf", Sheet::Dungeon, 75),
     ("crystal", Sheet::Dungeon, 56),
-    ("fountain", Sheet::Dungeon, 32),
     ("grave", Sheet::Dungeon, 64),
     ("gravestone", Sheet::Dungeon, 65),
     ("sign", Sheet::Town, 83),
-    ("statue", Sheet::Dungeon, 19),
     ("table", Sheet::Dungeon, 72),
     ("well", Sheet::Town, 104),
 ];
+
+/// Looks two squares tall: the tile drawn in the square above, from the same sheet.
+/// Their own tile alone would look cut off.
+const TOPS: &[(&str, u32)] = &[("bookshelf", 63), ("well", 92)];
+
+const TREE: u32 = 28;
+const BUSH: u32 = 5;
 
 /// What players look like until the story says otherwise, in the order they joined.
 pub const PLAYER_LOOKS: [&str; 6] = ["knight", "wizard", "ranger", "dwarf", "monk", "villager"];
@@ -117,9 +121,11 @@ pub fn look_names() -> Vec<&'static str> {
     LOOKS.iter().map(|(look, _, _)| *look).collect()
 }
 
-/// The sprite for a look, if it's one of `LOOKS`.
-pub fn look(name: &str) -> Option<RgbaImage> {
-    LOOKS.iter().find(|(look, _, _)| *look == name).map(|&(_, sheet, index)| sprite(sheet, index))
+/// The sprite for a look, if it's one of `LOOKS`, and for a tall one, its top half.
+pub fn look(name: &str) -> Option<(RgbaImage, Option<RgbaImage>)> {
+    let &(_, sheet, index) = LOOKS.iter().find(|(look, _, _)| *look == name)?;
+    let top = TOPS.iter().find(|(look, _)| *look == name).map(|&(_, top)| sprite(sheet, top));
+    Some((sprite(sheet, index), top))
 }
 
 /// The tiles a map character is drawn with: its ground, and anything standing on it,
@@ -141,7 +147,9 @@ pub fn ground(tile: char, x: usize, y: usize) -> Option<(RgbaImage, Option<RgbaI
         '#' => (sprite(Sheet::Dungeon, 40), None),
         '+' => (sprite(Sheet::Dungeon, 45), None),
         'c' => (sprite(Sheet::Dungeon, 22), None),
-        'T' => (grass(), Some(sprite(Sheet::Town, if (x + y).is_multiple_of(3) { 28 } else { 16 }))),
+        // Single-square trees and bushes. The sheet's other trees are halves of
+        // two-square ones, which look cut off alone.
+        'T' => (grass(), Some(sprite(Sheet::Town, if (x * 3 + y * 5).is_multiple_of(7) { BUSH } else { TREE }))),
         _ => return None,
     })
 }
@@ -182,6 +190,49 @@ mod tests {
         names.dedup();
         assert_eq!(names.len(), LOOKS.len(), "look names are unique");
         assert!(PLAYER_LOOKS.iter().all(|look| is_look(look)));
+    }
+
+    /// Opaque pixels along each edge: top, bottom, left, right.
+    fn edges(sprite: &RgbaImage) -> [usize; 4] {
+        let row = |y: u32| (0..SIZE).filter(|&x| sprite.get_pixel(x, y)[3] > 0).count();
+        let column = |x: u32| (0..SIZE).filter(|&y| sprite.get_pixel(x, y)[3] > 0).count();
+        [row(0), row(SIZE - 1), column(0), column(SIZE - 1)]
+    }
+
+    #[test]
+    fn looks_stand_alone() {
+        for &(name, _, _) in LOOKS {
+            let (sprite, top) = look(name).unwrap();
+            let [top_edge, _, left, right] = edges(&sprite);
+            // A whole square of wall or floor, like the sheet's wall banners, looks like a
+            // stray block out in a field.
+            let full = SIZE as usize;
+            assert!(top.is_some() || !(top_edge == full && left == full && right == full), "{name} is a block of wall or floor");
+            // A tall look's lower half carries on upward, and its top half stops.
+            if let Some(top) = top {
+                assert!(top_edge > 8, "{name}'s lower half doesn't need a top");
+                assert!(edges(&top)[0] < full, "{name}'s top is cut off too");
+            }
+        }
+    }
+
+    /// A whole sprite rounds off or comes to a point at its top edge. Half of a taller
+    /// one, like the tall tree's lower half that was once drawn as a tree, runs across it.
+    fn cut_off_at_the_top(sprite: &RgbaImage) -> bool {
+        (0..SIZE).filter(|&x| sprite.get_pixel(x, 0)[3] > 0).count() > 8
+    }
+
+    #[test]
+    fn trees_are_whole() {
+        for x in 0..10 {
+            for y in 0..10 {
+                let (_, tree) = ground('T', x, y).unwrap();
+                assert!(!cut_off_at_the_top(&tree.unwrap()), "the tree at ({x}, {y}) is cut off");
+            }
+        }
+        assert!(cut_off_at_the_top(&sprite(Sheet::Town, 16)), "the check catches the tall tree's lower half");
+        let kinds: std::collections::HashSet<Vec<u8>> = (0..10).map(|x| ground('T', x, 2).unwrap().1.unwrap().into_raw()).collect();
+        assert_eq!(kinds.len(), 2, "forests mix trees and bushes");
     }
 
     #[test]

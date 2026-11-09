@@ -61,6 +61,8 @@ struct Marker {
     shape: Shape,
     /// From its look. Without one, it's drawn as `shape` with its label inside.
     sprite: Option<RgbaImage>,
+    /// The top half of a look two squares tall, drawn in the square above.
+    top: Option<RgbaImage>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -91,8 +93,9 @@ fn markers(state: &GameState) -> Vec<Marker> {
             let fallen = entity.hp == Some(0);
             let colour = |colour| if fallen { FALLEN } else { colour };
             let look = |default: Option<&str>| {
-                let sprite = entity.look.as_deref().or(default).and_then(sprites::look);
-                if fallen { sprite.map(|sprite| greyed(&sprite)) } else { sprite }
+                let (sprite, top) = entity.look.as_deref().or(default).and_then(sprites::look).unzip();
+                let top = top.flatten();
+                if fallen { (sprite.map(|sprite| greyed(&sprite)), top.map(|top| greyed(&top))) } else { (sprite, top) }
             };
             match entity.kind {
                 Kind::Player | Kind::Monster | Kind::Npc => {
@@ -117,15 +120,18 @@ fn markers(state: &GameState) -> Vec<Marker> {
                         Kind::Monster => (MONSTER, None),
                         _ => (NPC, None),
                     };
-                    Marker { label, colour: colour(base), shape: Shape::Token, sprite: look(default_look) }
+                    let (sprite, top) = look(default_look);
+                    Marker { label, colour: colour(base), shape: Shape::Token, sprite, top }
                 }
                 Kind::Item => {
                     items += 1;
-                    Marker { label: items.to_string(), colour: ITEM, shape: Shape::Square, sprite: look(None) }
+                    let (sprite, top) = look(None);
+                    Marker { label: items.to_string(), colour: ITEM, shape: Shape::Square, sprite, top }
                 }
                 Kind::Feature => {
                     places += 1;
-                    Marker { label: places.to_string(), colour: FEATURE, shape: Shape::Diamond, sprite: look(None) }
+                    let (sprite, top) = look(None);
+                    Marker { label: places.to_string(), colour: FEATURE, shape: Shape::Diamond, sprite, top }
                 }
             }
         })
@@ -154,7 +160,13 @@ fn draw(state: &GameState, round: u32, markers: &[Marker], scale: Scale, font: &
         let (left, top) = (entity.x as u32 * scale.square, entity.y as u32 * scale.square);
         let marker = &markers[index];
         match &marker.sprite {
-            Some(sprite) => overlay(&mut image, &imageops::resize(sprite, scale.square, scale.square, FilterType::Nearest), left, top),
+            Some(sprite) => {
+                overlay(&mut image, &imageops::resize(sprite, scale.square, scale.square, FilterType::Nearest), left, top);
+                // A tall look's top goes in the square above, unless it's the map's top row.
+                if let (Some(upper), Some(above)) = (&marker.top, top.checked_sub(scale.square)) {
+                    overlay(&mut image, &imageops::resize(upper, scale.square, scale.square, FilterType::Nearest), left, above);
+                }
+            }
             None => {
                 let (cx, cy) = ((left + scale.square / 2) as i32, (top + scale.square / 2) as i32);
                 draw_marker(&mut image, font, marker, cx, cy, scale.token_radius, scale.token_font);
