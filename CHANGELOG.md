@@ -3,6 +3,12 @@
 Notable changes to matrix-llm-bot, built from the git history. Each version covers
 one day of commits, newest first.
 
+## 0.19.0 - 2026-11-13
+
+### Added
+
+- `!weather <place>` (or `!forecast`): the weather now and for the next three days, in °C and °F, from Open-Meteo. Add a state or country to pick the right place, like `!weather Portland, ME`
+
 ## 0.18.0 - 2026-11-09
 
 ### Added

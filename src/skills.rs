@@ -27,6 +27,7 @@ const KNOWN_TOOLS: &[&str] =
     "imdb_lookup",
     "leafly_strain",
     "rotten_tomatoes",
+    "weather",
     "web_search",
 ];
 const RESERVED_NAME: &str = "help";
@@ -446,7 +447,7 @@ fn resolve_args(
 /// command arguments, and any context its declared `tools` ask for (recent room
 /// history for `message_log`, room name/topic for `room_info`, the current UTC time
 /// for `current_time`, or a live lookup for `random_choice`/`urban_dictionary`/
-/// `imdb_lookup`/`leafly_strain`/`rotten_tomatoes`) — and returns the generated reply.
+/// `imdb_lookup`/`leafly_strain`/`rotten_tomatoes`/`weather`) — and returns the generated reply.
 ///
 /// Never propagates an error up into the message-send path — on any failure this
 /// logs a `tracing::warn!` and returns a friendly fallback string instead, matching
@@ -630,6 +631,20 @@ pub async fn execute(
                 warn!(?err, room_id, skill = %skill.name, "rotten tomatoes lookup failed");
                 user_turn.push_str(
                     "(The Rotten Tomatoes lookup failed due to a technical error. Apologize, and don't invent scores.)\n\n",
+                );
+            }
+        }
+    }
+
+    if skill.tools.iter().any(|tool| tool == "weather")
+        && let Some(place) = resolved_args.get("place").and_then(|value| value.as_str())
+    {
+        match crate::weather::lookup(tool_clients.http(), place).await {
+            Ok(context) => user_turn.push_str(&context),
+            Err(err) => {
+                warn!(?err, room_id, skill = %skill.name, "weather lookup failed");
+                user_turn.push_str(
+                    "(The weather lookup failed due to a technical error. Apologize, and don't guess the weather.)\n\n",
                 );
             }
         }
@@ -1075,7 +1090,11 @@ Say a friendly hello to the user.\n";
         assert!(rt.tools.iter().any(|tool| tool == "rotten_tomatoes"));
         assert!(registry.get("tomatoes").is_some(), "rt's `tomatoes` alias should resolve");
 
-        assert_eq!(registry.list().len(), 13, "expected all thirteen shipped skills to load");
+        let weather = registry.get("weather").expect("weather skill should be present");
+        assert_eq!(weather.tools, vec!["weather"]);
+        assert!(registry.get("forecast").is_some(), "weather's `forecast` alias should resolve");
+
+        assert_eq!(registry.list().len(), 14, "expected all fourteen shipped skills to load");
     }
 
     fn spec(name: &str, kind: ArgType) -> ArgSpec {

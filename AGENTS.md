@@ -38,7 +38,7 @@ To test Claude calls without the API, use the fake Messages server in `src/llm.r
 | `src/room_queue.rs` | Per-room ordering and message bursts |
 | `src/greeting.rs`, `src/ignore.rs`, `src/throttle.rs` | The greeting cooldown, `ignored_users`, and the pause after a rate limit |
 | `src/skills.rs`, `skills/*/SKILL.md` | Command loading, arguments, and prompts |
-| `src/tools.rs`, `src/rotten_tomatoes.rs` | The skills' outside lookups: Urban Dictionary, OMDb, Leafly, and Rotten Tomatoes |
+| `src/tools.rs`, `src/rotten_tomatoes.rs`, `src/weather.rs` | The skills' outside lookups: Urban Dictionary, OMDb, Leafly, Rotten Tomatoes, and Open-Meteo |
 | `src/cast_sheet.rs`, `src/photo_sheet.rs` | The `!rt` sheet of cast and crew photos, and the `!strain` photo grid |
 | `src/changelog.rs` | `!changelog`, from the `CHANGELOG.md` compiled into the build |
 | `src/pp.rs`, `assets/pp/` | The `!pp` GIF and the font and emoji it's drawn with, which the cast sheet also uses |

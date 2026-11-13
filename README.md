@@ -208,12 +208,13 @@ Frontmatter fields:
   - `random_choice` — a true random pick (real Rust randomness, not an LLM guess).
   - `urban_dictionary` / `imdb_lookup` / `leafly_strain` — outbound HTTP calls to Urban Dictionary, OMDb, and Leafly, respectively (see `src/tools.rs`). `leafly_strain` also reads the strain's Leafly rating and a few of the user reviews Leafly highlights, and posts a sheet of up to six photos of the strain just before the reply: Leafly's product shot, if it has a real one, then the user photos it highlights (see `src/photo_sheet.rs`).
   - `rotten_tomatoes` — a title's Tomatometer, Popcornmeter, critics consensus, director, cast, and trailer, read from Rotten Tomatoes' own search and title pages, since it has no public API. Its poster and a sheet of cast and crew photos, with names and roles, are posted as images just before the reply (see `src/rotten_tomatoes.rs` and `src/cast_sheet.rs`).
+  - `weather` — current conditions and a three-day forecast for the `place` argument from [Open-Meteo](https://open-meteo.com), which needs no API key. A qualifier after a comma, like `Portland, ME` or `London, UK`, picks between places of the same name (see `src/weather.rs`).
   - `web_search` — lets Claude search the web, up to twice per run.
 - `args` (optional) — declares expected arguments (name, type, required/default/bounds). Types are `string`, `integer`, `number`, `boolean`, and `array`. Arguments are validated before Claude is ever called.
 
 A `!command`'s args are parsed from the text after its name, without a model: they fill the skill's declared `args` in order, with the last one taking the rest of the line. Lists split on commas or " or ", or on spaces if there are neither.
 
-Thirteen skills ship as worked examples under `skills/`. There are six built-ins too:
+Fourteen skills ship as worked examples under `skills/`. There are six built-ins too:
 
 - `!help` lists commands, or answers `!help <question>` (see [Help](#help)).
 - `!dm @friend … <premise>` starts a role-playing game in its own room, with the bot as
@@ -241,6 +242,7 @@ An unknown command gets a reply pointing to `!help`.
 | `imdb` | — | `imdb_lookup` | a third-party API call requiring a configured key |
 | `strain` | — | `leafly_strain` | an API call plus real disambiguation logic |
 | `rt` | `tomatoes`, `rottentomatoes` | `rotten_tomatoes` | reading a site with no API, and a trailing year to pick between titles of the same name |
+| `weather` | `forecast` | `weather` | a keyless API, with a state or country after a comma to pick between places |
 
 `random`, `ud`, `imdb`, and `strain` are ported from *gordy*, a separate Matrix bot referenced read-only during development; `imdb` was re-pointed from gordy's scraping approach to the documented OMDb API.
 
