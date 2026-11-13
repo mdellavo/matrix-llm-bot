@@ -29,9 +29,13 @@ struct Place {
 }
 
 impl Place {
+    /// "Cherry Hill, NJ, USA" for a US place, the way people there write it, and
+    /// "Paris, Île-de-France, France" elsewhere.
     fn label(&self) -> String {
-        let mut parts: Vec<&str> =
-            [Some(&self.name), self.admin1.as_ref(), self.country.as_ref()].into_iter().flatten().map(String::as_str).filter(|part| !part.is_empty()).collect();
+        let american = self.country_code.as_deref() == Some("US");
+        let state = self.admin1.as_deref().map(|state| if american { state_abbreviation(state).unwrap_or(state) } else { state });
+        let country = if american { Some("USA") } else { self.country.as_deref() };
+        let mut parts: Vec<&str> = [Some(self.name.as_str()), state, country].into_iter().flatten().filter(|part| !part.is_empty()).collect();
         // A city-state like Singapore is its own state and country.
         parts.dedup();
         parts.join(", ")
@@ -91,9 +95,16 @@ pub async fn lookup(http: &reqwest::Client, query: &str) -> Result<String> {
         Some((name, rest)) => (name.trim(), Some(rest.trim()).filter(|rest| !rest.is_empty())),
         None => (query.trim(), None),
     };
+    let zip = zip_code(name);
+    let mut params = vec![("name", zip.unwrap_or(name)), ("count", CANDIDATES), ("language", "en"), ("format", "json")];
+    // The geocoder knows postcodes worldwide, so 08003 is Barcelona unless it's told
+    // to look in the US.
+    if zip.is_some() {
+        params.push(("countryCode", "US"));
+    }
     let places: Places = http
         .get(GEOCODING_URL)
-        .query(&[("name", name), ("count", CANDIDATES), ("language", "en"), ("format", "json")])
+        .query(&params)
         .send()
         .await
         .context("geocoding request failed")?
@@ -138,10 +149,22 @@ pub async fn lookup(http: &reqwest::Client, query: &str) -> Result<String> {
     Ok(context)
 }
 
-/// The geocoder ranks by population, so its first result is the likeliest place, unless
-/// the qualifier names another one's state or country.
+/// The place the qualifier names the state or country of, if any. Otherwise the room
+/// is assumed to be in the US, so Paris is Paris, Texas, and the geocoder's population
+/// ranking picks among US places, or among all of them when none is in the US.
 fn choose<'a>(places: &'a [Place], qualifier: Option<&str>) -> Option<&'a Place> {
-    qualifier.and_then(|qualifier| places.iter().find(|place| place.matches(qualifier))).or_else(|| places.first())
+    qualifier
+        .and_then(|qualifier| places.iter().find(|place| place.matches(qualifier)))
+        .or_else(|| places.iter().find(|place| place.country_code.as_deref() == Some("US")))
+        .or_else(|| places.first())
+}
+
+/// The five digits of a US ZIP code, alone or as ZIP+4.
+fn zip_code(text: &str) -> Option<&str> {
+    let five = text.get(..5).filter(|five| five.bytes().all(|byte| byte.is_ascii_digit()))?;
+    let rest = &text[5..];
+    let plus_four = rest.strip_prefix('-').is_some_and(|four| four.len() == 4 && four.bytes().all(|byte| byte.is_ascii_digit()));
+    (rest.is_empty() || plus_four).then_some(five)
 }
 
 fn format_forecast(place: &Place, forecast: &Forecast) -> String {
@@ -241,22 +264,29 @@ fn describe(code: u8) -> &'static str {
     }
 }
 
-/// The state a US postal abbreviation stands for, since the geocoder only gives names.
+/// US postal abbreviations, since the geocoder only gives states' names.
+const STATES: &[(&str, &str)] = &[
+    ("AL", "Alabama"), ("AK", "Alaska"), ("AZ", "Arizona"), ("AR", "Arkansas"), ("CA", "California"),
+    ("CO", "Colorado"), ("CT", "Connecticut"), ("DE", "Delaware"), ("DC", "District of Columbia"),
+    ("FL", "Florida"), ("GA", "Georgia"), ("HI", "Hawaii"), ("ID", "Idaho"), ("IL", "Illinois"),
+    ("IN", "Indiana"), ("IA", "Iowa"), ("KS", "Kansas"), ("KY", "Kentucky"), ("LA", "Louisiana"),
+    ("ME", "Maine"), ("MD", "Maryland"), ("MA", "Massachusetts"), ("MI", "Michigan"), ("MN", "Minnesota"),
+    ("MS", "Mississippi"), ("MO", "Missouri"), ("MT", "Montana"), ("NE", "Nebraska"), ("NV", "Nevada"),
+    ("NH", "New Hampshire"), ("NJ", "New Jersey"), ("NM", "New Mexico"), ("NY", "New York"),
+    ("NC", "North Carolina"), ("ND", "North Dakota"), ("OH", "Ohio"), ("OK", "Oklahoma"), ("OR", "Oregon"),
+    ("PA", "Pennsylvania"), ("RI", "Rhode Island"), ("SC", "South Carolina"), ("SD", "South Dakota"),
+    ("TN", "Tennessee"), ("TX", "Texas"), ("UT", "Utah"), ("VT", "Vermont"), ("VA", "Virginia"),
+    ("WA", "Washington"), ("WV", "West Virginia"), ("WI", "Wisconsin"), ("WY", "Wyoming"),
+];
+
+/// The state a postal abbreviation stands for.
 fn us_state(abbreviation: &str) -> Option<&'static str> {
-    const STATES: &[(&str, &str)] = &[
-        ("al", "Alabama"), ("ak", "Alaska"), ("az", "Arizona"), ("ar", "Arkansas"), ("ca", "California"),
-        ("co", "Colorado"), ("ct", "Connecticut"), ("de", "Delaware"), ("dc", "District of Columbia"),
-        ("fl", "Florida"), ("ga", "Georgia"), ("hi", "Hawaii"), ("id", "Idaho"), ("il", "Illinois"),
-        ("in", "Indiana"), ("ia", "Iowa"), ("ks", "Kansas"), ("ky", "Kentucky"), ("la", "Louisiana"),
-        ("me", "Maine"), ("md", "Maryland"), ("ma", "Massachusetts"), ("mi", "Michigan"), ("mn", "Minnesota"),
-        ("ms", "Mississippi"), ("mo", "Missouri"), ("mt", "Montana"), ("ne", "Nebraska"), ("nv", "Nevada"),
-        ("nh", "New Hampshire"), ("nj", "New Jersey"), ("nm", "New Mexico"), ("ny", "New York"),
-        ("nc", "North Carolina"), ("nd", "North Dakota"), ("oh", "Ohio"), ("ok", "Oklahoma"), ("or", "Oregon"),
-        ("pa", "Pennsylvania"), ("ri", "Rhode Island"), ("sc", "South Carolina"), ("sd", "South Dakota"),
-        ("tn", "Tennessee"), ("tx", "Texas"), ("ut", "Utah"), ("vt", "Vermont"), ("va", "Virginia"),
-        ("wa", "Washington"), ("wv", "West Virginia"), ("wi", "Wisconsin"), ("wy", "Wyoming"),
-    ];
-    STATES.iter().find(|(short, _)| *short == abbreviation).map(|(_, state)| *state)
+    STATES.iter().find(|(short, _)| short.eq_ignore_ascii_case(abbreviation)).map(|(_, state)| *state)
+}
+
+/// "NJ" for New Jersey.
+fn state_abbreviation(state: &str) -> Option<&'static str> {
+    STATES.iter().find(|(_, name)| name.eq_ignore_ascii_case(state)).map(|(short, _)| *short)
 }
 
 #[cfg(test)]
@@ -283,6 +313,7 @@ mod tests {
             place("Portland", "Victoria", "Australia", "AU"),
         ];
         assert_eq!(choose(&places, None).unwrap().admin1.as_deref(), Some("Oregon"));
+        assert_eq!(choose(&places, Some("Me")).unwrap().admin1.as_deref(), Some("Maine"));
         assert_eq!(choose(&places, Some("ME")).unwrap().admin1.as_deref(), Some("Maine"));
         assert_eq!(choose(&places, Some("maine")).unwrap().admin1.as_deref(), Some("Maine"));
         assert_eq!(choose(&places, Some("Australia")).unwrap().admin1.as_deref(), Some("Victoria"));
@@ -296,8 +327,28 @@ mod tests {
     }
 
     #[test]
+    fn assumes_the_us_unless_told_otherwise() {
+        // The geocoder's own order for "Paris" and "08003".
+        let paris = [place("Paris", "Île-de-France", "France", "FR"), place("Paris", "Texas", "United States", "US")];
+        assert_eq!(choose(&paris, None).unwrap().admin1.as_deref(), Some("Texas"));
+        assert_eq!(choose(&paris, Some("France")).unwrap().country_code.as_deref(), Some("FR"));
+        let tokyo = [place("Tokyo", "Tokyo", "Japan", "JP")];
+        assert_eq!(choose(&tokyo, None).unwrap().country_code.as_deref(), Some("JP"), "with no US place, the best one anywhere");
+    }
+
+    #[test]
+    fn reads_zip_codes() {
+        assert_eq!(zip_code("08003"), Some("08003"));
+        assert_eq!(zip_code("08003-1234"), Some("08003"));
+        for not_a_zip in ["0800", "080031", "08003-12", "Cherry Hill", "1234a", "08003 x", "é8003"] {
+            assert_eq!(zip_code(not_a_zip), None, "{not_a_zip}");
+        }
+    }
+
+    #[test]
     fn labels_skip_repeated_parts() {
-        assert_eq!(place("Boston", "Massachusetts", "United States", "US").label(), "Boston, Massachusetts, United States");
+        assert_eq!(place("Cherry Hill", "New Jersey", "United States", "US").label(), "Cherry Hill, NJ, USA");
+        assert_eq!(place("Paris", "Île-de-France", "France", "FR").label(), "Paris, Île-de-France, France");
         assert_eq!(place("Singapore", "Singapore", "Singapore", "SG").label(), "Singapore");
     }
 
@@ -315,7 +366,7 @@ mod tests {
         )
         .unwrap();
         let text = format_forecast(&place("Boston", "Massachusetts", "United States", "US"), &forecast);
-        assert!(text.contains("Weather for Boston, Massachusetts, United States"), "{text}");
+        assert!(text.contains("Weather for Boston, MA, USA"), "{text}");
         assert!(text.contains("Now (4:00 PM GMT-5, day): overcast, 5°C (41°F), feels like 2°C (36°F). Humidity 84%. Wind 6 km/h (4 mph), gusting to 14 km/h (9 mph)."), "{text}");
         assert!(text.contains("- Today: light snow, high 8°C (46°F), low 1°C (33°F), 97% chance of precipitation, sunrise 6:32 AM, sunset 4:23 PM"), "{text}");
         assert!(text.contains("- Tomorrow: overcast"), "{text}");
@@ -334,7 +385,9 @@ mod tests {
     async fn looks_up_live_weather() {
         let http = reqwest::Client::new();
         let text = lookup(&http, "Portland, ME").await.unwrap();
-        assert!(text.contains("Portland, Maine"), "{text}");
+        assert!(text.contains("Portland, ME, USA"), "{text}");
+        let text = lookup(&http, "08003").await.unwrap();
+        assert!(text.contains("Cherry Hill, NJ, USA"), "{text}");
         println!("{text}");
     }
 }

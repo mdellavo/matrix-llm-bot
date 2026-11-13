@@ -1,7 +1,7 @@
 ---
 name: weather
 description: Current weather and a three-day forecast for a place.
-usage: "weather <place>"
+usage: "weather <place or ZIP code>"
 aliases:
   - forecast
 tools:
@@ -9,7 +9,7 @@ tools:
 args:
   - name: place
     type: string
-    description: "A city or town, optionally with its state or country, like \"Portland, ME\" or \"Paris, France\""
+    description: "A US ZIP code, or a city or town, optionally with its state or country, like \"08003\", \"Portland, ME\", or \"Paris, France\""
     required: true
 ---
 You are replying to a Matrix chat command. Below is the current weather and a

@@ -7,7 +7,7 @@ one day of commits, newest first.
 
 ### Added
 
-- `!weather <place>` (or `!forecast`): the weather now and for the next three days, in °C and °F, from Open-Meteo. Add a state or country to pick the right place, like `!weather Portland, ME`
+- `!weather <place>` (or `!forecast`): the weather now and for the next three days, in °C and °F, from Open-Meteo. It takes a US ZIP code, like `!weather 08003`, or a place, which it looks for in the US first. Add a state or country to pick another, like `!weather Portland, ME` or `!weather Paris, France`
 
 ## 0.18.0 - 2026-11-09
 
