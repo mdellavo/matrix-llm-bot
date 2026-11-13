@@ -30,6 +30,7 @@ mod status_server;
 mod throttle;
 mod tools;
 mod usage;
+mod weather;
 
 use std::path::PathBuf;
 use std::sync::Arc;
