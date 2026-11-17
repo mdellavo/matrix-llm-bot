@@ -1639,6 +1639,7 @@ async fn handle_command(
                 message_text,
                 command.args,
                 &ctx.bot_name,
+                event.sender.as_str(),
             )
             .await
         }

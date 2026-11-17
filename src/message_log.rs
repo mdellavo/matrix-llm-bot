@@ -477,6 +477,39 @@ impl MessageLogger {
         })
     }
 
+    /// Up to `limit` of one person's most recent messages in `room_id`, oldest first,
+    /// leaving out their `!` commands. `who` is their user ID, its localpart, or their
+    /// display name, with or without a leading `@`, since that's how people write a
+    /// name in chat.
+    pub fn by_person(&self, room_id: &str, who: &str, limit: usize) -> Result<Vec<LoggedMessage>> {
+        let name = who.trim().trim_start_matches('@');
+        if name.is_empty() {
+            return Ok(Vec::new());
+        }
+        // Compared with substr rather than LIKE, so an `_` or `%` in a name is literal.
+        let user_id = if name.contains(':') { format!("@{name}") } else { String::new() };
+        let localpart = format!("@{name}:");
+        let sql = format!(
+            "SELECT {MESSAGE_COLUMNS} FROM messages WHERE room_id = ?1 \
+             AND (sender = ?2 OR substr(sender, 1, length(?3)) = ?3 OR lower(sender_name) = lower(?4) OR lower(sender_name) = lower(?5)) \
+             AND substr(ltrim(body), 1, 1) != '!' ORDER BY id DESC LIMIT ?6"
+        );
+
+        self.database.with(|connection| {
+            let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+            let mut statement = connection.prepare_cached(&sql)?;
+            let mut entries = statement
+                .query_map(params![room_id, user_id, localpart, name, who.trim(), limit], |row| read_message(row, false))?
+                .filter_map(Result::transpose)
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            entries.reverse();
+            for entry in &mut entries {
+                attach_reactions(connection, entry)?;
+            }
+            Ok(entries)
+        })
+    }
+
     /// How many messages are stored for `room_id`.
     pub fn count(&self, room_id: &str) -> Result<usize> {
         let count: i64 = self.database.with(|connection| {
@@ -651,7 +684,7 @@ pub fn format_links(links: &[LinkPreview]) -> String {
         .collect()
 }
 
-fn format_reactions(reactions: &[LoggedReaction]) -> String {
+pub fn format_reactions(reactions: &[LoggedReaction]) -> String {
     if reactions.is_empty() {
         return String::new();
     }
@@ -675,7 +708,7 @@ fn clip(text: &str) -> String {
     }
 }
 
-fn format_timestamp(ts_ms: i64) -> String {
+pub fn format_timestamp(ts_ms: i64) -> String {
     chrono::DateTime::from_timestamp_millis(ts_ms)
         .map_or_else(|| "unknown time".to_string(), |time| time.format("%Y-%m-%d %H:%M").to_string())
 }
@@ -837,6 +870,28 @@ mod tests {
                 thread_root_id: None,
             })
             .unwrap();
+    }
+
+    #[test]
+    fn finds_one_persons_messages_by_id_localpart_or_display_name() {
+        let logger = test_logger("person");
+        log_line(&logger, "$1", "@marc:p.ound.town", "morning all", 1, None);
+        log_line(&logger, "$2", "@pat_b:p.ound.town", "hi", 2, None);
+        log_line(&logger, "$3", "@marc:p.ound.town", "!weather 08003", 3, None);
+        log_line(&logger, "$4", "@marc:p.ound.town", "coffee is life", 4, None);
+        log_line(&logger, "$5", "@marcus:p.ound.town", "not marc", 5, None);
+        logger.database.with(|connection| connection.execute("UPDATE messages SET sender_name = 'Pat B' WHERE sender = '@pat_b:p.ound.town'", [])).unwrap();
+
+        let bodies = |who: &str| logger.by_person("!r", who, 10).unwrap().into_iter().map(|entry| entry.body).collect::<Vec<_>>();
+        assert_eq!(bodies("marc"), ["morning all", "coffee is life"], "oldest first, without commands or marcus");
+        assert_eq!(bodies("@marc"), bodies("marc"));
+        assert_eq!(bodies("@marc:p.ound.town"), bodies("marc"));
+        assert_eq!(bodies("pat b"), ["hi"]);
+        assert_eq!(bodies("@Pat B"), ["hi"]);
+        assert_eq!(bodies("pat_b"), ["hi"]);
+        assert!(bodies("pat%").is_empty(), "a wildcard is literal");
+        assert!(bodies("").is_empty());
+        assert_eq!(logger.by_person("!r", "marc", 1).unwrap()[0].body, "coffee is life", "the limit keeps the newest");
     }
 
     fn edited<'a>(event_id: &'a str, body: &'a str) -> EditedMessage<'a> {

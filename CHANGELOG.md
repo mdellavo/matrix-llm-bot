@@ -3,6 +3,12 @@
 Notable changes to matrix-llm-bot, built from the git history. Each version covers
 one day of commits, newest first.
 
+## 0.20.0 - 2026-11-17
+
+### Added
+
+- `!vibes [person]` (or `!vibecheck`): a vibe check on someone, read from their last 50 messages in the room, like "caffeinated optimism with a thin glaze of Monday dread", with what gives it away and a forecast. With no one named, it reads you
+
 ## 0.19.0 - 2026-11-13
 
 ### Added

@@ -20,6 +20,7 @@ const KNOWN_TOOLS: &[&str] =
     &[
     "message_log",
     "message_search",
+    "person_history",
     "room_info",
     "current_time",
     "random_choice",
@@ -33,6 +34,9 @@ const KNOWN_TOOLS: &[&str] =
 const RESERVED_NAME: &str = "help";
 const DEFAULT_MESSAGE_LOG_COUNT: usize = 5;
 const MAX_MESSAGE_LOG_COUNT: usize = 20;
+/// How many of one person's messages a `person_history` skill reads: enough to see a
+/// pattern in, not so many that a chatty person's costs much.
+const PERSON_HISTORY_LIMIT: usize = 50;
 /// Most matches a `message_search` skill gets to read.
 const MESSAGE_SEARCH_LIMIT: usize = 40;
 /// Searches per run for a skill with the `web_search` tool.
@@ -464,6 +468,7 @@ pub async fn execute(
     message_text: &str,
     arg_text: &str,
     bot_name: &str,
+    sender: &str,
 ) -> GeneratedReply {
     // Short-circuits before validating args or building any context — same
     // reasoning as the OMDb-key check below: there's nothing useful to say
@@ -533,6 +538,38 @@ pub async fn execute(
             Err(err) => {
                 warn!(?err, room_id, skill = %skill.name, "message search failed");
                 user_turn.push_str("(The search failed due to a technical error — apologize and don't guess.)\n\n");
+            }
+        }
+    }
+
+    if skill.tools.iter().any(|tool| tool == "person_history") {
+        // With no one named, it's the person asking.
+        let who = resolved_args.get("user").and_then(|value| value.as_str()).unwrap_or(sender);
+        match message_log.by_person(room_id, who, PERSON_HISTORY_LIMIT) {
+            // Nothing to read, so there's nothing for Claude to say either.
+            Ok(entries) if entries.is_empty() => {
+                return GeneratedReply::plain(format!("I haven't seen any messages from {} in this room yet.", message_log::short_name(who)), &skill.name);
+            }
+            Ok(entries) => {
+                let name = entries.last().map(LoggedMessage::display_name).unwrap_or(who);
+                user_turn.push_str(&format!(
+                    "{name}'s most recent messages in this room, oldest first, as `[UTC time] message [sentiment]` \
+                     (⏎ is a line break, and `{{reactions: ...}}` is how people reacted):\n"
+                ));
+                for entry in &entries {
+                    user_turn.push_str(&format!(
+                        "[{}] {}{}{}\n",
+                        message_log::format_timestamp(entry.origin_server_ts_ms),
+                        message_log::single_line(&entry.body),
+                        message_log::format_reactions(&entry.reactions),
+                        format_entry_tags(entry),
+                    ));
+                }
+                user_turn.push('\n');
+            }
+            Err(err) => {
+                warn!(?err, room_id, skill = %skill.name, "failed to read a person's messages for skill");
+                user_turn.push_str("(Their messages couldn't be read due to a technical error. Apologize, and don't guess.)\n\n");
             }
         }
     }
@@ -1094,7 +1131,11 @@ Say a friendly hello to the user.\n";
         assert_eq!(weather.tools, vec!["weather"]);
         assert!(registry.get("forecast").is_some(), "weather's `forecast` alias should resolve");
 
-        assert_eq!(registry.list().len(), 14, "expected all fourteen shipped skills to load");
+        let vibes = registry.get("vibes").expect("vibes skill should be present");
+        assert_eq!(vibes.tools, vec!["person_history"]);
+        assert!(registry.get("vibecheck").is_some(), "vibes' `vibecheck` alias should resolve");
+
+        assert_eq!(registry.list().len(), 15, "expected all fifteen shipped skills to load");
     }
 
     fn spec(name: &str, kind: ArgType) -> ArgSpec {
