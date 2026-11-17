@@ -199,10 +199,11 @@ Frontmatter fields:
 - `name` / `description` (required) — the command name and its one-line description in `help`.
 - `usage` (optional) — a usage hint shown alongside the description in `help`.
 - `aliases` (optional) — other names that resolve to this skill.
-- `model` (optional) — overrides which Claude model runs this skill's prompt; defaults to the classifier's cheaper model. Skills that need judgment (`digest`, `standup`, `topics`, `vibe`, `define`, `search`) use `claude-sonnet-5-5`.
+- `model` (optional) — overrides which Claude model runs this skill's prompt; defaults to the classifier's cheaper model. Skills that need judgment (`digest`, `standup`, `topics`, `vibe`, `vibes`, `define`, `search`) use `claude-sonnet-5-5`.
 - `tools` (optional) — capabilities the skill needs; the bot fetches the relevant context and injects it before calling Claude:
   - `message_log` — that room's recent messages, including the bot's replies. 5 by default and at most 20.
   - `message_search` — the best 40 matches for the `query` argument from the room's whole log.
+  - `person_history` — the last 50 messages in the room from the person named in the `user` argument, or from the person asking if it's left out, with their sentiment and the reactions they got. The person can be named by user ID, username, or display name, and their `!` commands are left out.
   - `room_info` — the room's ID, name, and topic.
   - `current_time` — the current UTC time.
   - `random_choice` — a true random pick (real Rust randomness, not an LLM guess).
@@ -214,7 +215,7 @@ Frontmatter fields:
 
 A `!command`'s args are parsed from the text after its name, without a model: they fill the skill's declared `args` in order, with the last one taking the rest of the line. Lists split on commas or " or ", or on spaces if there are neither.
 
-Fourteen skills ship as worked examples under `skills/`. There are six built-ins too:
+Fifteen skills ship as worked examples under `skills/`. There are six built-ins too:
 
 - `!help` lists commands, or answers `!help <question>` (see [Help](#help)).
 - `!dm @friend … <premise>` starts a role-playing game in its own room, with the bot as
@@ -233,6 +234,7 @@ An unknown command gets a reply pointing to `!help`.
 | `room` | — | `room_info`, `current_time` | injecting room metadata and the current time |
 | `digest` | `summary` | `message_log` | thematic summarization vs. `history`'s raw listing |
 | `vibe` | — | `message_log` | reading each message's classified sentiment |
+| `vibes` | `vibecheck` | `person_history` | one person's mood, read from their own recent messages, defaulting to whoever asked |
 | `topics` | — | `message_log` | reading each message's tagged entities |
 | `standup` | — | `message_log`, `current_time` | combining two tools in one skill |
 | `define` | — | `web_search` | a skill that can look things up on the web |
