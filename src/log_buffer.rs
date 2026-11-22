@@ -5,7 +5,32 @@ use std::collections::VecDeque;
 use std::io::Write;
 use std::sync::{Arc, Mutex};
 
-use tracing_subscriber::fmt::MakeWriter;
+use tracing::Subscriber;
+use tracing_subscriber::field::RecordFields;
+use tracing_subscriber::fmt::format::{DefaultFields, Writer};
+use tracing_subscriber::fmt::{self, FormatFields, MakeWriter};
+use tracing_subscriber::registry::LookupSpan;
+
+/// The `fmt` layer that writes into `logs`, without color.
+pub fn layer<S>(logs: LogBuffer) -> fmt::Layer<S, BufferFields, fmt::format::Format, LogBuffer>
+where
+    S: Subscriber + for<'span> LookupSpan<'span>,
+{
+    fmt::layer().with_ansi(false).fmt_fields(BufferFields::default()).with_writer(logs)
+}
+
+/// `DefaultFields` under a type of its own. A `fmt` layer keeps each span's formatted
+/// fields in the span, keyed by the formatter's type, so two layers sharing
+/// `DefaultFields` would both append to one copy: every span field would print twice,
+/// and this layer would show the console layer's color codes.
+#[derive(Debug, Default)]
+pub struct BufferFields(DefaultFields);
+
+impl<'writer> FormatFields<'writer> for BufferFields {
+    fn format_fields<R: RecordFields>(&self, writer: Writer<'writer>, fields: R) -> std::fmt::Result {
+        self.0.format_fields(writer, fields)
+    }
+}
 
 /// A fixed number of the latest formatted log lines. Cloning shares the buffer.
 #[derive(Debug, Clone)]
@@ -121,6 +146,30 @@ mod tests {
         let buffer = buffer(&["2026-11-22T00:00:01Z  INFO a: one", "2026-11-22T00:00:02Z  INFO a: two", "2026-11-22T00:00:03Z  WARN a: three", "2026-11-22T00:00:04Z ERROR a: four"]);
         assert_eq!(buffer.recent(10, None, None).len(), 3);
         assert_eq!(buffer.recent(1, None, None), ["2026-11-22T00:00:04Z ERROR a: four"]);
+    }
+
+    /// With the console layer beside it, as in `main`, a span's fields print once and
+    /// without color codes.
+    #[test]
+    fn span_fields_print_once_and_uncolored_beside_a_colored_layer() {
+        use tracing_subscriber::layer::SubscriberExt;
+
+        let console = LogBuffer::new(10);
+        let logs = LogBuffer::new(10);
+        let subscriber = tracing_subscriber::registry()
+            .with(fmt::layer().with_ansi(true).with_writer(console.clone()))
+            .with(layer(logs.clone()));
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::info_span!("send", request_id = "REQ-0").in_scope(|| tracing::info!("sent"));
+        });
+
+        for (name, buffer) in [("buffer", &logs), ("console", &console)] {
+            let line = buffer.recent(1, None, None).pop().unwrap();
+            assert_eq!(line.matches("REQ-0").count(), 1, "{name}: {line}");
+        }
+        let line = logs.recent(1, None, None).pop().unwrap();
+        assert!(!line.contains('\u{1b}'), "{line}");
+        assert_eq!(Level::of(&line), Some(Level::Info));
     }
 
     #[test]
