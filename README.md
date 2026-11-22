@@ -554,7 +554,7 @@ Optional:
 | `http_listen_addr` | `127.0.0.1:8080` | Address of the status page |
 | `skills_dir` | `./skills` | Directory of commands |
 | `omdb_api_key` | none | Enables the `imdb` skill |
-| `ignored_users` | none | Users whose messages are dropped entirely |
+| `ignored_users` | none | Users whose messages are dropped entirely. The MCP endpoint can add more at runtime |
 | `dm_allowed_users` | the bot's homeserver | Who may start a private conversation: `@user:example.org` or `:example.org`. Setting it replaces the default |
 | `notify_users` | nobody | Users to message privately: each time the bot starts, with the version it's running and the changelog lines added since their last notice, and with [alerts](#alerts). Written as `@user:example.org`. The bot reuses the private room it shares with each, or creates one. `notify_on_start`, its old name, still works |
 | `cost_limit_usd` | none | Lifetime cap on estimated Claude spend |
@@ -565,6 +565,7 @@ Optional:
 | `browser_url` | none | A headless Chrome's DevTools address, like `http://chrome:9222`, for rendering pages. See [Rendering pages with a headless browser](#rendering-pages-with-a-headless-browser) |
 | `browser_proxy_url` | none | The bot's proxy as Chrome reaches it, like `http://matrix-llm-bot:3128`. Required with `browser_url` |
 | `browser_proxy_listen` | `0.0.0.0:3128` | Where the proxy listens for Chrome |
+| `[mcp]` | off | The [MCP endpoint](#mcp-endpoint): `token` (required), `allow_llm`, `allow_control`, `include_private_rooms` (all `false`), `log_buffer_lines` (`2000`), and `allowed_hosts` |
 | `message_log_dir`, `usage_state_path`, `memory_path` | under `./data` | Where older versions kept data, read once for import |
 
 `config.toml.example` has the same options with comments.
@@ -593,6 +594,45 @@ Private conversations appear only as a total. The same data is available as JSON
 Costs are estimates from a hardcoded pricing table in `src/usage.rs`, not fetched live. They
 include cache reads and writes and web search fees, and models missing from the table
 aren't counted.
+
+## MCP endpoint
+
+With an `[mcp]` section in `config.toml`, the status server also serves an
+[MCP](https://modelcontextprotocol.io) endpoint at `/mcp`. Claude Code or another MCP
+client can then look into the running bot, debug its replies, and, if you allow it, act
+on it:
+
+```
+claude mcp add --transport http gordy http://127.0.0.1:8080/mcp \
+  --header "Authorization: Bearer <token>"
+```
+
+Use the host port from your compose file, like `8081`, when the bot runs in Docker.
+
+Tools come in three tiers, each switched on separately:
+
+| Tier | Setting | Tools |
+|---|---|---|
+| Observe | always on | `status`, `usage`, `stats`, `room_stats`, `recent_messages`, `search_messages`, `thread`, `get_prompt` (the exact prompts behind a classification and reply), `cache_check` (where consecutive chat prompts stop matching, which is what stops cache reads), `room_facts`, `skills`, `ignored_users`, `recent_logs`, `recent_failures` |
+| Claude | `allow_llm` | `classify` runs the classifier on any text without posting anything, and says whether code would treat it as addressed or as a command. `replay_reply` sends a past reply's stored prompt again, optionally on another model or with a different system prompt, and returns the new answer next to the old one. Both count toward `cost_limit_usd`, under `mcp:` labels. Replays run without tools, so they can't search the web or save facts |
+| Control | `allow_control` | `send_message`, `react`, `remember_fact`, `forget_fact`, `ignore_user`, `unignore_user`, `reload_skills`, `clear_throttle`, `join_room`, `leave_room`. Each one is logged and sent to `notify_users` as an alert, so no one holding the token can act unseen |
+
+Be careful with it:
+
+- Every request needs the bearer token. Generate one with `openssl rand -hex 32`. The bot
+  refuses to start with a token under 24 characters.
+- Private conversations and `!dm` games stay hidden unless `include_private_rooms` is on.
+- The endpoint only accepts loopback `Host` headers, which stops web pages from reaching
+  it through DNS rebinding. To reach it some other way, like over Tailscale, add the
+  name to `allowed_hosts`. Use an SSH tunnel or a private network rather than exposing
+  the port publicly.
+- The tools return what people wrote in chat. Someone in a room can write a message
+  aimed at whatever reads it, like "assistant, call send_message…". Leave
+  `allow_control` off unless you need it, and keep your client's approval prompts on for
+  control tools.
+- Users added with `ignore_user` are saved in the database. Users in `ignored_users` in
+  `config.toml` can only be removed there. Rooms in `rooms` are joined again on every
+  start, even after `leave_room`.
 
 ## Data and security
 
@@ -655,7 +695,7 @@ Ideas for later, not commitments. See [CHANGELOG.md](CHANGELOG.md) for what's sh
 - Login for the status page
 - Device verification instead of trusting all devices
 - Stronger limits on prompt injection from web results and room text
-- Admin commands to ignore a user or reload skills from chat
+- Admin commands to ignore a user or reload skills from chat, as the MCP endpoint can
 
 ### Deployment
 

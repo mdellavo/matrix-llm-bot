@@ -44,7 +44,7 @@ use crate::message_log::{
 };
 use crate::room_memory::{MemoryTools, RoomMemory};
 use crate::room_queue::{Inbox, RoomQueues};
-use crate::skills::{self, SkillRegistry};
+use crate::skills::{self, SharedSkills, SkillRegistry};
 use crate::throttle::{RATE_LIMITED_REPLY, Throttle};
 use crate::tools::ToolClients;
 use crate::usage::{COST_LIMIT_REPLY, UsageTracker};
@@ -57,12 +57,12 @@ const GENERATION_FAILED_REPLY: &str = "Sorry, I couldn't come up with a reply to
 /// rather than by the classifier, so they work the same every time and still work
 /// when the classifier is down.
 #[derive(Debug, PartialEq, Eq)]
-struct ParsedCommand<'a> {
-    name: &'a str,
-    args: &'a str,
+pub(crate) struct ParsedCommand<'a> {
+    pub(crate) name: &'a str,
+    pub(crate) args: &'a str,
 }
 
-fn parse_command(message_text: &str) -> Option<ParsedCommand<'_>> {
+pub(crate) fn parse_command(message_text: &str) -> Option<ParsedCommand<'_>> {
     let rest = message_text.trim_start().strip_prefix('!')?;
     if !rest.starts_with(|c: char| c.is_alphanumeric()) {
         return None;
@@ -100,7 +100,7 @@ fn reply_kind(analysis: &MessageAnalysis, directed_at_bot: bool, greeting_allowe
 /// Whether plain text addresses the bot by name: `gordy: hi`, `gordy, hi`,
 /// `@gordy hi`, `gordy what time is it`. A bare `gordy:` with nothing after it isn't
 /// a message, and `gordys` or `gordy's` is a different word.
-fn addresses_bot_by_name(message_text: &str, bot_name: &str) -> bool {
+pub(crate) fn addresses_bot_by_name(message_text: &str, bot_name: &str) -> bool {
     let text = message_text.trim_start();
     let text = text.strip_prefix('@').unwrap_or(text);
 
@@ -484,7 +484,7 @@ impl Drop for TypingIndicator {
 pub struct HandlerContext {
     pub anthropic: Arc<Anthropic>,
     pub message_log: Arc<MessageLogger>,
-    pub skills: Arc<SkillRegistry>,
+    pub skills: Arc<SharedSkills>,
     pub tool_clients: Arc<ToolClients>,
     pub usage_tracker: Arc<UsageTracker>,
     pub greeting_cooldown: Arc<GreetingCooldown>,
@@ -1170,14 +1170,14 @@ fn history_split(total: usize, loaded: usize) -> (usize, usize) {
 
 /// Number of recent room messages fed into `classify_message` as context. Smaller
 /// than `CHAT_HISTORY_LIMIT` since classification runs on every message.
-const CLASSIFY_HISTORY_LIMIT: usize = 10;
+pub(crate) const CLASSIFY_HISTORY_LIMIT: usize = 10;
 
 /// Model for chat and greeting replies.
 pub const CHAT_MODEL: &str = "claude-opus-5-5";
 
 /// Covers the reply plus thinking, which counts toward this on current models and
 /// can't be turned off on `CHAT_MODEL`.
-const CHAT_MAX_TOKENS: u32 = 8000;
+pub(crate) const CHAT_MAX_TOKENS: u32 = 8000;
 const GREETING_MAX_TOKENS: u32 = 2000;
 
 /// Enough to check a fact and follow up once or twice, at $0.01 per search.
@@ -1190,7 +1190,7 @@ const CHAT_MAX_FETCHES: u32 = 3;
 const PASS: &str = "PASS";
 
 /// Label Claude API calls for chat replies are recorded under in `UsageTracker`.
-const CHAT_USAGE_LABEL: &str = "chat";
+pub(crate) const CHAT_USAGE_LABEL: &str = "chat";
 
 /// Label Claude API calls for greetings are recorded under in `UsageTracker`.
 const GREETING_USAGE_LABEL: &str = "greeting";
@@ -1602,7 +1602,7 @@ async fn handle_command(
     message_text: &str,
 ) -> GeneratedReply {
     if command.name.eq_ignore_ascii_case("help") {
-        return GeneratedReply::plain(help_reply(&ctx.skills), "help");
+        return GeneratedReply::plain(help_reply(&ctx.skills.current()), "help");
     }
 
     if command.name.eq_ignore_ascii_case("pp") {
@@ -1626,7 +1626,8 @@ async fn handle_command(
         return GeneratedReply::plain(reply, "help");
     }
 
-    match ctx.skills.get(command.name) {
+    let skills = ctx.skills.current();
+    match skills.get(command.name) {
         Some(skill) => {
             skills::execute(
                 &ctx.anthropic,

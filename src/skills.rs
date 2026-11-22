@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, RwLock};
 
 use anyhow::{Context, Result};
 use matrix_sdk::room::Room;
@@ -237,6 +238,32 @@ impl SkillRegistry {
         let mut skills: Vec<&Skill> = self.skills.values().collect();
         skills.sort_by(|a, b| a.name.cmp(&b.name));
         skills
+    }
+}
+
+/// The loaded skills, which can be reloaded from disk while the bot runs. Readers take
+/// the current registry with `current` and keep it for the whole command, so a reload
+/// part-way through never swaps a skill out from under one.
+pub struct SharedSkills {
+    dir: PathBuf,
+    current: RwLock<Arc<SkillRegistry>>,
+}
+
+impl SharedSkills {
+    pub fn load(dir: &Path) -> Result<Self> {
+        Ok(Self { dir: dir.to_path_buf(), current: RwLock::new(Arc::new(SkillRegistry::load(dir)?)) })
+    }
+
+    pub fn current(&self) -> Arc<SkillRegistry> {
+        Arc::clone(&self.current.read().unwrap_or_else(|poisoned| poisoned.into_inner()))
+    }
+
+    /// Reads the skills directory again. On an error, such as two skills with one name,
+    /// the skills already loaded stay in place.
+    pub fn reload(&self) -> Result<Arc<SkillRegistry>> {
+        let registry = Arc::new(SkillRegistry::load(&self.dir)?);
+        *self.current.write().unwrap_or_else(|poisoned| poisoned.into_inner()) = Arc::clone(&registry);
+        Ok(registry)
     }
 }
 

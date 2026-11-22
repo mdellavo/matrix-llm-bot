@@ -1,6 +1,6 @@
 [package]
 name = "matrix-llm-bot"
-version = "0.20.0"
+version = "0.21.0"
 edition = "2024"
 # Also what the bot tells people when they ask where its code is.
 repository = "https://github.com/mdellavo/matrix-llm-bot"
@@ -38,3 +38,6 @@ futures-util = { version = "0.3", default-features = false }
 image = { version = "0.25.10", default-features = false, features = ["gif", "jpeg", "png"] }
 ab_glyph = "0.2.32"
 mime = "0.3.17"
+# The MCP endpoint (`src/mcp_server.rs`). Tools are described by hand rather than with
+# the macros, so each tier can be left out of the list when it's off.
+rmcp = { version = "3.11.0", default-features = false, features = ["server", "transport-streamable-http-server"] }

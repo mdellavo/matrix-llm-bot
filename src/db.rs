@@ -147,6 +147,12 @@ const MIGRATIONS: &[&str] = &["
         created_at TEXT NOT NULL
     );
     CREATE INDEX game_log_game ON game_log (game_id, id);
+", "
+    CREATE TABLE ignored_users (
+        user_id TEXT PRIMARY KEY,
+        added_by TEXT NOT NULL,
+        added_at TEXT NOT NULL
+    );
 "];
 
 #[derive(Debug)]

@@ -41,6 +41,15 @@ impl Throttle {
         (until > now).then(|| until - now)
     }
 
+    /// Ends a cooldown early, for an operator who knows the limit has passed. Whether
+    /// one was running.
+    pub fn clear(&self) -> bool {
+        let mut until = self.until.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let was_running = until.is_some_and(|until| until > Instant::now());
+        *until = None;
+        was_running
+    }
+
     /// Records a rate-limit response, pausing further Claude calls until
     /// `now + default_backoff` (the SDK's `AnthropicError` doesn't carry the
     /// real `Retry-After` value through to us once its own retries are

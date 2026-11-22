@@ -24,7 +24,7 @@ use crate::links::LinkFetcher;
 use crate::message_log::{MessageLogger, short_name};
 use crate::room_memory::RoomMemory;
 use crate::room_queue::RoomQueues;
-use crate::skills::SkillRegistry;
+use crate::skills::SharedSkills;
 use crate::throttle::Throttle;
 use crate::tools::ToolClients;
 use crate::usage::UsageTracker;
@@ -35,7 +35,7 @@ const DEVICE_ID_FILE_NAME: &str = "device_id";
 pub struct Bot {
     client: Client,
     message_log: Arc<MessageLogger>,
-    skills: Arc<SkillRegistry>,
+    skills: Arc<SharedSkills>,
     tool_clients: Arc<ToolClients>,
     usage_tracker: Arc<UsageTracker>,
     greeting_cooldown: Arc<GreetingCooldown>,
@@ -46,6 +46,11 @@ pub struct Bot {
     /// See `Config::notify_users`.
     notify_users: Vec<OwnedUserId>,
     dm: Arc<crate::dm::Dm>,
+    anthropic: Arc<Anthropic>,
+    memory: Arc<RoomMemory>,
+    bot_name: String,
+    /// Where alerts go, when there's anyone to send them to.
+    alerts: Option<crate::notify::Alerts>,
     /// Alerts waiting for `run` to start delivering them.
     alert_queue: Option<tokio::sync::mpsc::UnboundedReceiver<String>>,
 }
@@ -89,14 +94,16 @@ impl Bot {
         import_legacy_data(&database, config).context("failed to import older data files")?;
 
         let message_log = Arc::new(MessageLogger::new(Arc::clone(&database)));
-        let skills = Arc::new(SkillRegistry::load(&config.skills_dir)?);
+        let skills = Arc::new(SharedSkills::load(&config.skills_dir)?);
         let tool_clients = Arc::new(ToolClients::new(config.omdb_api_key.clone()));
         let usage_tracker = Arc::new(
             UsageTracker::open(Arc::clone(&database), config.cost_limit_usd)
                 .context("failed to load persisted Claude API usage stats")?,
         );
         let greeting_cooldown = Arc::new(GreetingCooldown::new(crate::greeting::DEFAULT_COOLDOWN));
-        let ignored_users = Arc::new(IgnoredUsers::new(config.ignored_users.clone()));
+        let ignored_users = Arc::new(
+            IgnoredUsers::open(Arc::clone(&database), config.ignored_users.clone()).context("failed to load ignored users")?,
+        );
         let rate_limit = Arc::new(Throttle::new(std::time::Duration::from_secs(config.rate_limit_backoff_secs)));
         let direct_rooms = Arc::new(DirectRooms::new(Arc::clone(&database), config.dm_allowed_users.clone()));
 
@@ -113,8 +120,10 @@ impl Bot {
             direct_rooms: Arc::clone(&direct_rooms),
             ignored_users: Arc::clone(&ignored_users),
         });
+        let memory = Arc::new(RoomMemory::new(Arc::clone(&database)));
+        let bot_name = short_name(&config.username).to_string();
         client.add_event_handler_context(Arc::new(HandlerContext {
-            anthropic,
+            anthropic: Arc::clone(&anthropic),
             message_log: Arc::clone(&message_log),
             skills: Arc::clone(&skills),
             tool_clients: Arc::clone(&tool_clients),
@@ -123,7 +132,7 @@ impl Bot {
             ignored_users: Arc::clone(&ignored_users),
             rate_limit: Arc::clone(&rate_limit),
             direct_rooms: Arc::clone(&direct_rooms),
-            memory: Arc::new(RoomMemory::new(Arc::clone(&database))),
+            memory: Arc::clone(&memory),
             room_queues: Arc::new(RoomQueues::default()),
             links: Arc::new(link_fetcher(config).await?),
             docs: Arc::new(BotDocs::new()?),
@@ -131,7 +140,7 @@ impl Bot {
             interjection_cooldown: Arc::new(GreetingCooldown::new(std::time::Duration::from_secs(
                 config.interjection_cooldown_secs,
             ))),
-            bot_name: short_name(&config.username).to_string(),
+            bot_name: bot_name.clone(),
             database: Arc::clone(&database),
             start_time: std::time::Instant::now(),
             dm: Arc::clone(&dm),
@@ -139,11 +148,13 @@ impl Bot {
 
         // Checked by `Config::validate`.
         let notify_users: Vec<OwnedUserId> = config.notify_users.iter().filter_map(|user| UserId::parse(user.as_str()).ok()).collect();
-        let alert_queue = (!notify_users.is_empty()).then(|| {
+        let (alerts, alert_queue) = if notify_users.is_empty() {
+            (None, None)
+        } else {
             let (alerts, queue) = crate::notify::Alerts::channel();
-            usage_tracker.alert_to(alerts);
-            queue
-        });
+            usage_tracker.alert_to(alerts.clone());
+            (Some(alerts), Some(queue))
+        };
 
         Ok(Self {
             client,
@@ -159,6 +170,10 @@ impl Bot {
             notify_users,
             alert_queue,
             dm,
+            anthropic,
+            memory,
+            bot_name,
+            alerts,
         })
     }
 
@@ -210,7 +225,7 @@ impl Bot {
     /// A clone of the shared skill registry handle, for callers (e.g. the status
     /// server) that need to list loaded commands without going through the event
     /// handler.
-    pub fn skills(&self) -> Arc<SkillRegistry> {
+    pub fn skills(&self) -> Arc<SharedSkills> {
         Arc::clone(&self.skills)
     }
 
@@ -258,6 +273,19 @@ impl Bot {
     /// on what's stored.
     pub fn database(&self) -> Arc<Database> {
         Arc::clone(&self.database)
+    }
+
+    /// What the MCP endpoint needs beyond the status server's state.
+    pub fn mcp_parts(&self, config: crate::config::McpConfig, logs: Option<crate::log_buffer::LogBuffer>) -> crate::mcp_server::McpParts {
+        crate::mcp_server::McpParts {
+            config,
+            anthropic: Arc::clone(&self.anthropic),
+            bot_name: self.bot_name.clone(),
+            memory: Arc::clone(&self.memory),
+            ignored_users: Arc::clone(&self.ignored_users),
+            logs,
+            alerts: self.alerts.clone(),
+        }
     }
 
     /// Joins every room configured for monitoring. Already-joined rooms are skipped.

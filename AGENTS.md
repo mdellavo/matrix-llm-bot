@@ -43,6 +43,7 @@ To test Claude calls without the API, use the fake Messages server in `src/llm.r
 | `src/changelog.rs` | `!changelog`, from the `CHANGELOG.md` compiled into the build |
 | `src/pp.rs`, `assets/pp/` | The `!pp` GIF and the font and emoji it's drawn with, which the cast sheet also uses |
 | `src/stats.rs`, `src/status_server.rs`, `src/stats_command.rs` | Status page, the activity counts behind it, and `!stats` |
+| `src/mcp_server.rs`, `src/log_buffer.rs` | The MCP endpoint at `/mcp` and its tool tiers, and the recent log lines it reads |
 | `src/usage.rs` | Token counts, prices, and the cost limit |
 
 ## Protect runtime state
@@ -91,6 +92,9 @@ To test Claude calls without the API, use the fake Messages server in `src/llm.r
 - The headless browser runs untrusted scripts, so it must reach the network only through
   `browser_proxy`. Don't give its container a network route of its own, and don't add
   plain-HTTP proxying, which can't be checked per request.
+- A new MCP tool goes in the lowest tier that fits in `src/mcp_server.rs`. Anything that
+  calls Claude is `Llm`, and anything that changes state is `Control` and calls `audit`.
+  Room tools take their room through `room_arg`, which keeps private rooms hidden.
 - Consider per-message cost. Classification runs on nearly every message, and anything
   added there is paid for constantly.
 

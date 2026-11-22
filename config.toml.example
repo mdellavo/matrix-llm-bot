@@ -87,3 +87,23 @@ rooms = ["#some-room:matrix.org"]
 # with each user, or creates one. Defaults to nobody. notify_on_start, its old name,
 # still works.
 # notify_users = ["@alice:matrix.org"]
+
+# Optional: an MCP endpoint at /mcp on the status server, for Claude Code or another
+# MCP client. See "MCP endpoint" in the README. Keep this section at the end of the
+# file, since TOML puts every line after [mcp] in it.
+# [mcp]
+# Required. Clients send it as "Authorization: Bearer <token>". At least 24 characters;
+# generate one with: openssl rand -hex 32
+# token = ""
+# Tools that call Claude and count toward cost_limit_usd: classify and replay_reply.
+# allow_llm = false
+# Tools that act: sending messages, reactions, facts, ignoring users, reloading
+# skills, clearing the rate-limit pause, and joining or leaving rooms. Each is logged
+# and sent to notify_users.
+# allow_control = false
+# Show private conversations and !dm games too.
+# include_private_rooms = false
+# Log lines kept in memory for recent_logs.
+# log_buffer_lines = 2000
+# Host headers to accept beyond localhost, like "bot.tailnet.ts.net:8080".
+# allowed_hosts = []

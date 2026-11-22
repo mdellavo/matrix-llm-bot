@@ -15,6 +15,8 @@ mod ignore;
 mod legacy_import;
 mod links;
 mod llm;
+mod log_buffer;
+mod mcp_server;
 mod message_log;
 mod notify;
 mod photo_sheet;
@@ -37,7 +39,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::Result;
-use tracing_subscriber::EnvFilter;
+use tracing_subscriber::{EnvFilter, Layer, layer::SubscriberExt, util::SubscriberInitExt};
 
 use bot::Bot;
 use config::Config;
@@ -66,15 +68,32 @@ async fn main() -> Result<()> {
         return dm::export(&database, args.get(1).map(String::as_str), &mut std::io::stdout().lock());
     }
 
-    tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(DEFAULT_LOG_FILTER)))
-        .init();
-
     let config = Config::load(&config_path())?;
+
+    // With MCP on, log lines also go to a buffer that `recent_logs` reads.
+    let log_filter = || EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(DEFAULT_LOG_FILTER));
+    let logs = config.mcp.as_ref().map(|mcp| log_buffer::LogBuffer::new(mcp.log_buffer_lines));
+    let buffer_layer = logs
+        .clone()
+        .map(|logs| tracing_subscriber::fmt::layer().with_ansi(false).with_writer(logs).with_filter(log_filter()));
+    tracing_subscriber::registry()
+        .with(tracing_subscriber::fmt::layer().with_filter(log_filter()))
+        .with(buffer_layer)
+        .init();
 
     let bot = Bot::new(&config).await?;
     bot.join_configured_rooms(&config.rooms).await?;
 
+    let mcp = config.mcp.clone().map(|mcp| {
+        if !config.http_listen_addr.ip().is_loopback() {
+            tracing::warn!(
+                addr = %config.http_listen_addr,
+                "the MCP endpoint is on and the status server isn't loopback-only; make sure only trusted machines can reach it"
+            );
+        }
+        tracing::info!(allow_llm = mcp.allow_llm, allow_control = mcp.allow_control, "MCP endpoint on at /mcp");
+        Arc::new(bot.mcp_parts(mcp, logs))
+    });
     let status_state = Arc::new(AppState {
         start_time: Instant::now(),
         client: bot.client(),
@@ -89,6 +108,7 @@ async fn main() -> Result<()> {
         fetch_links: config.fetch_links,
         browser_rendering: config.browser_url.is_some(),
         notify_users: config.notify_users.clone(),
+        mcp,
     });
     let http_listen_addr = config.http_listen_addr;
     tokio::spawn(async move {
