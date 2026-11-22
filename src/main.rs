@@ -53,9 +53,12 @@ use status_server::AppState;
 /// key was found" on every attempted key backup — expected and permanent, since
 /// this bot doesn't set up server-side key backup. `chromiumoxide::handler` warns on
 /// every DevTools event newer than the crate knows, which is most of them on a current
-/// Chrome, and those events aren't ones it uses. Explicitly set `RUST_LOG` to see any
-/// of these again.
-const DEFAULT_LOG_FILTER: &str = "info,matrix_sdk_base::client=warn,matrix_sdk_crypto::backups=error,chromiumoxide::handler=error";
+/// Chrome, and those events aren't ones it uses. `rmcp` logs three lines at `info` for
+/// every MCP request, since each one is served as its own short session, which would
+/// crowd the bot's own lines out of the buffer `recent_logs` reads. Explicitly set
+/// `RUST_LOG` to see any of these again.
+const DEFAULT_LOG_FILTER: &str =
+    "info,matrix_sdk_base::client=warn,matrix_sdk_crypto::backups=error,chromiumoxide::handler=error,rmcp=warn";
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -75,7 +78,7 @@ async fn main() -> Result<()> {
     let logs = config.mcp.as_ref().map(|mcp| log_buffer::LogBuffer::new(mcp.log_buffer_lines));
     let buffer_layer = logs
         .clone()
-        .map(|logs| tracing_subscriber::fmt::layer().with_ansi(false).with_writer(logs).with_filter(log_filter()));
+        .map(|logs| log_buffer::layer(logs).with_filter(log_filter()));
     tracing_subscriber::registry()
         .with(tracing_subscriber::fmt::layer().with_filter(log_filter()))
         .with(buffer_layer)
