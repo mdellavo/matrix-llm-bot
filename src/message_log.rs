@@ -387,10 +387,20 @@ impl MessageLogger {
 
     /// The stored message with this event ID, without its prompts.
     pub fn get(&self, room_id: &str, event_id: &str) -> Result<Option<LoggedMessage>> {
-        let sql = format!("SELECT {MESSAGE_COLUMNS} FROM messages WHERE room_id = ?1 AND event_id = ?2");
+        self.read_one(room_id, event_id, false)
+    }
+
+    /// `get`, with the prompts behind its classification and reply.
+    pub fn get_with_prompts(&self, room_id: &str, event_id: &str) -> Result<Option<LoggedMessage>> {
+        self.read_one(room_id, event_id, true)
+    }
+
+    fn read_one(&self, room_id: &str, event_id: &str, with_prompts: bool) -> Result<Option<LoggedMessage>> {
+        let columns = if with_prompts { format!("{MESSAGE_COLUMNS}, {PROMPT_COLUMNS}") } else { MESSAGE_COLUMNS.to_string() };
+        let sql = format!("SELECT {columns} FROM messages WHERE room_id = ?1 AND event_id = ?2");
         let entry = self.database.with(|connection| {
             let mut statement = connection.prepare_cached(&sql)?;
-            let mut rows = statement.query_map([room_id, event_id], |row| read_message(row, false))?;
+            let mut rows = statement.query_map([room_id, event_id], |row| read_message(row, with_prompts))?;
             rows.next().transpose().map(Option::flatten)
         })?;
         Ok(entry)

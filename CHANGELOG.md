@@ -3,6 +3,12 @@
 Notable changes to matrix-llm-bot, built from the git history. Each version covers
 one day of commits, newest first.
 
+## 0.21.0 - 2026-11-22
+
+### Added
+
+- An MCP endpoint, for looking into and running the bot from Claude Code or another MCP client. It's off until `[mcp]` is set in `config.toml`, and needs a token. It can read messages, the exact prompts behind any reply, usage, stats, saved facts, recent logs, and failed Claude calls, and find what's stopping prompt cache reads. With `allow_llm`, it can test the classifier on any text and replay a past reply on another model or prompt. With `allow_control`, it can post and react as the bot, save and delete facts, ignore people, reload skills, end a rate-limit pause, and join or leave rooms, and each of those is sent to `notify_users`. Private conversations stay hidden unless `include_private_rooms` is on
+
 ## 0.20.0 - 2026-11-17
 
 ### Added

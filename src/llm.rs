@@ -317,6 +317,56 @@ fn final_text(content: &[Value]) -> String {
         .to_string()
 }
 
+/// A stand-in for the Messages API, for testing Claude calls without the real one.
+#[cfg(test)]
+pub(crate) mod fake {
+    use std::sync::{Arc, Mutex};
+
+    use axum::{Json, Router, extract::State, http::HeaderMap, routing::post};
+    use serde_json::{Value, json};
+    use threatflux_anthropic_sdk::{Client as Anthropic, Config};
+
+    pub type Seen = Arc<Mutex<Vec<(Option<String>, Value)>>>;
+
+    /// Answers each request with the next canned response, recording what it got.
+    pub async fn serve(responses: Vec<Value>) -> (Anthropic, Seen) {
+        let seen: Seen = Arc::default();
+        let state = (Arc::clone(&seen), Arc::new(responses));
+
+        async fn handler(
+            State((seen, responses)): State<(Seen, Arc<Vec<Value>>)>,
+            headers: HeaderMap,
+            Json(body): Json<Value>,
+        ) -> Json<Value> {
+            let beta = headers.get("anthropic-beta").map(|value| value.to_str().unwrap().to_string());
+            let mut seen = seen.lock().unwrap();
+            seen.push((beta, body));
+            Json(responses[seen.len() - 1].clone())
+        }
+
+        let app = Router::new().route("/v1/messages", post(handler)).with_state(state);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let base_url = format!("http://127.0.0.1:{port}/").parse().unwrap();
+        (Anthropic::new(Config::new("test-key").unwrap().with_base_url(base_url)), seen)
+    }
+
+    pub fn response(content: Value, stop_reason: &str, model: &str) -> Value {
+        json!({
+            "id": "msg_1",
+            "type": "message",
+            "role": "assistant",
+            "model": model,
+            "content": content,
+            "stop_reason": stop_reason,
+            "stop_sequence": null,
+            "usage": {"input_tokens": 1000, "output_tokens": 1000},
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -472,52 +522,10 @@ mod tests {
     }
 
     mod against_a_fake_server {
-        use std::sync::{Arc, Mutex};
+        use std::sync::Arc;
 
-        use axum::{Json, Router, extract::State, http::HeaderMap, routing::post};
-        use threatflux_anthropic_sdk::Config;
-
+        use super::super::fake::{response, serve};
         use super::*;
-
-        type Seen = Arc<Mutex<Vec<(Option<String>, Value)>>>;
-
-        /// Answers each request with the next canned response, recording what it got.
-        async fn serve(responses: Vec<Value>) -> (Anthropic, Seen) {
-            let seen: Seen = Arc::default();
-            let state = (Arc::clone(&seen), Arc::new(responses));
-
-            async fn handler(
-                State((seen, responses)): State<(Seen, Arc<Vec<Value>>)>,
-                headers: HeaderMap,
-                Json(body): Json<Value>,
-            ) -> Json<Value> {
-                let beta = headers.get("anthropic-beta").map(|value| value.to_str().unwrap().to_string());
-                let mut seen = seen.lock().unwrap();
-                seen.push((beta, body));
-                Json(responses[seen.len() - 1].clone())
-            }
-
-            let app = Router::new().route("/v1/messages", post(handler)).with_state(state);
-            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let port = listener.local_addr().unwrap().port();
-            tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-
-            let base_url = format!("http://127.0.0.1:{port}/").parse().unwrap();
-            (Anthropic::new(Config::new("test-key").unwrap().with_base_url(base_url)), seen)
-        }
-
-        fn response(content: Value, stop_reason: &str, model: &str) -> Value {
-            json!({
-                "id": "msg_1",
-                "type": "message",
-                "role": "assistant",
-                "model": model,
-                "content": content,
-                "stop_reason": stop_reason,
-                "stop_sequence": null,
-                "usage": {"input_tokens": 1000, "output_tokens": 1000},
-            })
-        }
 
         fn tracker(_label: &str) -> UsageTracker {
             UsageTracker::open(Arc::new(crate::db::Database::open_in_memory()), None).unwrap()

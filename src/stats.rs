@@ -189,7 +189,7 @@ fn people(connection: &Connection) -> rusqlite::Result<Vec<PersonActivity>> {
 }
 
 /// One room's activity, for `!stats` in that room.
-#[derive(Debug, Default, PartialEq, Eq)]
+#[derive(Debug, Default, PartialEq, Eq, Serialize)]
 pub struct RoomStats {
     pub messages: u64,
     pub messages_24h: u64,

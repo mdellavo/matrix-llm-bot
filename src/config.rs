@@ -126,6 +126,57 @@ pub struct Config {
     /// Required with `browser_url`.
     #[serde(default)]
     pub browser_proxy_url: Option<String>,
+
+    /// The MCP endpoint at `/mcp` on the status server, for operating the bot from
+    /// Claude Code or another MCP client. Absent (the default) leaves it off.
+    #[serde(default)]
+    pub mcp: Option<McpConfig>,
+}
+
+/// See `src/mcp_server.rs`. Each tier is a separate opt-in, since each gives whoever
+/// holds the token more than the last.
+#[derive(Clone, Deserialize)]
+pub struct McpConfig {
+    /// Sent as `Authorization: Bearer <token>`. Every request needs it.
+    pub token: String,
+    /// Tools that call Claude, and so cost money: `classify` and `replay_reply`.
+    #[serde(default)]
+    pub allow_llm: bool,
+    /// Tools that change things: sending messages, facts, ignoring people, and so on.
+    #[serde(default)]
+    pub allow_control: bool,
+    /// Private rooms and `!dm` games are hidden unless this is on.
+    #[serde(default)]
+    pub include_private_rooms: bool,
+    /// How many recent log lines `recent_logs` can return.
+    #[serde(default = "default_mcp_log_lines")]
+    pub log_buffer_lines: usize,
+    /// `Host` headers to accept beyond loopback, like `bot.tailnet.ts.net:8080`, for
+    /// reaching the endpoint other than through localhost. Checking `Host` is what stops
+    /// a web page from reaching it through DNS rebinding.
+    #[serde(default)]
+    pub allowed_hosts: Vec<String>,
+}
+
+/// Leaves the token out, since `Config` is sometimes debug-printed.
+impl std::fmt::Debug for McpConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("McpConfig")
+            .field("token", &"<redacted>")
+            .field("allow_llm", &self.allow_llm)
+            .field("allow_control", &self.allow_control)
+            .field("include_private_rooms", &self.include_private_rooms)
+            .field("log_buffer_lines", &self.log_buffer_lines)
+            .field("allowed_hosts", &self.allowed_hosts)
+            .finish()
+    }
+}
+
+/// Shortest token accepted, so a placeholder like "changeme" can't go live.
+const MIN_MCP_TOKEN_LEN: usize = 24;
+
+fn default_mcp_log_lines() -> usize {
+    2000
 }
 
 fn default_browser_proxy_listen() -> String {
@@ -214,6 +265,12 @@ impl Config {
                 "dm_allowed_users entries must look like @user:example.org or :example.org, got {entry}"
             );
         }
+        if let Some(mcp) = &self.mcp {
+            anyhow::ensure!(
+                mcp.token.trim().len() >= MIN_MCP_TOKEN_LEN,
+                "mcp.token must be at least {MIN_MCP_TOKEN_LEN} characters; generate one with `openssl rand -hex 32`"
+            );
+        }
         Ok(())
     }
 }
@@ -228,6 +285,19 @@ mod tests {
         ))?;
         config.validate()?;
         Ok(config)
+    }
+
+    #[test]
+    fn mcp_is_off_unless_configured_and_needs_a_real_token() {
+        assert!(config("").unwrap().mcp.is_none());
+
+        let on = config("[mcp]\ntoken = \"0123456789abcdef0123456789abcdef\"").unwrap().mcp.unwrap();
+        assert!(!on.allow_llm && !on.allow_control && !on.include_private_rooms);
+        assert_eq!(on.log_buffer_lines, 2000);
+        assert!(!format!("{on:?}").contains("0123456789abcdef"));
+
+        let err = config("[mcp]\ntoken = \"changeme\"").unwrap_err().to_string();
+        assert!(err.contains("mcp.token must be at least"), "{err}");
     }
 
     #[test]

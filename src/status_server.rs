@@ -17,7 +17,7 @@ use tracing::info;
 use crate::db::Database;
 use crate::direct_rooms::DirectRooms;
 use crate::message_log::MessageLogger;
-use crate::skills::SkillRegistry;
+use crate::skills::SharedSkills;
 use crate::throttle::Throttle;
 use crate::tools::ToolClients;
 use crate::usage::UsageTracker;
@@ -33,7 +33,7 @@ pub struct AppState {
     pub start_time: Instant,
     pub client: Client,
     pub message_log: Arc<MessageLogger>,
-    pub skills: Arc<SkillRegistry>,
+    pub skills: Arc<SharedSkills>,
     pub tool_clients: Arc<ToolClients>,
     pub usage_tracker: Arc<UsageTracker>,
     pub rate_limit: Arc<Throttle>,
@@ -46,17 +46,24 @@ pub struct AppState {
     pub browser_rendering: bool,
     /// See `Config::notify_users`.
     pub notify_users: Vec<String>,
+    /// The MCP endpoint's own needs, when `[mcp]` is configured.
+    pub mcp: Option<Arc<crate::mcp_server::McpParts>>,
 }
 
 fn router(state: Arc<AppState>) -> Router {
-    Router::new()
+    let mcp = state.mcp.clone().map(|parts| crate::mcp_server::router(Arc::clone(&state), parts));
+    let pages = Router::new()
         .route("/", get(index))
         .route("/api/status", get(api_status))
         .route("/api/rooms/{room_id}/messages", get(api_room_messages))
         .route("/api/skills", get(api_skills))
         .route("/api/usage", get(api_usage))
         .route("/api/stats", get(api_stats))
-        .with_state(state)
+        .with_state(state);
+    match mcp {
+        Some(mcp) => pages.merge(mcp),
+        None => pages,
+    }
 }
 
 /// Binds and serves the status/debugging HTTP server until it errors or is aborted.
@@ -74,7 +81,7 @@ pub async fn serve(addr: SocketAddr, state: Arc<AppState>) -> Result<()> {
 }
 
 #[derive(Debug, Serialize)]
-struct StatusResponse {
+pub(crate) struct StatusResponse {
     bot_user_id: Option<String>,
     homeserver_url: String,
     version: &'static str,
@@ -94,30 +101,35 @@ struct StatusResponse {
 }
 
 #[derive(Debug, Serialize)]
-struct RoomSummary {
+pub(crate) struct RoomSummary {
     room_id: String,
     display_name: Option<String>,
 }
 
 /// Private conversations stay off this page, since it has no login. If that can't be
 /// checked, the room is treated as private.
-fn is_private(state: &AppState, room_id: &str) -> bool {
+pub(crate) fn is_private(state: &AppState, room_id: &str) -> bool {
     state.direct_rooms.contains(room_id).unwrap_or(true)
 }
 
 async fn api_status(State(state): State<Arc<AppState>>) -> Json<StatusResponse> {
+    Json(status(&state, false))
+}
+
+/// What `/api/status` shows. The MCP endpoint can be set to include private rooms.
+pub(crate) fn status(state: &AppState, include_private: bool) -> StatusResponse {
     let rooms = state
         .client
         .joined_rooms()
         .into_iter()
-        .filter(|room| !is_private(&state, room.room_id().as_str()))
+        .filter(|room| include_private || !is_private(state, room.room_id().as_str()))
         .map(|room| RoomSummary {
             room_id: room.room_id().to_string(),
             display_name: room.name(),
         })
         .collect();
 
-    Json(StatusResponse {
+    StatusResponse {
         bot_user_id: state.client.user_id().map(|id| id.to_string()),
         homeserver_url: state.homeserver_url.clone(),
         version: env!("CARGO_PKG_VERSION"),
@@ -131,7 +143,7 @@ async fn api_status(State(state): State<Arc<AppState>>) -> Json<StatusResponse> 
         omdb_configured: state.tool_clients.has_omdb_key(),
         rate_limited_seconds_remaining: state.rate_limit.remaining().map(|remaining| remaining.as_secs()),
         rooms,
-    })
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -157,7 +169,7 @@ async fn api_room_messages(
 }
 
 #[derive(Debug, Serialize)]
-struct SkillSummary {
+pub(crate) struct SkillSummary {
     name: String,
     description: String,
     usage: Option<String>,
@@ -170,6 +182,10 @@ struct SkillSummary {
 
 /// Every command: the built-ins, then the loaded skills.
 async fn api_skills(State(state): State<Arc<AppState>>) -> Json<Vec<SkillSummary>> {
+    Json(skill_summaries(&state))
+}
+
+pub(crate) fn skill_summaries(state: &AppState) -> Vec<SkillSummary> {
     let builtins = crate::handler::BUILTIN_COMMANDS.iter().map(|command| SkillSummary {
         name: command.name.to_string(),
         description: command.description.to_string(),
@@ -179,8 +195,8 @@ async fn api_skills(State(state): State<Arc<AppState>>) -> Json<Vec<SkillSummary
         model: None,
         builtin: true,
     });
-    let skills = builtins
-        .chain(state.skills.list().into_iter().map(|skill| SkillSummary {
+    builtins
+        .chain(state.skills.current().list().into_iter().map(|skill| SkillSummary {
             name: skill.name.clone(),
             description: skill.description.clone(),
             usage: skill.usage.clone(),
@@ -189,9 +205,7 @@ async fn api_skills(State(state): State<Arc<AppState>>) -> Json<Vec<SkillSummary
             model: skill.model.clone(),
             builtin: false,
         }))
-        .collect();
-
-    Json(skills)
+        .collect()
 }
 
 /// Claude API token/request usage over the bot's whole life, kept in the database (see
@@ -805,7 +819,7 @@ mod tests {
             .expect("log message 2");
 
         let skills_dir = unique_temp_dir("status-server-skills");
-        let skills = Arc::new(SkillRegistry::load(&skills_dir).expect("load skills"));
+        let skills = Arc::new(SharedSkills::load(&skills_dir).expect("load skills"));
         let tool_clients = Arc::new(ToolClients::new(None));
         let direct_database = Arc::clone(&database);
         let stats_database = Arc::clone(&database);
@@ -829,6 +843,7 @@ mod tests {
             fetch_links: true,
             browser_rendering: false,
             notify_users: vec!["@admin:example.org".to_string()],
+            mcp: None,
         });
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind ephemeral port");

@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use anyhow::{Context, Result};
@@ -20,6 +20,16 @@ const FAILURES_BEFORE_ALERT: u32 = 5;
 /// How much of a failure's error text an alert quotes.
 const ALERT_ERROR_CHARS: usize = 300;
 
+/// How many failed Claude calls `recent_failures` remembers, for the MCP endpoint.
+const RECENT_FAILURES_KEPT: usize = 50;
+
+/// A failed Claude call, kept in memory only.
+#[derive(Debug, Clone, Serialize)]
+pub struct FailureRecord {
+    pub at: String,
+    pub error: String,
+}
+
 /// The `usage_totals` row holding the bot-wide totals. Label names come from skills
 /// and fixed strings, which never start with `*`.
 pub const OVERALL_LABEL: &str = "*overall";
@@ -40,6 +50,11 @@ fn price_per_million_tokens(model: &str) -> Option<(f64, f64)> {
         "claude-fable-5-1" | "claude-fable-5" | "claude-mythos-5-1" | "claude-mythos-5" => Some((10.00, 50.00)),
         _ => None,
     }
+}
+
+/// Whether calls to `model` count toward the cost limit.
+pub fn is_priced(model: &str) -> bool {
+    price_per_million_tokens(model).is_some()
 }
 
 /// What a 5-minute cache write costs relative to normal input, on every model.
@@ -217,6 +232,7 @@ pub struct UsageTracker {
     /// Where spend and failure alerts go, once `alert_to` sets it.
     alerts: OnceLock<Alerts>,
     failures: Mutex<Failures>,
+    recent_failures: Mutex<VecDeque<FailureRecord>>,
 }
 
 /// Claude calls that have failed since the last one that worked.
@@ -246,7 +262,7 @@ impl UsageTracker {
             }
         }
 
-        Ok(Self { database, cost_limit_usd, inner: Mutex::new(inner), alerts: OnceLock::new(), failures: Mutex::default() })
+        Ok(Self { database, cost_limit_usd, inner: Mutex::new(inner), alerts: OnceLock::new(), failures: Mutex::default(), recent_failures: Mutex::default() })
     }
 
     /// Sends alerts when spend passes a share of the cost limit, and when Claude calls
@@ -265,6 +281,13 @@ impl UsageTracker {
     /// Records a Claude call that failed. Enough in a row raises an alert, once, until
     /// a call works again.
     pub fn record_failure(&self, error: &str) {
+        {
+            let mut recent = self.recent_failures.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            if recent.len() == RECENT_FAILURES_KEPT {
+                recent.pop_front();
+            }
+            recent.push_back(FailureRecord { at: chrono::Utc::now().to_rfc3339(), error: error.to_string() });
+        }
         let mut failures = self.failures.lock().expect("failure count mutex poisoned");
         failures.in_a_row += 1;
         if failures.in_a_row >= FAILURES_BEFORE_ALERT && !failures.alerted {
@@ -322,6 +345,11 @@ impl UsageTracker {
         if let Err(err) = saved {
             warn!(?err, "failed to persist usage totals");
         }
+    }
+
+    /// The latest failed calls since the bot started, oldest first.
+    pub fn recent_failures(&self) -> Vec<FailureRecord> {
+        self.recent_failures.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).iter().cloned().collect()
     }
 
     pub fn snapshot(&self) -> UsageSnapshot {
@@ -674,5 +702,18 @@ mod tests {
         tracker.record_failure("overloaded");
         tracker.record("chat", "claude-haiku-5-5", &usage(1, 1));
         assert!(raised(&mut receiver).is_empty());
+    }
+
+    #[test]
+    fn keeps_the_latest_failures_even_after_calls_recover() {
+        let tracker = UsageTracker::open(test_db(), None).unwrap();
+        for n in 0..RECENT_FAILURES_KEPT + 3 {
+            tracker.record_failure(&format!("error {n}"));
+        }
+        tracker.record("chat", "claude-haiku-5-5", &usage(1, 1));
+        let failures = tracker.recent_failures();
+        assert_eq!(failures.len(), RECENT_FAILURES_KEPT);
+        assert_eq!(failures[0].error, "error 3");
+        assert_eq!(failures.last().unwrap().error, format!("error {}", RECENT_FAILURES_KEPT + 2));
     }
 }
